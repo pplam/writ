@@ -1,11 +1,11 @@
-# Forge
+# Writ
 
 Plan, dispatch, and track coding-agent work against a design document.
 
-Forge takes a markdown design doc, turns it into a dependency-ordered task DAG
+Writ takes a markdown design doc, turns it into a dependency-ordered task DAG
 with explicit acceptance criteria, hands one task at a time to a coding agent,
 and keeps an append-only decision log. State is plain files — JSON, markdown,
-and logs — under `<project>/.forge`.
+and logs — under `<project>/.writ`.
 
 The premise: an agent should never be asked to "implement the design". It gets
 one bounded task, a stated bar, and a guardrail list. Everything it did stays
@@ -14,13 +14,13 @@ inspectable afterwards.
 ## Install
 
 ```bash
-uv tool install --editable /path/to/forge
+uv tool install --editable /path/to/writ
 ```
 
 Or run without installing:
 
 ```bash
-python -m forge --help
+python -m writ --help
 ```
 
 ## Quick start
@@ -28,22 +28,22 @@ python -m forge --help
 ```bash
 cd ~/projects/my-service
 
-forge init
-forge plan docs/design.md --dry-run     # preview
-forge plan docs/design.md               # commit the plan
+writ init
+writ plan docs/design.md --dry-run     # preview
+writ plan docs/design.md               # commit the plan
 
-forge status                            # progress, ready work, live runs
-forge next                              # what can start now
-forge show M01-001                      # the task and its acceptance bars
+writ status                            # progress, ready work, live runs
+writ next                              # what can start now
+writ show M01-001                      # the task and its acceptance bars
 
-forge dispatch M01-001 --agent claude --detach
-forge logs M01-001 --follow             # stream the agent's output
-forge status                            # from any other terminal, any time
+writ dispatch M01-001 --agent claude --detach
+writ logs M01-001 --follow             # stream the agent's output
+writ status                            # from any other terminal, any time
 
-forge accept M01-001 1 passed
-forge complete M01-001 --evidence "go test ./... green"
+writ accept M01-001 1 passed
+writ complete M01-001 --evidence "go test ./... green"
 
-forge decision add \
+writ decision add \
   --title "Fixture-only tests" \
   --decision "Automated tests never touch a live platform." \
   --context "Platform quotas are small and debugging consumes them." \
@@ -53,7 +53,7 @@ forge decision add \
 ## Storage
 
 ```
-<project>/.forge/
+<project>/.writ/
   state.json          milestones, tasks, runs, decisions
   decisions.md        human-readable mirror of the decision log
   runs/<run-id>/
@@ -64,11 +64,11 @@ forge decision add \
 ```
 
 Writes are atomic (temp file + replace) and serialized by an advisory lock, so
-a detached run and an interactive `forge status` never corrupt each other.
+a detached run and an interactive `writ status` never corrupt each other.
 
 ## Planning
 
-`forge plan` maps level-2 headings to milestones and level-3 headings to tasks.
+`writ plan` maps level-2 headings to milestones and level-3 headings to tasks.
 Acceptance criteria are lifted from explicit gate markers in the document —
 `**Pass:**`, `**Gate:**`, `Acceptance:` — split into individually checkable
 bars. Sections with no stated gate get generic criteria, so you can see which
@@ -84,7 +84,7 @@ parts of the design never defined "done".
 | `--force` | replace the existing plan |
 
 Dependencies default to a linear chain in document order — build order is
-usually load-bearing. Re-wire any task with `forge edit-task <id> --depends`.
+usually load-bearing. Re-wire any task with `writ edit-task <id> --depends`.
 
 ## Task lifecycle
 
@@ -112,44 +112,44 @@ is evidence, not a verdict.
 
 | Command | Purpose |
 |---|---|
-| `forge init [--force]` | create the project store |
-| `forge plan <doc>` | derive milestones, tasks, acceptance criteria |
-| `forge status` | progress bars, counts, ready work, live runs |
-| `forge tasks [--status S] [--milestone M] [--ready]` | list tasks |
-| `forge milestones` | rollups derived from member tasks |
-| `forge show <id>` | a task or milestone in full |
-| `forge next [--limit N]` | dispatchable tasks |
-| `forge graph [--dot]` | the dependency DAG |
+| `writ init [--force]` | create the project store |
+| `writ plan <doc>` | derive milestones, tasks, acceptance criteria |
+| `writ status` | progress bars, counts, ready work, live runs |
+| `writ tasks [--status S] [--milestone M] [--ready]` | list tasks |
+| `writ milestones` | rollups derived from member tasks |
+| `writ show <id>` | a task or milestone in full |
+| `writ next [--limit N]` | dispatchable tasks |
+| `writ graph [--dot]` | the dependency DAG |
 
 **Change**
 
 | Command | Purpose |
 |---|---|
-| `forge start\|complete\|fail\|block\|reset <id> [--evidence T] [--force]` | transitions |
-| `forge accept <id> <n> passed\|failed\|pending` | per-criterion sign-off |
-| `forge add-task <title> [--id] [--milestone] [--depends] [--acceptance] [--allow] [--forbid]` | hand-written task |
-| `forge edit-task <id> [--title] [--depends] [--acceptance] [--allow] [--forbid]` | amend |
+| `writ start\|complete\|fail\|block\|reset <id> [--evidence T] [--force]` | transitions |
+| `writ accept <id> <n> passed\|failed\|pending` | per-criterion sign-off |
+| `writ add-task <title> [--id] [--milestone] [--depends] [--acceptance] [--allow] [--forbid]` | hand-written task |
+| `writ edit-task <id> [--title] [--depends] [--acceptance] [--allow] [--forbid]` | amend |
 
 **Dispatch and monitor**
 
 | Command | Purpose |
 |---|---|
-| `forge dispatch <id> --agent CMD [--detach] [--timeout S] [--cwd D] [--dry-run] [-- args]` | run an agent |
-| `forge runs [--task T] [--active]` | run history |
-| `forge run <run-id>` | one run in detail |
-| `forge logs <run-id\|task-id> [--follow] [--stderr] [--tail N]` | agent output |
-| `forge cancel <run-id>` | stop an active run |
-| `forge reap` | reconcile runs whose process died |
-| `forge watch [--interval S] [--once] [--until-idle]` | live status view |
+| `writ dispatch <id> --agent CMD [--detach] [--timeout S] [--cwd D] [--dry-run] [-- args]` | run an agent |
+| `writ runs [--task T] [--active]` | run history |
+| `writ run <run-id>` | one run in detail |
+| `writ logs <run-id\|task-id> [--follow] [--stderr] [--tail N]` | agent output |
+| `writ cancel <run-id>` | stop an active run |
+| `writ reap` | reconcile runs whose process died |
+| `writ watch [--interval S] [--once] [--until-idle]` | live status view |
 
 **Decision log**
 
 | Command | Purpose |
 |---|---|
-| `forge decision add --title T --decision D [--context] [--consequences] [--supersedes ID] [--task ID]` | append a record |
-| `forge decision list [--active] [--task ID]` | list records |
-| `forge decision show <id>` | one record |
-| `forge decision export [--out FILE]` | render as markdown |
+| `writ decision add --title T --decision D [--context] [--consequences] [--supersedes ID] [--task ID]` | append a record |
+| `writ decision list [--active] [--task ID]` | list records |
+| `writ decision show <id>` | one record |
+| `writ decision export [--out FILE]` | render as markdown |
 
 Records are append-only. Superseding writes a new entry and marks the old one
 `superseded`; nothing is edited in place.
@@ -165,19 +165,19 @@ fixed guardrail block (test-first, minimum change, no weakened invariants, no
 live network, report assumptions and deviations). Preview it with:
 
 ```bash
-forge dispatch M01-001 --dry-run
+writ dispatch M01-001 --dry-run
 ```
 
 The prompt is written to the run directory and delivered to the agent on stdin.
 Arguments after `--` are forwarded to the agent command:
 
 ```bash
-forge dispatch M01-001 --agent claude -- --model sonnet
+writ dispatch M01-001 --agent claude -- --model sonnet
 ```
 
 `--detach` hands the run to a supervisor process that outlives the CLI, so you
 can close the terminal and still get a recorded outcome. `--timeout` kills the
-process group and records exit 124. If a machine dies mid-run, `forge reap`
+process group and records exit 124. If a machine dies mid-run, `writ reap`
 reconciles the orphaned records.
 
 ## Tests

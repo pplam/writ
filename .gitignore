@@ -4,5 +4,5 @@ __pycache__/
 .venv/
 dist/
 build/
-.forge/
+.writ/
 .pytest_cache/

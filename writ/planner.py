@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .state import ForgeError
+from .state import WritError
 
 GATE_PATTERN = re.compile(
     r"\*{0,2}(?:pass|gate|acceptance|acceptance criteria|stage\s*\d*\s*gate)\*{0,2}\s*:\*{0,2}\s*(.+)",
@@ -129,7 +129,7 @@ def parse(
     lines = text.splitlines()
     heads = _headings(lines, milestone_level)
     if not heads:
-        raise ForgeError(
+        raise WritError(
             f"no level-{milestone_level} headings found; "
             "try --level 1 or point at a document with `##` sections"
         )

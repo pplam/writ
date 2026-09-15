@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from forge.cli import main
+from writ.cli import main
 
 DESIGN = """\
 # Sample Project
@@ -60,7 +60,7 @@ def run(*args: str) -> tuple[int, str, str]:
 
 
 @pytest.fixture
-def forge(project: Path):
+def writ(project: Path):
     def invoke(*args: str) -> tuple[int, str, str]:
         return run("--root", str(project), *args)
 
@@ -68,10 +68,10 @@ def forge(project: Path):
 
 
 @pytest.fixture
-def planned(forge, design: Path):
-    forge("init")
-    forge("plan", str(design))
-    return forge
+def planned(writ, design: Path):
+    writ("init")
+    writ("plan", str(design))
+    return writ
 
 
 def python_agent(script: str) -> list[str]:

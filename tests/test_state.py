@@ -2,26 +2,26 @@ import json
 
 import pytest
 
-from forge import state
-from forge.state import ForgeError
+from writ import state
+from writ.state import WritError
 
 
 def test_initialize_creates_store(project):
     location = state.initialize(project)
-    assert location == project / ".forge"
+    assert location == project / ".writ"
     assert state.state_file(project).exists()
     assert state.runs_dir(project).exists()
 
 
 def test_initialize_refuses_to_clobber(project):
     state.initialize(project)
-    with pytest.raises(ForgeError, match="already initialized"):
+    with pytest.raises(WritError, match="already initialized"):
         state.initialize(project)
     state.initialize(project, force=True)
 
 
 def test_load_without_init_is_an_error(project):
-    with pytest.raises(ForgeError, match="no Forge project"):
+    with pytest.raises(WritError, match="no Writ project"):
         state.load(project)
 
 
@@ -30,14 +30,14 @@ def test_unsupported_schema_is_refused(project):
     data = state.load(project)
     data["schema_version"] = 999
     state.save(project, data)
-    with pytest.raises(ForgeError, match="schema"):
+    with pytest.raises(WritError, match="schema"):
         state.load(project)
 
 
 def test_corrupt_state_is_reported(project):
     state.initialize(project)
     state.state_file(project).write_text("{not json", encoding="utf-8")
-    with pytest.raises(ForgeError, match="corrupt"):
+    with pytest.raises(WritError, match="corrupt"):
         state.load(project)
 
 

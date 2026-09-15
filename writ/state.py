@@ -1,4 +1,4 @@
-"""State storage for Forge.
+"""State storage for Writ.
 
 The store is deliberately boring: one JSON document per project, written
 atomically, guarded by an advisory lock file so a detached supervisor and an
@@ -6,7 +6,7 @@ interactive CLI cannot clobber each other.
 
 Layout under a project root:
 
-    .forge/
+    .writ/
         state.json        the whole project: milestones, tasks, runs, decisions
         state.lock        advisory lock, held only for the duration of a write
         decisions.md      human-readable, append-only mirror of the decision log
@@ -24,7 +24,7 @@ from typing import Any, Iterator
 
 SCHEMA_VERSION = 1
 
-STORE_DIRNAME = ".forge"
+STORE_DIRNAME = ".writ"
 STATE_FILENAME = "state.json"
 LOCK_FILENAME = "state.lock"
 DECISIONS_FILENAME = "decisions.md"
@@ -34,7 +34,7 @@ LOCK_TIMEOUT_SECONDS = 10.0
 LOCK_STALE_SECONDS = 60.0
 
 
-class ForgeError(Exception):
+class WritError(Exception):
     """Any expected, user-facing failure."""
 
 
@@ -44,7 +44,7 @@ def utcnow() -> str:
 
 
 def store_dir(root: str | os.PathLike[str]) -> Path:
-    """The `.forge` directory for a project root."""
+    """The `.writ` directory for a project root."""
     return Path(root).expanduser() / STORE_DIRNAME
 
 
@@ -86,7 +86,7 @@ def initialize(root: str | os.PathLike[str], force: bool = False) -> Path:
     """Create the store. Refuses to overwrite unless `force`."""
     target = state_file(root)
     if target.exists() and not force:
-        raise ForgeError(
+        raise WritError(
             f"already initialized at {store_dir(root)} (use --force to reset)"
         )
     runs_dir(root).mkdir(parents=True, exist_ok=True)
@@ -98,17 +98,17 @@ def load(root: str | os.PathLike[str]) -> dict[str, Any]:
     """Read the project document. Raises if the project is not initialized."""
     target = state_file(root)
     if not target.exists():
-        raise ForgeError(
-            f"no Forge project at {Path(root).expanduser()} (run `forge init` first)"
+        raise WritError(
+            f"no Writ project at {Path(root).expanduser()} (run `writ init` first)"
         )
     try:
         data = json.loads(target.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:  # pragma: no cover - corrupted store
-        raise ForgeError(f"corrupt state file {target}: {exc}") from exc
+        raise WritError(f"corrupt state file {target}: {exc}") from exc
     version = data.get("schema_version")
     if version != SCHEMA_VERSION:
-        raise ForgeError(
-            f"state schema {version!r} is not supported by this Forge build "
+        raise WritError(
+            f"state schema {version!r} is not supported by this Writ build "
             f"(expected {SCHEMA_VERSION})"
         )
     return data
@@ -144,9 +144,9 @@ def _lock(root: str | os.PathLike[str]) -> Iterator[None]:
                 _release(path)
                 continue
             if time.monotonic() > deadline:
-                raise ForgeError(
+                raise WritError(
                     f"timed out waiting for the state lock at {path}; "
-                    "another Forge process may be writing"
+                    "another Writ process may be writing"
                 )
             time.sleep(0.05)
     try:

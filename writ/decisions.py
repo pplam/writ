@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from . import state
-from .state import ForgeError, utcnow
+from .state import WritError, utcnow
 
 MARKDOWN_HEADER = "# Decision Log\n\nAppend-only. Superseding entries are added, never edited.\n"
 
@@ -20,17 +20,17 @@ def add(
     tasks: list[str] | None = None,
 ) -> dict[str, Any]:
     if not title.strip():
-        raise ForgeError("a decision needs a title")
+        raise WritError("a decision needs a title")
     if not decision.strip():
-        raise ForgeError("a decision needs a --decision statement")
+        raise WritError("a decision needs a --decision statement")
     counters = data.setdefault("counters", {})
     number = counters.get("decision", len(data["decisions"])) + 1
     counters["decision"] = number
     if supersedes and not any(item["id"] == supersedes for item in data["decisions"]):
-        raise ForgeError(f"unknown decision to supersede: {supersedes}")
+        raise WritError(f"unknown decision to supersede: {supersedes}")
     for task_id in tasks or []:
         if task_id not in data["tasks"]:
-            raise ForgeError(f"unknown task: {task_id}")
+            raise WritError(f"unknown task: {task_id}")
     record = {
         "id": f"D-{number:04d}",
         "date": utcnow(),
@@ -56,7 +56,7 @@ def get(data: dict[str, Any], decision_id: str) -> dict[str, Any]:
     for item in data["decisions"]:
         if item["id"] == decision_id:
             return item
-    raise ForgeError(f"unknown decision: {decision_id}")
+    raise WritError(f"unknown decision: {decision_id}")
 
 
 def render_markdown(data: dict[str, Any]) -> str:

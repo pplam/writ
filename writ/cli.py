@@ -6,25 +6,25 @@ import sys
 
 from . import commands
 from .model import ACCEPTANCE_STATUSES
-from .state import ForgeError
+from .state import WritError
 
 DESCRIPTION = """\
-Forge turns a design document into an executable task DAG, dispatches tasks to
+Writ turns a design document into an executable task DAG, dispatches tasks to
 coding agents, tracks acceptance criteria, and keeps an append-only decision log.
-State lives in <root>/.forge as JSON, markdown, and plain logs.
+State lives in <root>/.writ as JSON, markdown, and plain logs.
 """
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="forge",
+        prog="writ",
         description=DESCRIPTION,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--root",
         default=".",
-        help="project directory containing .forge (default: current directory)",
+        help="project directory containing .writ (default: current directory)",
     )
     parser.add_argument(
         "--json", action="store_true", help="machine-readable output where supported"
@@ -32,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True, metavar="<command>")
 
     # setup
-    p = sub.add_parser("init", help="create a Forge project in --root")
+    p = sub.add_parser("init", help="create a Writ project in --root")
     p.add_argument("--force", action="store_true", help="overwrite existing state")
     p.set_defaults(func=commands.cmd_init)
 
@@ -101,7 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("accept", help="set an acceptance criterion's status")
     p.add_argument("id")
-    p.add_argument("number", help="1-based index from `forge show`")
+    p.add_argument("number", help="1-based index from `writ show`")
     p.add_argument("status", choices=ACCEPTANCE_STATUSES)
     p.set_defaults(func=commands.cmd_accept)
 
@@ -225,8 +225,8 @@ def main(argv: list[str] | None = None) -> int:
     args.agent_args = agent_args
     try:
         result = args.func(args)
-    except ForgeError as exc:
-        print(f"forge: {exc}", file=sys.stderr)
+    except WritError as exc:
+        print(f"writ: {exc}", file=sys.stderr)
         return 2
     except BrokenPipeError:  # pragma: no cover - piping to head
         return 0

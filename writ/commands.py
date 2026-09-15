@@ -24,7 +24,7 @@ from .model import (
     set_acceptance,
     set_status,
 )
-from .state import ForgeError
+from .state import WritError
 
 
 # --------------------------------------------------------------------------
@@ -33,14 +33,14 @@ from .state import ForgeError
 
 def cmd_init(args) -> None:
     location = state.initialize(args.root, force=args.force)
-    print(f"initialized Forge project at {location}")
-    print("next: forge plan <design.md>")
+    print(f"initialized Writ project at {location}")
+    print("next: writ plan <design.md>")
 
 
 def cmd_plan(args) -> None:
     doc = Path(args.design).expanduser()
     if not doc.exists():
-        raise ForgeError(f"design document not found: {doc}")
+        raise WritError(f"design document not found: {doc}")
     milestones = planner.parse(
         doc.read_text(encoding="utf-8"),
         milestone_level=args.level,
@@ -62,7 +62,7 @@ def cmd_plan(args) -> None:
 
     with state.transaction(args.root) as data:
         if data["tasks"] and not (args.append or args.force):
-            raise ForgeError(
+            raise WritError(
                 "this project already has tasks; use --append to add, "
                 "or --force to replace the plan"
             )
@@ -105,7 +105,7 @@ def cmd_plan(args) -> None:
         f"created {summary['milestones']} milestones and {created_tasks} tasks "
         f"from {doc.name}"
     )
-    print("next: forge status")
+    print("next: writ status")
 
 
 # --------------------------------------------------------------------------
@@ -346,7 +346,7 @@ def cmd_next(args) -> None:
         render.emit_json([task["id"] for task in candidates])
         return
     if not candidates:
-        print("nothing is ready; run `forge status` to see what is blocking")
+        print("nothing is ready; run `writ status` to see what is blocking")
         return
     print(
         render.table(
@@ -360,7 +360,7 @@ def cmd_graph(args) -> None:
     data = state.load(args.root)
     check_dag(data)
     if args.dot:
-        print("digraph forge {")
+        print("digraph writ {")
         print('  rankdir=LR; node [shape=box, fontname="Helvetica"];')
         for task_id in sorted(data["tasks"]):
             task = data["tasks"][task_id]
@@ -438,7 +438,7 @@ def cmd_edit_task(args) -> None:
         if args.depends:
             for dep in args.depends:
                 if dep not in data["tasks"]:
-                    raise ForgeError(f"unknown dependency: {dep}")
+                    raise WritError(f"unknown dependency: {dep}")
             task["depends_on"] = args.depends
         if args.allow:
             task["allowed"] = args.allow
@@ -473,7 +473,7 @@ def cmd_dispatch(args) -> int:
     if args.detach:
         pid = runner.detach(Path(args.root), run_id)
         print(f"dispatched {args.id} as run {run_id} (detached, supervisor pid {pid})")
-        print(f"logs: forge logs {run_id} --follow")
+        print(f"logs: writ logs {run_id} --follow")
         return 0
     print(f"dispatched {args.id} as run {run_id}")
     print(f"logs: {directory}")
@@ -481,8 +481,8 @@ def cmd_dispatch(args) -> int:
     print(f"run {run_id} finished with exit code {code}")
     if code == 0:
         print(
-            f"next: verify acceptances, then `forge accept {args.id} <n> passed` "
-            f"and `forge complete {args.id}`"
+            f"next: verify acceptances, then `writ accept {args.id} <n> passed` "
+            f"and `writ complete {args.id}`"
         )
     return code
 
@@ -558,12 +558,12 @@ def cmd_logs(args) -> None:
     if run_id in data["tasks"]:
         latest = runner.latest_run_for(data, run_id)
         if latest is None:
-            raise ForgeError(f"task {run_id} has no runs yet")
+            raise WritError(f"task {run_id} has no runs yet")
         run_id = latest
     stream = "stderr" if args.stderr else "stdout"
     path = runner.log_path(root, run_id, stream)
     if not path.exists():
-        raise ForgeError(f"no {stream} log yet for {run_id}")
+        raise WritError(f"no {stream} log yet for {run_id}")
     if not args.follow:
         text = path.read_text(encoding="utf-8", errors="replace")
         if args.tail:
@@ -619,7 +619,7 @@ def cmd_watch(args) -> None:  # pragma: no cover - interactive loop
             payload = _status_payload(data)
             if not args.no_clear:
                 os.system("clear" if shutil.which("clear") else "")
-            print(f"forge watch — {state.utcnow()}  (ctrl-c to exit)\n")
+            print(f"writ watch — {state.utcnow()}  (ctrl-c to exit)\n")
             print(_render_status(payload))
             if args.once or not payload["active_runs"] and args.until_idle:
                 return

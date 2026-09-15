@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
-from .state import ForgeError, utcnow
+from .state import WritError, utcnow
 
 TASK_STATUSES = ("planned", "ready", "running", "blocked", "completed", "failed")
 ACCEPTANCE_STATUSES = ("pending", "passed", "failed")
@@ -16,14 +16,14 @@ SETTABLE_STATUSES = ("planned", "running", "blocked", "completed", "failed")
 def get_task(data: dict[str, Any], task_id: str) -> dict[str, Any]:
     task = data["tasks"].get(task_id)
     if task is None:
-        raise ForgeError(f"unknown task: {task_id}")
+        raise WritError(f"unknown task: {task_id}")
     return task
 
 
 def get_milestone(data: dict[str, Any], milestone_id: str) -> dict[str, Any]:
     milestone = data["milestones"].get(milestone_id)
     if milestone is None:
-        raise ForgeError(f"unknown milestone: {milestone_id}")
+        raise WritError(f"unknown milestone: {milestone_id}")
     return milestone
 
 
@@ -33,7 +33,7 @@ def find(data: dict[str, Any], item_id: str) -> tuple[str, dict[str, Any]]:
         return "task", data["tasks"][item_id]
     if item_id in data["milestones"]:
         return "milestone", data["milestones"][item_id]
-    raise ForgeError(f"unknown task or milestone: {item_id}")
+    raise WritError(f"unknown task or milestone: {item_id}")
 
 
 def blocking_dependencies(data: dict[str, Any], task: dict[str, Any]) -> list[str]:
@@ -42,7 +42,7 @@ def blocking_dependencies(data: dict[str, Any], task: dict[str, Any]) -> list[st
     for dep_id in task.get("depends_on", []):
         dep = data["tasks"].get(dep_id)
         if dep is None:
-            raise ForgeError(
+            raise WritError(
                 f"task {task['id']} depends on unknown task {dep_id}"
             )
         if dep["status"] not in TERMINAL_STATUSES:
@@ -129,14 +129,14 @@ def set_status(
 ) -> dict[str, Any]:
     """Transition a task, enforcing dependency and acceptance gates."""
     if status not in SETTABLE_STATUSES:
-        raise ForgeError(
+        raise WritError(
             f"cannot set status {status!r}; choose from {', '.join(SETTABLE_STATUSES)}"
         )
     task = get_task(data, task_id)
     if status == "running" and not force:
         blockers = blocking_dependencies(data, task)
         if blockers:
-            raise ForgeError(
+            raise WritError(
                 f"{task_id} is blocked by incomplete dependencies: "
                 f"{', '.join(blockers)} (use --force to override)"
             )
@@ -144,9 +144,9 @@ def set_status(
         unmet = unmet_acceptances(task)
         if unmet:
             listed = "; ".join(unmet)
-            raise ForgeError(
+            raise WritError(
                 f"{task_id} has unmet acceptance criteria: {listed} "
-                "(mark them with `forge accept`, or use --force)"
+                "(mark them with `writ accept`, or use --force)"
             )
     task["status"] = status
     task["updated_at"] = utcnow()
@@ -164,13 +164,13 @@ def set_acceptance(
     data: dict[str, Any], task_id: str, number: int, status: str
 ) -> dict[str, Any]:
     if status not in ACCEPTANCE_STATUSES:
-        raise ForgeError(
+        raise WritError(
             f"acceptance status must be one of {', '.join(ACCEPTANCE_STATUSES)}"
         )
     task = get_task(data, task_id)
     acceptances = task.get("acceptances", [])
     if number < 1 or number > len(acceptances):
-        raise ForgeError(
+        raise WritError(
             f"{task_id} has {len(acceptances)} acceptance criteria; {number} is out of range"
         )
     acceptances[number - 1]["status"] = status
@@ -192,13 +192,13 @@ def add_task(
     design_doc: str | None = None,
 ) -> dict[str, Any]:
     if task_id in data["tasks"]:
-        raise ForgeError(f"task {task_id} already exists")
+        raise WritError(f"task {task_id} already exists")
     if milestone and milestone not in data["milestones"]:
-        raise ForgeError(f"unknown milestone: {milestone}")
+        raise WritError(f"unknown milestone: {milestone}")
     deps = list(depends_on)
     for dep in deps:
         if dep not in data["tasks"]:
-            raise ForgeError(f"unknown dependency: {dep}")
+            raise WritError(f"unknown dependency: {dep}")
     task = {
         "id": task_id,
         "title": title,
@@ -226,7 +226,7 @@ def add_milestone(
     data: dict[str, Any], *, milestone_id: str, title: str, design_section: str | None = None
 ) -> dict[str, Any]:
     if milestone_id in data["milestones"]:
-        raise ForgeError(f"milestone {milestone_id} already exists")
+        raise WritError(f"milestone {milestone_id} already exists")
     milestone = {
         "id": milestone_id,
         "title": title,
@@ -248,13 +248,13 @@ def check_dag(data: dict[str, Any]) -> None:
         mark = state.get(node, 0)
         if mark == 1:
             cycle = " -> ".join(trail + [node])
-            raise ForgeError(f"dependency cycle: {cycle}")
+            raise WritError(f"dependency cycle: {cycle}")
         if mark == 2:
             return
         state[node] = 1
         for dep in tasks[node].get("depends_on", []):
             if dep not in tasks:
-                raise ForgeError(f"task {node} depends on unknown task {dep}")
+                raise WritError(f"task {node} depends on unknown task {dep}")
             visit(dep, trail + [node])
         state[node] = 2
 

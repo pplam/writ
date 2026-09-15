@@ -17,7 +17,7 @@ from .model import (
     get_task,
     refresh_milestones,
 )
-from .state import ForgeError, utcnow
+from .state import WritError, utcnow
 
 ACTIVE_RUN_STATUSES = ("starting", "running")
 
@@ -116,7 +116,7 @@ def prepare(
         if not force:
             blockers = blocking_dependencies(data, task)
             if blockers:
-                raise ForgeError(
+                raise WritError(
                     f"{task_id} is blocked by incomplete dependencies: "
                     f"{', '.join(blockers)} (use --force to override)"
                 )
@@ -152,7 +152,7 @@ def execute(root: Path, run_id: str) -> int:
     data = state.load(root)
     run = data["runs"].get(run_id)
     if run is None:
-        raise ForgeError(f"unknown run: {run_id}")
+        raise WritError(f"unknown run: {run_id}")
     directory = Path(run["dir"])
     prompt = (directory / "prompt.txt").read_text(encoding="utf-8")
     stdout_path = directory / "stdout.log"
@@ -178,10 +178,10 @@ def execute(root: Path, run_id: str) -> int:
                 _terminate(process.pid)
                 process.wait(timeout=10)
                 code = 124
-                err.write("\nforge: agent exceeded its timeout and was terminated\n")
+                err.write("\nwrit: agent exceeded its timeout and was terminated\n")
     except FileNotFoundError as exc:
         _finish(root, run_id, 127, note=f"agent not found: {exc}")
-        raise ForgeError(f"agent command not found: {run['command'][0]}") from exc
+        raise WritError(f"agent command not found: {run['command'][0]}") from exc
     _finish(root, run_id, code)
     return code
 
@@ -224,7 +224,7 @@ def detach(root: Path, run_id: str) -> int:
             [
                 sys.executable,
                 "-m",
-                "forge",
+                "writ",
                 "--root",
                 str(root),
                 "supervise",
@@ -269,9 +269,9 @@ def cancel(root: Path, run_id: str) -> None:
     with state.transaction(root) as data:
         run = data["runs"].get(run_id)
         if run is None:
-            raise ForgeError(f"unknown run: {run_id}")
+            raise WritError(f"unknown run: {run_id}")
         if run["status"] not in ACTIVE_RUN_STATUSES:
-            raise ForgeError(f"run {run_id} is not active (status: {run['status']})")
+            raise WritError(f"run {run_id} is not active (status: {run['status']})")
         pid = run.get("pid")
         supervisor = run.get("supervisor_pid")
     for candidate in (supervisor, pid):
@@ -316,14 +316,14 @@ def log_path(root: Path, run_id: str, stream: str) -> Path:
     data = state.load(root)
     run = data["runs"].get(run_id)
     if run is None:
-        raise ForgeError(f"unknown run: {run_id}")
+        raise WritError(f"unknown run: {run_id}")
     return Path(run["dir"]) / f"{stream}.log"
 
 
 def resolve_run(data: dict[str, Any], run_id: str) -> dict[str, Any]:
     run = data["runs"].get(run_id)
     if run is None:
-        raise ForgeError(f"unknown run: {run_id}")
+        raise WritError(f"unknown run: {run_id}")
     return run
 
 

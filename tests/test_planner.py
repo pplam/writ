@@ -1,7 +1,7 @@
 import pytest
 
-from forge import planner
-from forge.state import ForgeError
+from writ import planner
+from writ.state import WritError
 from tests.conftest import DESIGN
 
 
@@ -62,7 +62,7 @@ def test_offset_continues_numbering():
 
 
 def test_document_without_headings_is_rejected():
-    with pytest.raises(ForgeError):
+    with pytest.raises(WritError):
         planner.parse("just prose, no headings at all")
 
 
