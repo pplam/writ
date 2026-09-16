@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import agents, decisions, planner, planning, render, runner, state
+from . import agents, decisions, planner, planning, render, runner, state, verdict
 from .model import (
     acceptance_summary,
     add_evidence,
@@ -23,6 +23,7 @@ from .model import (
     milestone_tasks,
     ready_tasks,
     refresh_milestones,
+    reviewable_tasks,
     set_acceptance,
     set_status,
 )
@@ -309,6 +310,8 @@ def _list_tasks(data, args):
             continue
         if args.ready and status != "ready":
             continue
+        if getattr(args, "awaiting_review", False) and status != "awaiting-review":
+            continue
         counts = acceptance_summary(task)
         rows.append(
             [
@@ -563,9 +566,18 @@ def _render_task(data: dict[str, Any], task: dict[str, Any]) -> str:
         f"\nacceptance criteria ({counts['passed']}/{counts['total']} passed):"
     )
     for index, acceptance in enumerate(task.get("acceptances", []), start=1):
-        lines.append(render.acceptance_line(index, acceptance))
+        lines.extend(render.acceptance_detail(index, acceptance))
     if not task.get("acceptances"):
         lines.append("  (none recorded)")
+    last = task.get("last_verdict")
+    if last:
+        who = last.get("actor") or last.get("role", "agent")
+        claim = last.get("decision") or last.get("outcome")
+        lines.append(f"\nlast verdict: {claim} by {who} at {last.get('at')}")
+        if last.get("summary"):
+            lines.append(f"  {last['summary']}")
+    if status == "awaiting-review":
+        lines.append(f"\nawaiting review: writ review {task['id']}")
     if task.get("allowed"):
         lines.append("\nallowed:")
         lines.extend(f"  - {entry}" for entry in task["allowed"])
@@ -576,13 +588,18 @@ def _render_task(data: dict[str, Any], task: dict[str, Any]) -> str:
         lines.append("\nruns:")
         for run_id in task["runs"]:
             run = data["runs"].get(run_id, {})
+            role = run.get("role", "agent")
             lines.append(
-                f"  - {run_id}  {run.get('status')}  exit={run.get('exit_code')}"
+                f"  - {run_id}  [{role}]  {run.get('status')}  "
+                f"exit={run.get('exit_code')}"
             )
+            if run.get("verdict_error"):
+                lines.append(f"      unusable verdict: {run['verdict_error']}")
     if task.get("evidence"):
         lines.append("\nevidence:")
         for entry in task["evidence"]:
-            lines.append(f"  - {entry['at']}  {entry['text']}")
+            actor = entry.get("actor", "operator")
+            lines.append(f"  - {entry['at']}  [{actor}] {entry['text']}")
     return "\n".join(lines)
 
 
@@ -608,10 +625,11 @@ def _status_payload(data: dict[str, Any]) -> dict[str, Any]:
         "tasks_completed": counts.get("completed", 0),
         "counts": counts,
         "ready": [task["id"] for task in ready_tasks(data)],
+        "awaiting_review": [task["id"] for task in reviewable_tasks(data)],
         "running": [
             task_id
             for task_id, task in sorted(tasks.items())
-            if task["status"] == "running"
+            if task["status"] in ("running", "reviewing")
         ],
         "failed": [
             task_id
@@ -686,6 +704,9 @@ def _render_status(payload: dict[str, Any]) -> str:
         lines.append(f"failed: {', '.join(payload['failed'])}")
     if payload["ready"]:
         lines.append(f"ready to dispatch: {', '.join(payload['ready'][:8])}")
+    if payload.get("awaiting_review"):
+        listed = ", ".join(payload["awaiting_review"][:8])
+        lines.append(f"awaiting review: {listed}   (writ review)")
     if payload["active_runs"]:
         lines.append("")
         lines.append(
@@ -740,14 +761,46 @@ def cmd_set(args) -> None:
     print(f"{args.id} -> {args.status}")
 
 
-def cmd_accept(args) -> None:
+def cmd_override(args) -> None:
+    """Let a human take a decision the agents own, and say that they did.
+
+    Writ routes judgements through agents, but a tool that cannot be overridden
+    is a tool that traps you when a model is wrong or unavailable. The escape
+    hatch exists; it just refuses to disguise itself as an agent's verdict.
+    """
     with state.transaction(args.root) as data:
-        task = set_acceptance(data, args.id, int(args.number), args.status)
-        counts = acceptance_summary(task)
-    print(
-        f"{args.id} acceptance {args.number} -> {args.status} "
-        f"({counts['passed']}/{counts['total']} passed)"
-    )
+        task = get_task(data, args.id)
+        for spec in args.accept or []:
+            number, _, status = spec.partition("=")
+            if not number.strip().isdigit():
+                raise WritError(f"--accept expects N or N=STATUS, got {spec!r}")
+            set_acceptance(
+                data,
+                args.id,
+                int(number),
+                (status or "passed").strip(),
+                actor="operator",
+                evidence=f"operator override: {args.reason}",
+            )
+        set_status(
+            data,
+            args.id,
+            args.status,
+            evidence=f"operator override to {args.status}: {args.reason}",
+            force=True,
+            actor="operator",
+            allow_judged=True,
+        )
+        task["last_verdict"] = {
+            "role": "operator",
+            "actor": "operator",
+            "outcome": args.status,
+            "decision": None,
+            "summary": args.reason,
+            "at": state.utcnow(),
+        }
+    print(f"{args.id} -> {args.status} (operator override)")
+    print(f"recorded reason: {args.reason}")
 
 
 def cmd_task(args) -> None:
@@ -823,43 +876,105 @@ def cmd_dispatch(args) -> int:
         task = get_task(data, args.id)
         print(runner.build_prompt(data, task, Path(args.root)))
         return 0
+    return _run_agent_on_task(args, role="agent", task_id=args.id, extra=extra)
+
+
+def cmd_review(args) -> int:
+    """Have an agent that did not write the code decide whether it is done.
+
+    Self-assessment is not evidence, so the implementing agent's verdict only
+    reaches `awaiting-review`. This is the step that can complete a task.
+    """
+    data = state.load(args.root)
+    if args.dry_run:
+        task = get_task(data, args.id) if args.id else None
+        if task is None:
+            raise WritError("--dry-run needs a task id")
+        print(runner.build_review_prompt(data, task, Path(args.root)))
+        return 0
+
+    if args.id:
+        targets = [args.id]
+    else:
+        targets = [task["id"] for task in reviewable_tasks(data)]
+        if not targets:
+            print("nothing is awaiting review")
+            return 0
+        print(f"reviewing {len(targets)} task(s): {', '.join(targets)}")
+
+    worst = 0
+    for index, task_id in enumerate(targets):
+        if index:
+            print()
+        code = _run_agent_on_task(args, role="reviewer", task_id=task_id, extra=[])
+        worst = worst or code
+    return worst
+
+
+def _run_agent_on_task(args, *, role: str, task_id: str, extra: list[str]) -> int:
+    """Shared body of dispatch and review: run one agent, report its verdict."""
+    root = Path(args.root)
     run_id, directory, _, resolved = runner.prepare(
-        Path(args.root),
-        args.id,
+        root,
+        task_id,
         args.agent,
         extra,
         model=args.model,
         timeout=args.timeout,
         cwd=args.cwd,
         force=args.force,
+        role=role,
     )
     if resolved.warning:
         print(f"warning: {resolved.warning}", file=sys.stderr)
-    if args.detach:
-        pid = runner.detach(Path(args.root), run_id)
-        print(f"dispatched {args.id} as run {run_id} (detached, supervisor pid {pid})")
+    verb = "reviewing" if role == "reviewer" else "dispatched"
+    if getattr(args, "detach", False):
+        pid = runner.detach(root, run_id)
+        print(f"{verb} {task_id} as run {run_id} (detached, supervisor pid {pid})")
         print(f"logs: writ logs {run_id} --follow")
         return 0
-    print(f"dispatched {args.id} as run {run_id}")
+    print(f"{verb} {task_id} as run {run_id}")
     print(f"running: {resolved.display}")
     print(f"logs: {directory}")
     if not args.quiet:
         print("" + "─" * 62)
         sys.stdout.flush()
-    code = runner.execute(
-        Path(args.root), run_id, stream=not args.quiet, prefix="| "
-    )
+    code = runner.execute(root, run_id, stream=not args.quiet, prefix="| ")
     if not args.quiet:
         print("" + "─" * 62)
     print(f"run {run_id} finished with exit code {code}")
     if code == 124 and not runner.produced_output(directory):
         print(agents.hang_hint(resolved), file=sys.stderr)
-    if code == 0:
-        print(
-            f"next: verify acceptances, then `writ accept {args.id} <n> passed` "
-            f"and `writ complete {args.id}`"
-        )
+    _report_verdict(root, run_id, task_id, directory, role)
     return code
+
+
+def _report_verdict(
+    root: Path, run_id: str, task_id: str, directory: Path, role: str
+) -> None:
+    """Say what the agent claimed and what writ did about it.
+
+    The status change is the interesting part of a run, so it is reported
+    explicitly rather than left for the user to go and look up.
+    """
+    status, error = runner.verdict_summary(root, run_id)
+    if error:
+        print(f"warning: {error}", file=sys.stderr)
+    if status is None:
+        print(verdict.missing_message(task_id, directory, role), file=sys.stderr)
+        return
+    data = state.load(root)
+    task = data["tasks"][task_id]
+    counts = acceptance_summary(task)
+    print(
+        f"{task_id} -> {status} "
+        f"({counts['passed']}/{counts['total']} criteria passed, "
+        f"judged by the {role})"
+    )
+    if status == "awaiting-review":
+        print(f"next: writ review {task_id}")
+    elif status == "failed":
+        print(f"next: writ show {task_id}   # see what it could not meet")
 
 
 def cmd_agents(args) -> None:

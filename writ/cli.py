@@ -1,6 +1,6 @@
 """Argument parsing and entry point.
 
-The command surface is deliberately small. Two rules keep it that way:
+The command surface is deliberately small. Three rules keep it that way:
 
 1. One verb per job, not one verb per noun. `show` resolves any id — task,
    milestone, run, or decision — because "show me this thing" is one intent.
@@ -8,6 +8,10 @@ The command surface is deliberately small. Two rules keep it that way:
 2. A status is a value, not a verb. `writ set <id> <status>` replaces the
    start/complete/fail/block/reset family, so adding a status never adds a
    command, and the legal values are visible in one place.
+3. Agents judge their own work; operators do not. Whether a task is done is a
+   claim about its acceptance criteria, so it is made by the agent that did the
+   work and checked by a reviewer agent — not typed in by hand. `set` cannot
+   reach `completed`; `override` can, and records that a human said so.
 """
 from __future__ import annotations
 
@@ -15,7 +19,7 @@ import argparse
 import sys
 
 from . import commands
-from .model import ACCEPTANCE_STATUSES, SETTABLE_STATUSES
+from .model import JUDGED_STATUSES, SETTABLE_STATUSES
 from .state import WritError
 
 DESCRIPTION = """\
@@ -27,9 +31,11 @@ Typical flow:
   writ init
   writ plan design.md          an agent reads the doc and the repo
   writ list --ready            what can start now
-  writ dispatch M01-001        hand one task to an agent
-  writ accept M01-001 1 passed sign off a criterion
-  writ set M01-001 completed   record the outcome
+  writ dispatch M01-001        an agent implements it and reports a verdict
+  writ review M01-001          a second agent checks the claim and signs off
+
+Statuses and acceptance criteria are set by those agents, not by hand. Use
+`writ override` when a human needs the last word, which records that they took it.
 """
 
 EPILOG = """\
@@ -174,6 +180,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--ready", action="store_true", help="only tasks that can be dispatched now"
     )
+    p.add_argument(
+        "--awaiting-review",
+        action="store_true",
+        help="only tasks an agent has reported and a reviewer has not checked",
+    )
     p.add_argument("--active", action="store_true", help="only live runs")
     p.add_argument("--limit", type=int, help="show at most N rows")
     p.set_defaults(func=commands.cmd_list)
@@ -210,23 +221,70 @@ def build_parser() -> argparse.ArgumentParser:
     # -------------------------------------------------------------- mutation
     p = sub.add_parser(
         "set",
-        help=f"set a task's status ({', '.join(SETTABLE_STATUSES)})",
+        help=f"set a task's workflow status ({', '.join(SETTABLE_STATUSES)})",
+        description=(
+            "Move a task around the board. This cannot mark a task completed: "
+            "completion is a judgement about acceptance criteria, made by the "
+            "agent that did the work and checked by `writ review`. Use "
+            "`writ override` if a human has to decide."
+        ),
     )
     p.add_argument("id")
     p.add_argument("status", choices=SETTABLE_STATUSES)
     p.add_argument("--evidence", help="note recorded with the transition")
     p.add_argument(
-        "--force", action="store_true", help="bypass dependency/acceptance gates"
+        "--force", action="store_true", help="bypass the dependency gate"
     )
     p.set_defaults(func=commands.cmd_set)
 
-    p = sub.add_parser("accept", help="set an acceptance criterion's status")
-    p.add_argument("id")
-    p.add_argument("number", help="1-based index from `writ show`")
-    p.add_argument(
-        "status", nargs="?", default="passed", choices=ACCEPTANCE_STATUSES
+    p = sub.add_parser(
+        "review",
+        help="have a second agent verify a task and sign it off",
+        description=(
+            "Dispatch a reviewer agent that re-checks the acceptance criteria "
+            "without having written the code. Its decision completes or fails "
+            "the task. With no id, reviews everything awaiting review."
+        ),
     )
-    p.set_defaults(func=commands.cmd_accept)
+    p.add_argument("id", nargs="?", help="task to review (default: all awaiting)")
+    p.add_argument("--agent", default="pi", help="reviewer command (default: pi)")
+    p.add_argument("--model", help="model for the reviewer")
+    p.add_argument("--timeout", type=int, default=1800, help="seconds before kill")
+    p.add_argument("--cwd", help="directory to run the reviewer in")
+    p.add_argument(
+        "--force", action="store_true", help="review a task that is not awaiting review"
+    )
+    p.add_argument("--quiet", "-q", action="store_true", help="do not mirror output")
+    p.add_argument(
+        "--dry-run", action="store_true", help="print the review prompt and stop"
+    )
+    p.set_defaults(func=commands.cmd_review)
+
+    p = sub.add_parser(
+        "override",
+        help="record a human judgement that an agent could not reach",
+        description=(
+            "The escape hatch for when the agents are wrong or unavailable. "
+            "Everything it writes is attributed to you rather than to an agent, "
+            "so the evidence log stays honest about who decided what."
+        ),
+    )
+    p.add_argument("id", help="task id")
+    p.add_argument(
+        "status",
+        choices=sorted(set(SETTABLE_STATUSES + JUDGED_STATUSES)),
+        help="status to force",
+    )
+    p.add_argument(
+        "--reason", required=True, help="why the agents' judgement is being overridden"
+    )
+    p.add_argument(
+        "--accept",
+        action="append",
+        metavar="N[=STATUS]",
+        help="also set criterion N (default passed); repeatable",
+    )
+    p.set_defaults(func=commands.cmd_override)
 
     p = sub.add_parser(
         "task",

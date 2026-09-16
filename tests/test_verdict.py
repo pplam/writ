@@ -1,0 +1,474 @@
+"""The verdict protocol: agents judge their own work, reviewers confirm it.
+
+The fake agents here are shell one-liners that write a verdict file, so the whole
+loop is exercised without a live model.
+"""
+import json
+import shlex
+import sys
+
+import pytest
+
+from writ import state, verdict
+from writ.state import WritError
+
+
+# --------------------------------------------------------------------------
+# fake agents
+
+
+def agent_reporting(payload, *, exit_code=0, to_stdout=False):
+    """A fake agent that writes `payload` as its verdict.
+
+    It reads the prompt to find the exact path writ asked for, which is also a
+    check that the prompt really names one.
+    """
+    script = f"""
+import json, re, sys
+prompt = sys.stdin.read()
+payload = {payload!r}
+match = re.search(r'^  (\\S*verdict\\.json)$', prompt, re.M)
+if {to_stdout!r} or not match:
+    sys.stdout.write("here is my report\\n```json\\n" + payload + "\\n```\\n")
+else:
+    open(match.group(1), "w").write(payload)
+    sys.stdout.write("wrote verdict\\n")
+sys.exit({exit_code})
+"""
+    return f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+
+def passing(count=3, note="ran: pytest -q, 187 passed"):
+    return json.dumps(
+        {
+            "outcome": "complete",
+            "summary": "implemented the thing",
+            "criteria": [
+                {"number": n, "status": "passed", "evidence": note}
+                for n in range(1, count + 1)
+            ],
+        }
+    )
+
+
+def partial(passed=1, total=3):
+    criteria = [
+        {"number": n, "status": "passed", "evidence": "ran: pytest -q"}
+        for n in range(1, passed + 1)
+    ]
+    criteria += [
+        {"number": n, "status": "failed", "evidence": "could not get this green"}
+        for n in range(passed + 1, total + 1)
+    ]
+    return json.dumps(
+        {"outcome": "incomplete", "summary": "got part way", "criteria": criteria}
+    )
+
+
+def review(decision, count=3):
+    status = "passed" if decision == "accept" else "failed"
+    return json.dumps(
+        {
+            "decision": decision,
+            "summary": f"re-ran the suite and {decision}ed",
+            "criteria": [
+                {"number": n, "status": status, "evidence": "independently re-ran"}
+                for n in range(1, count + 1)
+            ],
+        }
+    )
+
+
+# --------------------------------------------------------------------------
+# the prompt asks for a verdict
+
+
+def test_the_task_prompt_names_the_verdict_file_and_schema(planned, writ):
+    _, out, _ = writ("dispatch", "M01-001", "--dry-run")
+    assert "verdict.json" in out
+    assert '"outcome"' in out
+    assert "Writ sets this task's status from that file" in out
+
+
+def test_the_prompt_states_how_many_criteria_there_are(planned, writ):
+    _, out, _ = writ("dispatch", "M01-001", "--dry-run")
+    assert "3 acceptance criteria, numbered 1 to 3" in out
+
+
+def test_the_prompt_no_longer_asks_for_prose_only(planned, writ):
+    """The old prompt asked for a freeform report, which writ could not act on."""
+    _, out, _ = writ("dispatch", "M01-001", "--dry-run")
+    assert "acceptance criteria met and not met" not in out
+
+
+# --------------------------------------------------------------------------
+# an agent's verdict drives the task
+
+
+def test_a_passing_verdict_parks_the_task_for_review(planned, writ, project):
+    code, out, _ = writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    assert code == 0
+    assert "M01-001 -> awaiting-review" in out
+    assert "3/3 criteria passed" in out
+    assert "next: writ review M01-001" in out
+
+    task = state.load(project)["tasks"]["M01-001"]
+    assert task["status"] == "awaiting-review"
+    assert [a["status"] for a in task["acceptances"]] == ["passed"] * 3
+
+
+def test_an_agent_cannot_complete_its_own_task(planned, writ, project):
+    """Self-assessment is not evidence, so `complete` becomes awaiting-review."""
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    task = state.load(project)["tasks"]["M01-001"]
+    assert task["status"] != "completed"
+    assert task["last_verdict"]["outcome"] == "complete"
+    assert task["last_verdict"]["role"] == "agent"
+
+
+def test_criteria_record_who_judged_them_and_on_what_evidence(planned, writ, project):
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    task = state.load(project)["tasks"]["M01-001"]
+    first = task["acceptances"][0]
+    assert first["evidence"] == "ran: pytest -q, 187 passed"
+    assert first["judged_by"].startswith("agent(")
+
+
+def test_a_partial_verdict_fails_the_task_and_keeps_the_detail(planned, writ, project):
+    code, out, _ = writ("dispatch", "M01-001", "--agent", agent_reporting(partial()))
+    assert code == 0  # the process succeeded; the work did not
+    assert "M01-001 -> failed" in out
+    task = state.load(project)["tasks"]["M01-001"]
+    assert task["status"] == "failed"
+    assert [a["status"] for a in task["acceptances"]] == ["passed", "failed", "failed"]
+
+
+def test_a_blocked_verdict_records_what_stopped_it(planned, writ, project):
+    payload = json.dumps(
+        {
+            "outcome": "blocked",
+            "summary": "cannot proceed",
+            "blocked_on": "the storage format is undecided",
+            "criteria": [{"number": 1, "status": "pending", "evidence": ""}],
+        }
+    )
+    writ("dispatch", "M01-001", "--agent", agent_reporting(payload))
+    task = state.load(project)["tasks"]["M01-001"]
+    assert task["status"] == "blocked"
+    assert any("storage format is undecided" in e["text"] for e in task["evidence"])
+
+
+def test_an_exit_code_alone_changes_nothing(planned, writ, project):
+    """Exit 0 with no verdict is not a claim, so no criterion moves."""
+    silent = f"{shlex.quote(sys.executable)} -c 'import sys; sys.stdin.read()'"
+    code, out, err = writ("dispatch", "M01-001", "--agent", silent)
+    assert code == 0
+    assert "exited without a usable verdict" in err
+    task = state.load(project)["tasks"]["M01-001"]
+    assert task["status"] == "planned"
+    assert all(a["status"] == "pending" for a in task["acceptances"])
+
+
+def test_a_verdict_on_stdout_is_recovered(planned, writ, project):
+    """An agent that cannot write files still gets its report read."""
+    writ(
+        "dispatch",
+        "M01-001",
+        "--agent",
+        agent_reporting(passing(), to_stdout=True),
+    )
+    task = state.load(project)["tasks"]["M01-001"]
+    assert task["status"] == "awaiting-review"
+
+
+def test_a_nonzero_exit_with_a_verdict_still_uses_the_verdict(planned, writ, project):
+    writ(
+        "dispatch",
+        "M01-001",
+        "--agent",
+        agent_reporting(partial(passed=2), exit_code=1),
+    )
+    task = state.load(project)["tasks"]["M01-001"]
+    assert task["status"] == "failed"
+    # the criteria it did meet are still credited
+    assert [a["status"] for a in task["acceptances"]] == ["passed", "passed", "failed"]
+
+
+# --------------------------------------------------------------------------
+# review
+
+
+def test_review_completes_a_task_the_agent_only_claimed(planned, writ, project):
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    code, out, _ = writ("review", "M01-001", "--agent", agent_reporting(review("accept")))
+    assert code == 0
+    assert "M01-001 -> completed" in out
+    task = state.load(project)["tasks"]["M01-001"]
+    assert task["status"] == "completed"
+    assert task["last_verdict"]["role"] == "reviewer"
+
+
+def test_a_rejecting_review_fails_the_task(planned, writ, project):
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    _, out, _ = writ("review", "M01-001", "--agent", agent_reporting(review("reject")))
+    assert "M01-001 -> failed" in out
+    task = state.load(project)["tasks"]["M01-001"]
+    assert task["status"] == "failed"
+    assert [a["status"] for a in task["acceptances"]] == ["failed"] * 3
+
+
+def test_the_review_prompt_shows_the_claim_but_says_not_to_trust_it(planned, writ):
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    _, out, _ = writ("review", "M01-001", "--dry-run")
+    assert "implementer claimed passed" in out
+    assert "Treat the implementer's claims as claims" in out
+    assert "You did not write this code" in out
+    assert "Do not modify the repository" in out
+
+
+def test_review_refuses_a_task_that_was_never_reported(planned, writ):
+    code, _, err = writ("review", "M01-001", "--agent", "true")
+    assert code == 2
+    assert "not awaiting review" in err
+
+
+def test_review_with_no_id_reviews_everything_awaiting(planned, writ, project):
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    _, out, _ = writ("review", "--agent", agent_reporting(review("accept")))
+    assert "reviewing 1 task(s): M01-001" in out
+    assert state.load(project)["tasks"]["M01-001"]["status"] == "completed"
+
+
+def test_review_with_nothing_awaiting_says_so(planned, writ):
+    code, out, _ = writ("review", "--agent", "true")
+    assert code == 0 and "nothing is awaiting review" in out
+
+
+def test_a_review_run_is_recorded_as_a_reviewer(planned, writ, project):
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    writ("review", "M01-001", "--agent", agent_reporting(review("accept")))
+    runs = state.load(project)["runs"]
+    roles = sorted(run.get("role") for run in runs.values())
+    assert roles == ["agent", "reviewer"]
+
+
+def test_completing_a_task_by_review_unblocks_its_dependents(planned, writ, project):
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    writ("review", "M01-001", "--agent", agent_reporting(review("accept")))
+    _, out, _ = writ("--json", "status")
+    assert "M02-001" in json.loads(out)["ready"]
+
+
+# --------------------------------------------------------------------------
+# validation: a verdict has to be honest to be accepted
+
+
+def test_passing_a_criterion_requires_evidence():
+    payload = json.dumps(
+        {
+            "outcome": "complete",
+            "criteria": [{"number": 1, "status": "passed", "evidence": ""}],
+        }
+    )
+    with pytest.raises(WritError, match="marked passed with no evidence"):
+        verdict.parse(payload)
+
+
+def test_claiming_complete_with_unmet_criteria_is_rejected():
+    payload = json.dumps(
+        {
+            "outcome": "complete",
+            "criteria": [
+                {"number": 1, "status": "passed", "evidence": "ran it"},
+                {"number": 2, "status": "failed", "evidence": "nope"},
+            ],
+        }
+    )
+    with pytest.raises(WritError, match="outcome is 'complete' but criteria 2"):
+        verdict.parse(payload)
+
+
+def test_accepting_a_review_with_unmet_criteria_is_rejected():
+    payload = json.dumps(
+        {
+            "decision": "accept",
+            "criteria": [{"number": 1, "status": "pending", "evidence": "unsure"}],
+        }
+    )
+    with pytest.raises(WritError, match="decision is 'accept' but criteria 1"):
+        verdict.parse(payload, role="reviewer")
+
+
+def test_blocked_requires_saying_what_blocked_it():
+    payload = json.dumps({"outcome": "blocked", "criteria": []})
+    with pytest.raises(WritError, match="blocked_on is empty"):
+        verdict.parse(payload)
+
+
+def test_an_unknown_outcome_names_the_field():
+    payload = json.dumps({"outcome": "mostly done", "criteria": []})
+    with pytest.raises(WritError, match="outcome must be one of"):
+        verdict.parse(payload)
+
+
+def test_a_duplicated_criterion_is_rejected():
+    payload = json.dumps(
+        {
+            "outcome": "incomplete",
+            "criteria": [
+                {"number": 1, "status": "failed"},
+                {"number": 1, "status": "passed", "evidence": "ran it"},
+            ],
+        }
+    )
+    with pytest.raises(WritError, match="criterion 1 reported twice"):
+        verdict.parse(payload)
+
+
+def test_a_criterion_this_task_does_not_have_is_rejected(planned, writ, project):
+    payload = json.dumps(
+        {
+            "outcome": "incomplete",
+            "criteria": [{"number": 9, "status": "failed", "evidence": "x"}],
+        }
+    )
+    _, _, err = writ("dispatch", "M01-001", "--agent", agent_reporting(payload))
+    assert "reports criteria 9 but M01-001 has 3" in err
+    task = state.load(project)["tasks"]["M01-001"]
+    assert all(a["status"] == "pending" for a in task["acceptances"])
+
+
+def test_malformed_json_leaves_the_task_alone(planned, writ, project):
+    _, _, err = writ(
+        "dispatch", "M01-001", "--agent", agent_reporting("{not json at all")
+    )
+    assert "not valid JSON" in err
+    task = state.load(project)["tasks"]["M01-001"]
+    assert all(a["status"] == "pending" for a in task["acceptances"])
+
+
+def test_criteria_may_be_reported_out_of_order():
+    payload = json.dumps(
+        {
+            "outcome": "incomplete",
+            "criteria": [
+                {"number": 3, "status": "failed"},
+                {"number": 1, "status": "passed", "evidence": "ran it"},
+            ],
+        }
+    )
+    parsed = verdict.parse(payload)
+    assert [c.number for c in parsed.criteria] == [1, 3]
+
+
+def test_a_string_number_is_tolerated():
+    """Models emit "1" for 1 often enough that rejecting it is pedantry."""
+    payload = json.dumps(
+        {
+            "outcome": "incomplete",
+            "criteria": [{"number": "2", "status": "failed"}],
+        }
+    )
+    assert verdict.parse(payload).criteria[0].number == 2
+
+
+# --------------------------------------------------------------------------
+# the operator escape hatch
+
+
+def test_override_records_that_a_human_decided(planned, writ, project):
+    writ(
+        "override",
+        "M01-001",
+        "completed",
+        "--reason",
+        "checked on staging by hand",
+        "--accept",
+        "1",
+        "--accept",
+        "2",
+        "--accept",
+        "3",
+    )
+    task = state.load(project)["tasks"]["M01-001"]
+    assert task["status"] == "completed"
+    assert task["last_verdict"]["role"] == "operator"
+    assert all(a["judged_by"] == "operator" for a in task["acceptances"])
+    assert any(
+        "operator override" in e["text"] and e["actor"] == "operator"
+        for e in task["evidence"]
+    )
+
+
+def test_override_demands_a_reason(planned, writ):
+    code, _, err = writ("override", "M01-001", "completed")
+    assert code == 2 and "--reason" in err
+
+
+def test_override_can_mark_one_criterion_failed(planned, writ, project):
+    writ(
+        "override",
+        "M01-001",
+        "failed",
+        "--reason",
+        "criterion 2 regressed in staging",
+        "--accept",
+        "2=failed",
+    )
+    task = state.load(project)["tasks"]["M01-001"]
+    assert task["acceptances"][1]["status"] == "failed"
+
+
+def test_set_explains_where_completion_comes_from(planned, writ, project):
+    """A refusal is only useful if it says what to do instead."""
+    from writ import model
+
+    data = state.load(project)
+    with pytest.raises(WritError) as caught:
+        model.set_status(data, "M01-001", "completed")
+    message = str(caught.value)
+    assert "writ dispatch" in message
+    assert "writ review" in message
+    assert "writ override" in message
+
+
+# --------------------------------------------------------------------------
+# evidence log attribution
+
+
+def test_the_evidence_log_distinguishes_agent_from_reviewer(planned, writ, project):
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    writ("review", "M01-001", "--agent", agent_reporting(review("accept")))
+    task = state.load(project)["tasks"]["M01-001"]
+    actors = {entry.get("actor", "") for entry in task["evidence"]}
+    assert any(actor.startswith("agent(") for actor in actors)
+    assert any(actor.startswith("reviewer(") for actor in actors)
+
+
+def test_show_surfaces_the_evidence_and_the_judge(planned, writ):
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    _, out, _ = writ("show", "M01-001")
+    assert "judged by agent(" in out
+    assert "evidence: ran: pytest -q, 187 passed" in out
+    assert "awaiting review: writ review M01-001" in out
+
+
+def test_status_lists_what_is_awaiting_review(planned, writ):
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    _, out, _ = writ("status")
+    assert "awaiting review: M01-001" in out
+
+
+def test_list_filters_to_what_awaits_review(planned, writ):
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    _, out, _ = writ("--json", "list", "--awaiting-review")
+    assert [t["id"] for t in json.loads(out)] == ["M01-001"]
+
+
+def test_two_runs_in_the_same_second_do_not_collide(planned, writ, project):
+    """Run ids are second-resolution, and dispatch+review is faster than that."""
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    writ("review", "M01-001", "--agent", agent_reporting(review("accept")))
+    data = state.load(project)
+    assert len(data["runs"]) == 2
+    assert data["tasks"]["M01-001"]["runs"] == sorted(data["runs"])

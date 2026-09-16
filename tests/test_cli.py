@@ -85,17 +85,35 @@ def test_next_and_graph(planned, writ):
     assert "digraph writ" in dot and '"M01-001" -> "M02-001"' in dot
 
 
-def test_lifecycle_with_acceptance_gate(planned, writ):
+def test_completion_is_not_available_to_the_operator(planned, writ):
+    """The point of the tool: a human cannot declare a task done by typing."""
     assert writ("set", "M01-001", "running")[0] == 0
     code, _, err = writ("set", "M01-001", "completed")
-    assert code == 2 and "unmet acceptance criteria" in err
-    for index in (1, 2, 3):
-        assert writ("accept", "M01-001", str(index), "passed")[0] == 0
-    assert writ("set", "M01-001", "completed", "--evidence", "suite green")[0] == 0
+    assert code == 2
+    assert "invalid choice" in err
+
+
+def test_override_completes_a_task_and_says_who_decided(planned, writ):
+    code, out, _ = writ(
+        "override",
+        "M01-001",
+        "completed",
+        "--reason",
+        "verified by hand on staging",
+        "--accept",
+        "1",
+        "--accept",
+        "2",
+        "--accept",
+        "3",
+    )
+    assert code == 0 and "operator override" in out
     _, out, _ = writ("--json", "status")
     payload = json.loads(out)
     assert payload["tasks_completed"] == 1
     assert payload["ready"] == ["M02-001"]
+    _, shown, _ = writ("show", "M01-001")
+    assert "operator" in shown
 
 
 def test_dependency_gate_blocks_out_of_order_start(planned, writ):

@@ -55,9 +55,11 @@ def test_successful_dispatch_records_a_run(planned, writ, project):
     assert "Task M01-001" in (directory / "stdout.log").read_text()
 
     task = data["tasks"]["M01-001"]
-    assert task["status"] == "planned"  # success awaits acceptance sign-off
+    # the echo agent never writes a verdict, so exiting 0 proves nothing and the
+    # task goes back to planned rather than being credited
+    assert task["status"] == "planned"
     assert task["runs"] == [run_id]
-    assert any("exit code 0" in item["text"] for item in task["evidence"])
+    assert any("without a usable verdict" in item["text"] for item in task["evidence"])
 
 
 def test_failing_agent_marks_the_task_failed(planned, writ, project):

@@ -7,9 +7,12 @@ dependency-ordered task DAG with explicit acceptance criteria, hands one task at
 a time back to an agent, and keeps an append-only decision log. State is plain
 files — JSON, markdown, and logs — under `<project>/.writ`.
 
-The premise: an agent should never be asked to "implement the design". It gets
-one bounded task, a stated bar, and a guardrail list. Everything it did stays
-inspectable afterwards.
+Two premises. An agent should never be asked to "implement the design": it gets
+one bounded task, a stated bar, and a guardrail list. And whether that bar was
+met is decided by agents, not typed in by a human — the agent that did the work
+reports a structured verdict with evidence, and a reviewer agent that did not
+write the code decides whether to sign it off. Everything either of them claimed
+stays inspectable afterwards.
 
 ## Install
 
@@ -36,12 +39,12 @@ writ status                            # progress, ready work, live runs
 writ list --ready                      # what can start now
 writ show M01-001                      # the task and its acceptance bars
 
-writ dispatch M01-001 --agent claude --detach
+writ dispatch M01-001 --agent claude    # implements it, reports a verdict
 writ logs M01-001 --follow             # stream the agent's output
 writ status --watch                    # from any other terminal, any time
 
-writ accept M01-001 1
-writ set M01-001 completed --evidence "go test ./... green"
+writ review M01-001 --agent codex      # a different agent checks the claim
+                                       # its decision completes or fails the task
 
 writ decide "Fixture-only tests" \
   --decision "Automated tests never touch a live platform." \
@@ -62,6 +65,7 @@ writ decide "Fixture-only tests" \
     stderr.log
   runs/<run-id>/
     prompt.txt        exactly what the agent was given
+    verdict.json      what it claimed, per criterion, with evidence
     stdout.log
     stderr.log
     supervisor.log    detached runs only
@@ -139,24 +143,74 @@ structured as a task list, or when you want no agent in the loop.
 ```
 planned ──(deps complete)──> ready ──dispatch──> running
                                                     │
-                        agent exits 0 ──────────────┤
-                                                    ▼
-                                    planned (awaiting acceptance sign-off)
-                        agent exits non-zero ─────> failed
+                                         agent writes a verdict
+                                                    │
+                    ┌───────────────────────────────┼──────────────┐
+                    ▼                               ▼              ▼
+             awaiting-review                     failed         blocked
+                    │
+                 review ──> reviewing ──┬──> completed   (reviewer accepted)
+                                        └──> failed      (reviewer rejected)
 ```
 
-`ready` is derived, never stored. Two gates are enforced:
+`ready` is derived from the DAG, never stored.
 
-- a task cannot **start** while a dependency is incomplete;
-- a task cannot **complete** while an acceptance criterion is unmet.
+### Statuses are set by agents, not by hand
 
-Both accept `--force`, which records the override rather than hiding it. A
-successful agent run does **not** auto-complete the task — the agent's exit code
-is evidence, not a verdict.
+The implementing agent reports a structured verdict; a reviewer agent that did
+not write the code checks it. Between them they own every status change that
+represents a judgement about the work:
+
+- the **implementing agent** can pass criteria and reach `awaiting-review`. It
+  cannot mark its own task `completed` — an agent grading its own homework is
+  not evidence.
+- the **reviewer agent** re-runs the tests and re-reads the diff, and its
+  decision is what produces `completed` or `failed`.
+
+So `writ set` covers only workflow moves (`planned`, `running`, `blocked`,
+`failed`). It has no `completed`, with or without `--force`.
+
+### The verdict
+
+Every dispatched agent is told to write `verdict.json` into its run directory:
+
+```json
+{
+  "outcome": "complete",
+  "summary": "what changed and what it now does",
+  "criteria": [
+    {"number": 1, "status": "passed",
+     "evidence": "python3 -m pytest -q -> 5 passed"}
+  ],
+  "notes": "assumptions, deviations, risks"
+}
+```
+
+Writ validates it before applying it. A criterion marked `passed` with no
+evidence is rejected, as is an `outcome: complete` that any criterion
+contradicts, or a verdict about criteria the task does not have. Rejected
+verdicts leave the task untouched and print why.
+
+**An exit code is not a verdict.** A process can exit 0 having done nothing, so
+a run that produces no usable verdict moves no criterion; the task returns to
+`planned` and the transcript is left for you to read. Conversely a non-zero exit
+with a valid verdict still records the criteria the agent did meet.
+
+### When a human needs the last word
+
+`writ override <id> <status> --reason ...` does what `set` and `accept` used to,
+and is the only way to reach `completed` by hand. It requires a reason and
+attributes everything it writes to `operator` rather than to an agent, so the
+evidence log stays honest about who decided what:
+
+```bash
+writ override M01-001 completed --reason "verified on staging" --accept 1 --accept 2
+writ override M01-002 failed --reason "criterion 2 regressed" --accept 2=failed
+```
 
 ## Commands
 
-Fourteen commands, organized by what you are doing rather than what type it
+Fifteen commands, organized by what you are doing rather than what type it
 operates on.
 
 **Set up**
@@ -171,7 +225,7 @@ operates on.
 | Command | Purpose |
 |---|---|
 | `writ status [--watch] [--interval S] [--until-idle]` | progress, ready work, live runs |
-| `writ list [tasks\|milestones\|runs\|decisions] [--status S] [--milestone M] [--task T] [--ready] [--active] [--limit N]` | any collection |
+| `writ list [tasks\|milestones\|runs\|decisions] [--status S] [--milestone M] [--task T] [--ready] [--awaiting-review] [--active] [--limit N]` | any collection |
 | `writ show <id> [--verbose] [--prompt]` | any single thing |
 | `writ graph [--dot]` | the dependency DAG |
 | `writ logs <run-id\|task-id> [--follow] [--stderr] [--tail N]` | agent output |
@@ -180,8 +234,8 @@ operates on.
 
 | Command | Purpose |
 |---|---|
-| `writ set <id> <status> [--evidence T] [--force]` | task status |
-| `writ accept <id> <n> [status]` | per-criterion sign-off (defaults to `passed`) |
+| `writ set <id> <status> [--evidence T] [--force]` | workflow status; cannot reach `completed` |
+| `writ override <id> <status> --reason R [--accept N[=STATUS]]` | human judgement, attributed to you |
 | `writ task [id] [--title T] [--milestone M] [--depends] [--acceptance] [--allow] [--forbid]` | create, or amend with an id |
 | `writ decide <title> --decision D [--context] [--consequences] [--supersedes ID] [--task ID] [--export PATH]` | append a decision |
 
@@ -189,7 +243,8 @@ operates on.
 
 | Command | Purpose |
 |---|---|
-| `writ dispatch <id> [--agent CMD] [--model M] [--detach] [--timeout S] [--cwd D] [--quiet] [--dry-run] [-- args]` | run an agent |
+| `writ dispatch <id> [--agent CMD] [--model M] [--detach] [--timeout S] [--cwd D] [--quiet] [--dry-run] [-- args]` | an agent implements the task and reports a verdict |
+| `writ review [id] [--agent CMD] [--model M] [--timeout S] [--cwd D] [--force] [--quiet] [--dry-run]` | a second agent verifies and signs off; no id reviews all awaiting |
 | `writ cancel [run-id]` | stop a run, or reap dead ones when given no id |
 | `writ agents [--agent CMD] [--model M]` | how writ invokes each agent headlessly |
 
@@ -211,20 +266,22 @@ writ show D-0001               # one decision
 ```
 
 A task view shows both directions of the DAG (what it waits on, and what it
-unblocks), per-criterion acceptance state, the design section it came from, every
-run with its exit code, and the evidence log — including notes the planning agent
-left about ambiguities it found.
+unblocks), the design section it came from, every run tagged by role
+(`[agent]` / `[reviewer]`), and the evidence log attributed to whoever produced
+each line. Each acceptance criterion carries the evidence behind it and the name
+of the agent that judged it, so "2/2 passed" can always be traced back to the
+commands someone actually ran.
 
 ### A status is a value, not a verb
 
 ```bash
 writ set M01-001 running
-writ set M01-001 completed --evidence "go test ./... green"
+writ set M01-001 blocked --evidence "waiting on the storage decision"
 ```
 
 One command for every transition, so the legal values live in one place and
-`--help` lists them. `ready` is absent on purpose: it is derived from the DAG and
-never stored, so it cannot be set.
+`--help` lists them. Two are absent on purpose: `ready` is derived from the DAG,
+and `completed` belongs to the review flow above.
 
 Records in the decision log are append-only. Superseding writes a new entry and
 marks the old one `superseded`; nothing is edited in place.
@@ -232,13 +289,22 @@ marks the old one `superseded`; nothing is edited in place.
 ## Dispatch
 
 The prompt is assembled from the authoritative documents, the task, its
-acceptance criteria, any allow/forbid lists, the matching design section, and a
-fixed guardrail block (test-first, minimum change, no weakened invariants, no
-live network, report assumptions and deviations). Preview it with:
+acceptance criteria, any allow/forbid lists, the matching design section, a fixed
+guardrail block (test-first, minimum change, no weakened invariants, no live
+network), and the verdict contract: the exact path to write, the schema, and the
+rule that a criterion marked `passed` needs re-runnable evidence. Earlier
+attempts on the same task are included, so a retry can see what already failed.
+
+Preview either prompt without running anything:
 
 ```bash
 writ dispatch M01-001 --dry-run
+writ review M01-001 --dry-run
 ```
+
+The review prompt shows the implementer's claims and tells the reviewer to treat
+them as claims. It gets them because a reviewer that cannot see the claim cannot
+tell a misleading one from an honest one.
 
 The prompt is written to the run directory and delivered to the agent on stdin,
 and the agent's output is mirrored to your terminal as it arrives (`--quiet` to
@@ -253,6 +319,17 @@ writ dispatch M01-001 --agent claude -- --dangerously-skip-permissions
 can close the terminal and still get a recorded outcome. `--timeout` kills the
 process group and records exit 124. If a machine dies mid-run, `writ cancel`
 with no id reconciles the orphaned records.
+
+`writ review` takes the same agent, model, and timeout flags. With no task id it
+reviews everything currently awaiting review, which is the usual way to run it:
+
+```bash
+writ review                            # everything awaiting
+writ list --awaiting-review            # see that queue first
+```
+
+Using a different model for review than for implementation is worth doing: an
+independent check is only as independent as the thing performing it.
 
 ## Agent invocation
 

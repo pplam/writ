@@ -47,16 +47,16 @@ def test_force_overrides_dependency_gate():
 def test_complete_requires_acceptances_passed():
     data = base_state()
     with pytest.raises(WritError, match="unmet acceptance criteria"):
-        model.set_status(data, "M01-001", "completed")
+        model.set_status(data, "M01-001", "completed", allow_judged=True)
     model.set_acceptance(data, "M01-001", 1, "passed")
-    model.set_status(data, "M01-001", "completed")
+    model.set_status(data, "M01-001", "completed", allow_judged=True)
     assert data["tasks"]["M01-001"]["status"] == "completed"
 
 
 def test_completing_a_dependency_unblocks_the_next_task():
     data = base_state()
     model.set_acceptance(data, "M01-001", 1, "passed")
-    model.set_status(data, "M01-001", "completed")
+    model.set_status(data, "M01-001", "completed", allow_judged=True)
     assert model.effective_status(data, data["tasks"]["M01-002"]) == "ready"
 
 
@@ -64,10 +64,10 @@ def test_milestone_status_is_derived():
     data = base_state()
     assert data["milestones"]["M01"]["status"] == "ready"
     model.set_acceptance(data, "M01-001", 1, "passed")
-    model.set_status(data, "M01-001", "completed")
+    model.set_status(data, "M01-001", "completed", allow_judged=True)
     assert data["milestones"]["M01"]["status"] == "in-progress"
     model.set_acceptance(data, "M01-002", 1, "passed")
-    model.set_status(data, "M01-002", "completed")
+    model.set_status(data, "M01-002", "completed", allow_judged=True)
     assert data["milestones"]["M01"]["status"] == "completed"
 
 

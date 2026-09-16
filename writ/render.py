@@ -8,6 +8,8 @@ STATUS_MARKS = {
     "planned": "·",
     "ready": ">",
     "running": "*",
+    "reviewing": "*",
+    "awaiting-review": "?",
     "blocked": "!",
     "completed": "+",
     "failed": "x",
@@ -53,3 +55,21 @@ def bar(done: int, total: int, width: int = 24) -> str:
 def acceptance_line(index: int, item: dict[str, Any]) -> str:
     glyph = {"passed": "x", "failed": "!", "pending": " "}[item["status"]]
     return f"  {index}. [{glyph}] {item['text']}"
+
+
+def acceptance_detail(index: int, item: dict[str, Any]) -> list[str]:
+    """An acceptance criterion with the evidence and the judge behind it.
+
+    A bare checkmark is not much use when an agent set it: the value is in who
+    claimed it and what they ran, so both are shown under the line.
+    """
+    lines = [acceptance_line(index, item)]
+    judge = item.get("judged_by")
+    if judge:
+        lines.append(f"        judged by {judge}")
+    evidence = item.get("evidence")
+    if evidence:
+        for number, chunk in enumerate(str(evidence).splitlines()):
+            prefix = "        evidence: " if number == 0 else "                  "
+            lines.append(f"{prefix}{chunk}")
+    return lines

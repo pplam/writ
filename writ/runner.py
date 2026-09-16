@@ -8,9 +8,9 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, IO
+from typing import Any, IO, Iterable
 
-from . import agents, planner, state
+from . import agents, planner, state, verdict
 from .model import (
     add_evidence,
     blocking_dependencies,
@@ -30,17 +30,16 @@ Working rules (non-negotiable):
 5. Run the project's full verification (build, tests, vet/lint) before reporting.
 6. Do not weaken an invariant, add a dependency, or use live network data to pass a test.
 7. Do not modify components outside the allowed list.
-
-Report back:
-- files changed and why
-- the test written first and its initial failure
-- tests now passing, with the exact commands and results
-- acceptance criteria met and not met
-- assumptions, deviations, and remaining risks
 """
 
 
-def build_prompt(data: dict[str, Any], task: dict[str, Any], root: Path) -> str:
+def build_prompt(
+    data: dict[str, Any],
+    task: dict[str, Any],
+    root: Path,
+    *,
+    verdict_path: Path | None = None,
+) -> str:
     """Compose the agent prompt from the task, its gates, and the design doc."""
     lines: list[str] = []
     lines.append("You are implementing ONE bounded task in this project.")
@@ -80,7 +79,137 @@ def build_prompt(data: dict[str, Any], task: dict[str, Any], root: Path) -> str:
         lines.append(excerpt)
         lines.append("---")
         lines.append("")
+    if task.get("evidence"):
+        recent = task["evidence"][-4:]
+        lines.append("Previous attempts on this task recorded:")
+        for entry in recent:
+            actor = entry.get("actor", "operator")
+            lines.append(f"- [{actor}] {entry['text']}")
+        lines.append("")
     lines.append(GUARDRAILS)
+    lines.append("")
+    lines.append(_verdict_instructions(task, verdict_path))
+    return "\n".join(lines)
+
+
+def _verdict_instructions(task: dict[str, Any], verdict_path: Path | None) -> str:
+    """Tell the agent to report a machine-readable verdict, and how.
+
+    Writ records the task's status from this file. Without it the run leaves the
+    task untouched, so the instruction is explicit about the consequence rather
+    than trusting the agent to infer that reporting matters.
+    """
+    path = verdict_path or Path(verdict.VERDICT_FILENAME)
+    total = len(task.get("acceptances", []))
+    lines = [
+        "When you are done, report your verdict as JSON to this exact path:",
+        f"  {path}",
+        "",
+        "The file must contain JSON only — no prose, no code fence.",
+        "",
+        "Schema:",
+        verdict.SCHEMA,
+        "",
+        verdict.RULES,
+        "",
+        f"This task has {total} acceptance criteria, numbered 1 to {total}.",
+        "",
+        "Writ sets this task's status from that file, and an independent reviewer "
+        "re-checks whatever you claim. If you do not write it, the task stays "
+        "where it was and your work is not recorded.",
+        "",
+        "If you cannot write the file, print the same JSON to stdout inside a "
+        "single ```json fenced block instead.",
+    ]
+    return "\n".join(lines)
+
+
+def build_review_prompt(
+    data: dict[str, Any],
+    task: dict[str, Any],
+    root: Path,
+    *,
+    verdict_path: Path | None = None,
+) -> str:
+    """Compose the prompt for an agent reviewing someone else's work.
+
+    The reviewer is told what was claimed and asked to verify it independently.
+    It gets the claim because a review that cannot see the claim cannot tell a
+    misleading one from an honest one; it is told not to trust it for the same
+    reason.
+    """
+    lines: list[str] = []
+    lines.append(
+        "You are reviewing ONE completed task in this project. You did not write "
+        "this code. Do not fix it — judge it."
+    )
+    lines.append("")
+    docs = list(data.get("design_docs", []))
+    if task.get("design_doc") and task["design_doc"] not in docs:
+        docs.append(task["design_doc"])
+    if docs:
+        lines.append("Authoritative documents:")
+        lines.extend(f"- {doc}" for doc in docs)
+        lines.append("")
+    lines.append(f"Task {task['id']}: {task['title']}")
+    if task.get("milestone"):
+        milestone = data["milestones"].get(task["milestone"], {})
+        lines.append(f"Milestone: {task['milestone']} — {milestone.get('title', '')}")
+    lines.append("")
+    lines.append("Acceptance criteria to verify:")
+    for index, item in enumerate(task.get("acceptances", []), start=1):
+        lines.append(f"  {index}. {item['text']}")
+        claimed = item.get("status", "pending")
+        if item.get("evidence"):
+            lines.append(f"     implementer claimed {claimed}: {item['evidence']}")
+        else:
+            lines.append(f"     implementer left this {claimed}")
+    lines.append("")
+    last = task.get("last_verdict") or {}
+    if last.get("summary"):
+        lines.append("The implementer summarised its work as:")
+        lines.append(f"  {last['summary']}")
+        lines.append("")
+    if task.get("allowed"):
+        lines.append("The task was scoped to these files/packages:")
+        lines.extend(f"- {item}" for item in task["allowed"])
+        lines.append("")
+    if task.get("forbidden"):
+        lines.append("It was forbidden from modifying:")
+        lines.extend(f"- {item}" for item in task["forbidden"])
+        lines.append("")
+    excerpt = _design_excerpt(task, root)
+    if excerpt:
+        lines.append("Relevant design section:")
+        lines.append("---")
+        lines.append(excerpt)
+        lines.append("---")
+        lines.append("")
+    lines.append(
+        "Verify by running the project's tests yourself and reading the diff. "
+        "Treat the implementer's claims as claims."
+    )
+    lines.append("")
+    lines.append(verdict.REVIEW_RULES)
+    lines.append("")
+    path = verdict_path or Path(verdict.VERDICT_FILENAME)
+    lines.append("Write your review as JSON to this exact path:")
+    lines.append(f"  {path}")
+    lines.append("")
+    lines.append("The file must contain JSON only — no prose, no code fence.")
+    lines.append("")
+    lines.append("Schema:")
+    lines.append(verdict.REVIEW_SCHEMA)
+    lines.append("")
+    lines.append(
+        "Writ completes or fails the task from your decision, so it is the last "
+        "word. If you do not write the file, the task stays awaiting review."
+    )
+    lines.append("")
+    lines.append(
+        "If you cannot write the file, print the same JSON to stdout inside a "
+        "single ```json fenced block instead."
+    )
     return "\n".join(lines)
 
 
@@ -96,8 +225,23 @@ def _design_excerpt(task: dict[str, Any], root: Path, limit: int = 4000) -> str:
     return text[:limit]
 
 
-def new_run_id(task_id: str) -> str:
-    return f"{task_id}-{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}"
+def new_run_id(task_id: str, taken: Iterable[str] = ()) -> str:
+    """A unique run id for this task.
+
+    Ids are timestamped to the second and two runs of the same task can easily
+    start within one second — dispatch then review, or a quick retry — so a
+    collision is disambiguated with a suffix rather than silently overwriting
+    the earlier run's record.
+    """
+    base = f"{task_id}-{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}"
+    existing = set(taken)
+    if base not in existing:
+        return base
+    for suffix in range(2, 100):
+        candidate = f"{base}-{suffix}"
+        if candidate not in existing:
+            return candidate
+    raise WritError(f"too many runs of {task_id} in one second")
 
 
 TIMEOUT_NOTE = "writ: agent exceeded its timeout and was terminated"
@@ -255,26 +399,41 @@ def prepare(
     timeout: int | None,
     cwd: str | None,
     force: bool,
+    role: str = "agent",
 ) -> tuple[str, Path, str, agents.ResolvedAgent]:
-    """Create the run directory and record the run as `starting`."""
+    """Create the run directory and record the run as `starting`.
+
+    `role` selects the prompt and how the resulting verdict is applied: an
+    implementing agent parks the task at `awaiting-review`, a reviewer completes
+    or fails it.
+    """
     resolved = agents.resolve(agent, agent_args, model)
     with state.transaction(root) as data:
         task = get_task(data, task_id)
-        if not force:
+        if role == "reviewer":
+            if task["status"] not in ("awaiting-review", "reviewing") and not force:
+                raise WritError(
+                    f"{task_id} is {task['status']}, not awaiting review "
+                    "(use --force to review it anyway)"
+                )
+        elif not force:
             blockers = blocking_dependencies(data, task)
             if blockers:
                 raise WritError(
                     f"{task_id} is blocked by incomplete dependencies: "
                     f"{', '.join(blockers)} (use --force to override)"
                 )
-        run_id = new_run_id(task_id)
+        run_id = new_run_id(task_id, data["runs"])
         directory = state.run_dir(root, run_id)
         directory.mkdir(parents=True, exist_ok=True)
-        prompt = build_prompt(data, task, Path(root))
+        verdict_path = directory / verdict.VERDICT_FILENAME
+        builder = build_review_prompt if role == "reviewer" else build_prompt
+        prompt = builder(data, task, Path(root), verdict_path=verdict_path)
         (directory / "prompt.txt").write_text(prompt, encoding="utf-8")
         data["runs"][run_id] = {
             "id": run_id,
             "task": task_id,
+            "role": role,
             "status": "starting",
             "command": resolved.command,
             "model": model,
@@ -288,7 +447,7 @@ def prepare(
             "dir": str(directory),
         }
         task.setdefault("runs", []).append(run_id)
-        task["status"] = "running"
+        task["status"] = "reviewing" if role == "reviewer" else "running"
         task["updated_at"] = utcnow()
         refresh_milestones(data)
     return run_id, directory, prompt, resolved
@@ -370,6 +529,14 @@ def _mark_running(root: Path, run_id: str, pid: int) -> None:
 
 
 def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None:
+    """Record the run's outcome, and apply the agent's verdict to its task.
+
+    An exit code is not a judgement. A process can exit 0 having done nothing and
+    exit non-zero after finishing the work, so the task's status comes from the
+    verdict the agent wrote, not from `code`. A missing or invalid verdict leaves
+    the task's criteria untouched and says so — silently guessing is what this
+    whole mechanism exists to avoid.
+    """
     with state.transaction(root) as data:
         run = data["runs"][run_id]
         run["status"] = "completed" if code == 0 else "failed"
@@ -377,18 +544,68 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
         run["finished_at"] = utcnow()
         if note:
             run["note"] = note
+        role = run.get("role", "agent")
         task = data["tasks"].get(run["task"])
-        if task is not None and task["status"] == "running":
-            # An agent exit is evidence, not a verdict: success moves the task to
-            # `planned` awaiting acceptance sign-off, failure is recorded as failed.
-            task["status"] = "planned" if code == 0 else "failed"
+        if task is None:
+            refresh_milestones(data)
+            return
+        directory = Path(run["dir"])
+        actor = _actor(run)
+        try:
+            reported = verdict.read(directory, role=role)
+        except WritError as exc:
+            reported = None
+            run["verdict_error"] = str(exc)
+            add_evidence(task, f"unusable verdict from {actor}: {exc}", actor="writ")
+
+        if reported is not None:
+            try:
+                verdict.check_scope(reported, task, str(directory))
+            except WritError as exc:
+                run["verdict_error"] = str(exc)
+                add_evidence(task, f"unusable verdict from {actor}: {exc}", actor="writ")
+            else:
+                run["verdict"] = {
+                    "outcome": reported.outcome,
+                    "decision": reported.decision,
+                    "passed": reported.passed,
+                    "unmet": reported.unmet,
+                }
+                status = verdict.apply(data, task, reported, actor=actor)
+                run["resulting_status"] = status
+                refresh_milestones(data)
+                return
+
+        # No usable verdict. Record what happened without inventing a judgement:
+        # the task falls back to failed if the process itself failed, and
+        # otherwise returns to planned so it can be picked up again.
+        if task["status"] in ("running", "reviewing"):
+            task["status"] = "failed" if code != 0 else "planned"
             task["updated_at"] = utcnow()
-            add_evidence(
-                task,
-                f"run {run_id} finished with exit code {code}"
-                + (f" ({note})" if note else ""),
-            )
+        add_evidence(
+            task,
+            f"run {run_id} exited {code} without a usable verdict"
+            + (f" ({note})" if note else ""),
+            actor="writ",
+        )
         refresh_milestones(data)
+
+
+def _actor(run: dict[str, Any]) -> str:
+    """A short name for who produced a verdict, for the evidence log."""
+    role = run.get("role", "agent")
+    command = run.get("command") or []
+    name = Path(command[0]).name if command else "agent"
+    if run.get("model"):
+        name = f"{name}:{run['model']}"
+    return f"{role}({name})"
+
+
+def verdict_summary(root: Path, run_id: str) -> tuple[str | None, str | None]:
+    """The status a run produced and any verdict error, for the CLI to report."""
+    data = state.load(root)
+    run = data["runs"].get(run_id) or {}
+    return run.get("resulting_status"), run.get("verdict_error")
 
 
 def detach(root: Path, run_id: str) -> int:

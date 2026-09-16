@@ -5,12 +5,30 @@ from typing import Any, Iterable
 
 from .state import WritError, utcnow
 
-TASK_STATUSES = ("planned", "ready", "running", "blocked", "completed", "failed")
+TASK_STATUSES = (
+    "planned",
+    "ready",
+    "running",
+    "awaiting-review",
+    "reviewing",
+    "blocked",
+    "completed",
+    "failed",
+)
 ACCEPTANCE_STATUSES = ("pending", "passed", "failed")
 TERMINAL_STATUSES = ("completed",)
 
-#: statuses a user may set directly; `ready` is derived, never stored
-SETTABLE_STATUSES = ("planned", "running", "blocked", "completed", "failed")
+#: statuses an operator may set directly.
+#:
+#: Deliberately small. `completed` is absent because completion is a judgement
+#: about acceptance criteria, and that judgement belongs to the agent that did
+#: the work and the reviewer that checked it — see writ/verdict.py. `ready` and
+#: `awaiting-review` are absent because they are derived, not stored decisions.
+#: An operator overriding any of these uses `writ override`, which says so.
+SETTABLE_STATUSES = ("planned", "running", "blocked", "failed")
+
+#: statuses only a verdict or an explicit override may produce
+JUDGED_STATUSES = ("completed", "awaiting-review")
 
 
 def get_task(data: dict[str, Any], task_id: str) -> dict[str, Any]:
@@ -102,8 +120,10 @@ def milestone_status(data: dict[str, Any], milestone_id: str) -> str:
         return "completed"
     if any(status == "failed" for status in statuses):
         return "failed"
-    if any(status == "running" for status in statuses):
+    if any(status in ("running", "reviewing") for status in statuses):
         return "running"
+    if any(status == "awaiting-review" for status in statuses):
+        return "awaiting-review"
     if any(status == "blocked" for status in statuses):
         return "blocked"
     if any(status in ("ready", "completed") for status in statuses):
@@ -130,6 +150,15 @@ def ready_tasks(data: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def reviewable_tasks(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Tasks whose implementing agent has reported and that await a reviewer."""
+    return [
+        task
+        for task in sorted(data["tasks"].values(), key=lambda item: item["id"])
+        if task["status"] == "awaiting-review"
+    ]
+
+
 def set_status(
     data: dict[str, Any],
     task_id: str,
@@ -137,11 +166,27 @@ def set_status(
     *,
     evidence: str | None = None,
     force: bool = False,
+    actor: str = "operator",
+    allow_judged: bool = False,
 ) -> dict[str, Any]:
-    """Transition a task, enforcing dependency and acceptance gates."""
-    if status not in SETTABLE_STATUSES:
+    """Transition a task, enforcing dependency and acceptance gates.
+
+    `allow_judged` is how a verdict or an explicit override reaches `completed`;
+    ordinary `writ set` cannot, because completion is a judgement about the
+    acceptance criteria rather than a bookkeeping change.
+    """
+    permitted = SETTABLE_STATUSES + (JUDGED_STATUSES if allow_judged else ())
+    if status not in permitted:
+        if status in JUDGED_STATUSES:
+            raise WritError(
+                f"{status!r} is not set by hand: it is the outcome of an agent "
+                "verdict. Let the agent report (`writ dispatch`), have a "
+                f"reviewer check it (`writ review {task_id}`), or record an "
+                f"explicit human judgement with `writ override {task_id} "
+                f"{status} --reason ...`"
+            )
         raise WritError(
-            f"cannot set status {status!r}; choose from {', '.join(SETTABLE_STATUSES)}"
+            f"cannot set status {status!r}; choose from {', '.join(permitted)}"
         )
     task = get_task(data, task_id)
     if status == "running" and not force:
@@ -157,23 +202,38 @@ def set_status(
             listed = "; ".join(unmet)
             raise WritError(
                 f"{task_id} has unmet acceptance criteria: {listed} "
-                "(mark them with `writ accept`, or use --force)"
+                "(only a passing verdict clears these)"
             )
     task["status"] = status
     task["updated_at"] = utcnow()
     if evidence:
-        add_evidence(task, evidence)
+        add_evidence(task, evidence, actor=actor)
     refresh_milestones(data)
     return task
 
 
-def add_evidence(task: dict[str, Any], text: str) -> None:
-    task.setdefault("evidence", []).append({"at": utcnow(), "text": text})
+def add_evidence(task: dict[str, Any], text: str, *, actor: str = "operator") -> None:
+    """Append to the task's evidence log, recording who claimed it.
+
+    The actor matters: "tests pass" from the agent that wrote the code and from
+    an independent reviewer are different claims, and the log has to keep them
+    apart to be worth anything.
+    """
+    task.setdefault("evidence", []).append(
+        {"at": utcnow(), "actor": actor, "text": text}
+    )
 
 
 def set_acceptance(
-    data: dict[str, Any], task_id: str, number: int, status: str
+    data: dict[str, Any],
+    task_id: str,
+    number: int,
+    status: str,
+    *,
+    actor: str = "operator",
+    evidence: str | None = None,
 ) -> dict[str, Any]:
+    """Record a judgement on one criterion. Normally written by a verdict."""
     if status not in ACCEPTANCE_STATUSES:
         raise WritError(
             f"acceptance status must be one of {', '.join(ACCEPTANCE_STATUSES)}"
@@ -184,7 +244,12 @@ def set_acceptance(
         raise WritError(
             f"{task_id} has {len(acceptances)} acceptance criteria; {number} is out of range"
         )
-    acceptances[number - 1]["status"] = status
+    entry = acceptances[number - 1]
+    entry["status"] = status
+    entry["judged_by"] = actor
+    entry["judged_at"] = utcnow()
+    if evidence:
+        entry["evidence"] = evidence
     task["updated_at"] = utcnow()
     return task
 

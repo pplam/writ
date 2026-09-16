@@ -35,8 +35,7 @@ def test_tasks_show_omits_blocks_for_a_leaf_task(planned, writ):
 
 def test_tasks_show_includes_constraints_runs_and_evidence(planned, writ, project):
     writ("task", "M01-001", "--allow", "internal/store", "--forbid", "api/")
-    writ("accept", "M01-001", "1", "passed")
-    writ("set", "M01-001", "failed", "--evidence", "flaky under load")
+    writ("override", "M01-001", "failed", "--reason", "flaky under load", "--accept", "1")
     _, out, _ = writ("show", "M01-001")
     assert "allowed:\n  - internal/store" in out
     assert "forbidden:\n  - api/" in out
@@ -89,9 +88,10 @@ def test_milestones_show_summarises_and_lists_members(planned, writ):
 
 
 def test_milestones_show_rollup_tracks_completion(planned, writ):
-    for index in (1, 2, 3):
-        writ("accept", "M01-001", str(index), "passed")
-    writ("set", "M01-001", "completed")
+    writ(
+        "override", "M01-001", "completed", "--reason", "verified by hand",
+        "--accept", "1", "--accept", "2", "--accept", "3",
+    )
     _, out, _ = writ("show", "M01")
     assert "tasks: 1/1" in out
     assert "status: completed" in out
@@ -262,10 +262,12 @@ def test_set_walks_a_task_through_its_statuses(planned, writ):
     assert "status: ready" in out  # planned + unblocked reads as ready
 
 
-def test_set_still_enforces_the_acceptance_gate(planned, writ):
+def test_set_cannot_reach_completed_at_all(planned, writ):
+    """Not even --force: completion is a verdict, not a transition."""
     code, _, err = writ("set", "M01-001", "completed")
-    assert code == 2 and "unmet acceptance criteria" in err
-    assert writ("set", "M01-001", "completed", "--force")[0] == 0
+    assert code == 2 and "invalid choice" in err
+    code, _, err = writ("set", "M01-001", "completed", "--force")
+    assert code == 2 and "invalid choice" in err
 
 
 def test_set_rejects_a_derived_status(planned, writ):
@@ -274,8 +276,10 @@ def test_set_rejects_a_derived_status(planned, writ):
     assert code == 2 and "invalid choice" in err
 
 
-def test_accept_defaults_to_passed(planned, writ):
-    assert writ("accept", "M01-001", "1")[0] == 0
+def test_override_can_sign_off_one_criterion(planned, writ):
+    assert writ(
+        "override", "M01-001", "planned", "--reason", "checked by hand", "--accept", "1"
+    )[0] == 0
     _, out, _ = writ("show", "M01-001")
     assert "1. [x] the project builds" in out
 
