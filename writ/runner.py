@@ -206,6 +206,12 @@ def build_review_prompt(
         for item in recorded:
             lines.append(f"- [{item['status']}] {item['title']}: {item['decision']}")
         lines.append("")
+        lines.append(
+            "Do not propose these again, even in different words. Propose a "
+            "decision only for a fork none of the above covers, or say in your "
+            "summary that one of them is wrong."
+        )
+        lines.append("")
     path = verdict_path or Path(verdict.VERDICT_FILENAME)
     lines.append("Write your review as JSON to this exact path:")
     lines.append(f"  {path}")
@@ -214,6 +220,12 @@ def build_review_prompt(
     lines.append("")
     lines.append("Schema:")
     lines.append(verdict.REVIEW_SCHEMA)
+    lines.append("")
+    total = len(task.get("acceptances", []))
+    lines.append(
+        f"This task has {total} acceptance criteria, numbered 1 to {total}. "
+        "Report on every one."
+    )
     lines.append("")
     lines.append(
         "Writ completes or fails the task from your decision, so it is the last "

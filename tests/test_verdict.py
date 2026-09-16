@@ -629,3 +629,23 @@ def test_the_reviewer_sees_decisions_already_recorded(planned, writ):
     _, out, _ = writ("review", "M01-001", "--dry-run")
     assert "Decisions already recorded against this task:" in out
     assert "[proposed] Length-prefixed frames" in out
+
+
+def test_the_reviewer_is_told_not_to_repeat_them(planned, writ):
+    """Live runs showed reviewers restating the implementer's proposals."""
+    writ("dispatch", "M01-001", "--agent", agent_reporting(with_decisions(GOOD)))
+    _, out, _ = writ("review", "M01-001", "--dry-run")
+    assert "Do not propose these again" in out
+
+
+def test_a_task_with_no_decisions_gets_no_such_instruction(planned, writ):
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    _, out, _ = writ("review", "M01-001", "--dry-run")
+    assert "Do not propose these again" not in out
+
+
+def test_the_review_prompt_states_the_criterion_count(planned, writ):
+    """A reviewer that does not know how many bars there are can miss one."""
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    _, out, _ = writ("review", "M01-001", "--dry-run")
+    assert "This task has 3 acceptance criteria, numbered 1 to 3." in out
