@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Any, IO, Iterable
 
-from . import agents, planner, state, verdict
+from . import agents, decisions, planner, state, verdict
 from .model import (
     add_evidence,
     blocking_dependencies,
@@ -112,6 +112,8 @@ def _verdict_instructions(task: dict[str, Any], verdict_path: Path | None) -> st
         "",
         verdict.RULES,
         "",
+        verdict.DECISION_RULES,
+        "",
         f"This task has {total} acceptance criteria, numbered 1 to {total}.",
         "",
         "Writ sets this task's status from that file, and an independent reviewer "
@@ -192,6 +194,18 @@ def build_review_prompt(
     lines.append("")
     lines.append(verdict.REVIEW_RULES)
     lines.append("")
+    lines.append(verdict.DECISION_RULES)
+    lines.append("")
+    recorded = [
+        item
+        for item in data.get("decisions", [])
+        if task["id"] in item.get("tasks", [])
+    ]
+    if recorded:
+        lines.append("Decisions already recorded against this task:")
+        for item in recorded:
+            lines.append(f"- [{item['status']}] {item['title']}: {item['decision']}")
+        lines.append("")
     path = verdict_path or Path(verdict.VERDICT_FILENAME)
     lines.append("Write your review as JSON to this exact path:")
     lines.append(f"  {path}")
@@ -570,10 +584,13 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
                     "decision": reported.decision,
                     "passed": reported.passed,
                     "unmet": reported.unmet,
+                    "decisions": [p.title for p in reported.decisions],
                 }
                 status = verdict.apply(data, task, reported, actor=actor)
                 run["resulting_status"] = status
                 refresh_milestones(data)
+                if reported.decisions:
+                    decisions.sync_markdown(root, data)
                 return
 
         # No usable verdict. Record what happened without inventing a judgement:

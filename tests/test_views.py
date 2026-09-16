@@ -1,5 +1,24 @@
-"""Detail views: `writ tasks show`, `writ milestones show`, and `writ show`."""
+"""Detail views: `writ show`, `writ list`, and `writ set`."""
 import json
+
+from writ import decisions, state
+
+
+def record_decision(project, title, text, *, tasks=None):
+    """Put a decision in the log without a dispatch.
+
+    These tests are about the views, not about how a record got there, and there
+    is no command that writes one by hand.
+    """
+    with state.transaction(project) as data:
+        record = decisions.propose(
+            data,
+            title=title,
+            decision=text,
+            proposed_by="agent (pi)",
+            tasks=tasks or [],
+        )
+    return record["id"]
 
 
 # --------------------------------------------------------------------------
@@ -188,8 +207,8 @@ def test_show_run_prompt_prints_what_the_agent_was_given(planned, writ, project)
     assert "Working rules (non-negotiable)" in out
 
 
-def test_show_resolves_a_decision_id(planned, writ):
-    writ("decide", "Fixture-only tests", "--decision", "no live platform")
+def test_show_resolves_a_decision_id(planned, writ, project):
+    record_decision(project, "Fixture-only tests", "no live platform")
     code, out, _ = writ("show", "D-0001")
     assert code == 0
     assert "D-0001 — Fixture-only tests" in out
@@ -236,7 +255,7 @@ def test_list_runs_and_decisions_share_the_filters(planned, writ, project):
 
     echo = f"{sys.executable} -c 'import sys; sys.stdout.write(sys.stdin.read())'"
     writ("dispatch", "M01-001", "--agent", echo)
-    writ("decide", "A choice", "--decision", "d", "--task", "M01-001")
+    record_decision(project, "A choice", "a real decision here", tasks=["M01-001"])
     _, runs, _ = writ("--json", "list", "runs", "--task", "M01-001")
     assert len(json.loads(runs)) == 1
     _, empty, _ = writ("--json", "list", "runs", "--task", "M03-001")

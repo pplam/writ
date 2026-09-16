@@ -26,6 +26,7 @@ from .model import (
     reviewable_tasks,
     set_acceptance,
     set_status,
+    SETTABLE_STATUSES,
 )
 from .state import WritError
 
@@ -398,8 +399,12 @@ def _list_decisions(data, args):
         items = [item for item in items if args.task in item.get("tasks", [])]
     if args.status:
         items = [item for item in items if item["status"] == args.status]
-    rows = [[i["id"], i["status"], i["date"], i["title"]] for i in items]
-    return ["ID", "STATUS", "DATE", "TITLE"], rows, list(items)
+    if getattr(args, "proposed", False):
+        items = [item for item in items if item["status"] == "proposed"]
+    rows = [
+        [i["id"], i["status"], i.get("proposed_by") or "", i["title"]] for i in items
+    ]
+    return ["ID", "STATUS", "BY", "TITLE"], rows, list(items)
 
 
 def cmd_show(args) -> None:
@@ -471,6 +476,10 @@ def _render_decision(record: dict[str, Any]) -> str:
     lines = [f"{record['id']} — {record['title']}"]
     lines.append(f"date: {record['date']}")
     lines.append(f"status: {record['status']}")
+    if record.get("proposed_by"):
+        lines.append(f"proposed by: {record['proposed_by']}")
+    if record.get("confirmed_by") and record["status"] != "proposed":
+        lines.append(f"ruled by: {record['confirmed_by']} ({record['confirmed_at']})")
     if record.get("supersedes"):
         lines.append(f"supersedes: {record['supersedes']}")
     if record.get("superseded_by"):
@@ -482,6 +491,14 @@ def _render_decision(record: dict[str, Any]) -> str:
     lines.append(f"\ndecision:\n{record['decision']}")
     if record.get("consequences"):
         lines.append(f"\nconsequences:\n{record['consequences']}")
+    if record.get("rejected_reason"):
+        lines.append(f"\nrejected:\n{record['rejected_reason']}")
+    if record["status"] == "proposed":
+        lines.append(
+            f"\nproposed by an agent and not yet confirmed."
+            f"\n  writ set {record['id']} active"
+            f"\n  writ set {record['id']} rejected --reason ..."
+        )
     return "\n".join(lines)
 
 
@@ -648,6 +665,9 @@ def _status_payload(data: dict[str, Any]) -> dict[str, Any]:
             for run in active_runs
         ],
         "decisions": len(data["decisions"]),
+        "proposed_decisions": [
+            item["id"] for item in decisions.proposed(data)
+        ],
     }
 
 
@@ -707,6 +727,9 @@ def _render_status(payload: dict[str, Any]) -> str:
     if payload.get("awaiting_review"):
         listed = ", ".join(payload["awaiting_review"][:8])
         lines.append(f"awaiting review: {listed}   (writ review)")
+    if payload.get("proposed_decisions"):
+        listed = ", ".join(payload["proposed_decisions"][:8])
+        lines.append(f"decisions proposed: {listed}   (writ show <id>)")
     if payload["active_runs"]:
         lines.append("")
         lines.append(
@@ -754,11 +777,53 @@ def cmd_graph(args) -> None:
 
 
 def cmd_set(args) -> None:
+    """Set a status on whatever the id points at.
+
+    Tasks and decisions both have statuses a human may legitimately move, and
+    which one you meant is already in the id, so one verb covers both.
+    """
     with state.transaction(args.root) as data:
+        kind, _ = find(data, args.id)
+        if kind == "decision":
+            _set_decision(args, data)
+            return
+        if kind != "task":
+            raise WritError(
+                f"{args.id} is a {kind}; only tasks and decisions have a "
+                "status you can set"
+            )
+        if args.status not in SETTABLE_STATUSES:
+            raise WritError(
+                f"{args.status!r} is a decision status, not a task status "
+                f"(tasks accept {', '.join(SETTABLE_STATUSES)})"
+            )
         set_status(
             data, args.id, args.status, evidence=args.evidence, force=args.force
         )
     print(f"{args.id} -> {args.status}")
+
+
+def _set_decision(args, data) -> None:
+    """Rule on a decision an agent proposed."""
+    if args.status not in decisions.SETTABLE_DECISION_STATUSES:
+        raise WritError(
+            f"{args.status!r} is a task status, not a decision status "
+            f"(decisions accept {', '.join(decisions.SETTABLE_DECISION_STATUSES)})"
+        )
+    if args.status == "rejected":
+        if not args.reason:
+            raise WritError("rejecting a decision needs --reason")
+        record = decisions.reject(data, args.id, reason=args.reason)
+        decisions.sync_markdown(args.root, data)
+        print(f"{record['id']} rejected: {record['title']}")
+        print(f"reason: {record['rejected_reason']}")
+        return
+    record = decisions.confirm(data, args.id, supersedes=args.supersedes)
+    decisions.sync_markdown(args.root, data)
+    print(f"{record['id']} active: {record['title']}")
+    if record.get("supersedes"):
+        print(f"supersedes: {record['supersedes']}")
+    print(f"mirror: {state.decisions_file(args.root)}")
 
 
 def cmd_override(args) -> None:
@@ -1104,23 +1169,4 @@ def cmd_cancel(args) -> None:
         print(f"marked {run_id} interrupted")
 
 
-def cmd_decide(args) -> None:
-    """Append a decision. Reading them is `writ list decisions` / `writ show`."""
-    with state.transaction(args.root) as data:
-        record = decisions.add(
-            data,
-            title=args.title,
-            decision=args.decision,
-            context=args.context or "",
-            consequences=args.consequences or "",
-            supersedes=args.supersedes,
-            tasks=args.task or [],
-        )
-        decisions.sync_markdown(args.root, data)
-        markdown = decisions.render_markdown(data)
-    if args.export:
-        Path(args.export).expanduser().write_text(markdown, encoding="utf-8")
-    print(f"recorded {record['id']}: {record['title']}")
-    print(f"mirror: {state.decisions_file(args.root)}")
-    if args.export:
-        print(f"exported: {args.export}")
+

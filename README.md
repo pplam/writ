@@ -46,10 +46,8 @@ writ status --watch                    # from any other terminal, any time
 writ review M01-001 --agent codex      # a different agent checks the claim
                                        # its decision completes or fails the task
 
-writ decide "Fixture-only tests" \
-  --decision "Automated tests never touch a live platform." \
-  --context "Platform quotas are small and debugging consumes them." \
-  --task M01-001
+writ list decisions --proposed         # choices the agents had to make
+writ set D-0001 active                 # confirm one, or reject it with --reason
 ```
 
 ## Storage
@@ -196,6 +194,45 @@ a run that produces no usable verdict moves no criterion; the task returns to
 `planned` and the transcript is left for you to read. Conversely a non-zero exit
 with a valid verdict still records the criteria the agent did meet.
 
+### The decision log
+
+A task's verdict also carries the choices the design document did not make. An
+agent implementing "merge these config files, later files winning" has to decide
+what happens when a list meets a list — the document does not say, and whichever
+way it goes, the next agent inherits it and cannot tell a deliberate choice from
+an accident. So the verdict has a `decisions` array, and entries land in the log
+attributed to the agent that made them.
+
+Reviewers propose too, which is where it earns its keep: a choice visible in the
+diff but absent from the implementer's report is exactly what an independent
+reader catches.
+
+**Proposals are not commitments.** They land as `proposed` and do nothing until
+you rule on them:
+
+```bash
+writ list decisions --proposed
+writ show D-0001                       # the choice, its context, its consequences
+writ set D-0001 active                 # binding from here on
+writ set D-0002 rejected --reason "packaging is M03, not this task's call"
+```
+
+An agent may report what it decided; it may not commit the project on its own
+authority. That is the same split as acceptance criteria — the agent claims,
+something else decides — and it is why there is no command for writing a decision
+by hand. A record exists because someone made the choice while doing the work.
+
+Rejected proposals stay in the log with their reason. That an agent proposed
+something and was turned down is worth knowing, and deleting it invites the same
+proposal next week.
+
+Records are append-only. Confirming a replacement writes a new entry and marks
+the old one `superseded`; nothing is edited in place:
+
+```bash
+writ set D-0007 active --supersedes D-0001
+```
+
 ### When a human needs the last word
 
 `writ override <id> <status> --reason ...` does what `set` and `accept` used to,
@@ -210,7 +247,7 @@ writ override M01-002 failed --reason "criterion 2 regressed" --accept 2=failed
 
 ## Commands
 
-Fifteen commands, organized by what you are doing rather than what type it
+Fourteen commands, organized by what you are doing rather than what type it
 operates on.
 
 **Set up**
@@ -225,7 +262,7 @@ operates on.
 | Command | Purpose |
 |---|---|
 | `writ status [--watch] [--interval S] [--until-idle]` | progress, ready work, live runs |
-| `writ list [tasks\|milestones\|runs\|decisions] [--status S] [--milestone M] [--task T] [--ready] [--awaiting-review] [--active] [--limit N]` | any collection |
+| `writ list [tasks\|milestones\|runs\|decisions] [--status S] [--milestone M] [--task T] [--ready] [--awaiting-review] [--proposed] [--active] [--limit N]` | any collection |
 | `writ show <id> [--verbose] [--prompt]` | any single thing |
 | `writ graph [--dot]` | the dependency DAG |
 | `writ logs <run-id\|task-id> [--follow] [--stderr] [--tail N]` | agent output |
@@ -234,10 +271,9 @@ operates on.
 
 | Command | Purpose |
 |---|---|
-| `writ set <id> <status> [--evidence T] [--force]` | workflow status; cannot reach `completed` |
+| `writ set <id> <status> [--evidence T] [--reason R] [--supersedes ID] [--force]` | a task's workflow status, or a ruling on a proposed decision |
 | `writ override <id> <status> --reason R [--accept N[=STATUS]]` | human judgement, attributed to you |
 | `writ task [id] [--title T] [--milestone M] [--depends] [--acceptance] [--allow] [--forbid]` | create, or amend with an id |
-| `writ decide <title> --decision D [--context] [--consequences] [--supersedes ID] [--task ID] [--export PATH]` | append a decision |
 
 **Run agents**
 
@@ -283,8 +319,13 @@ One command for every transition, so the legal values live in one place and
 `--help` lists them. Two are absent on purpose: `ready` is derived from the DAG,
 and `completed` belongs to the review flow above.
 
-Records in the decision log are append-only. Superseding writes a new entry and
-marks the old one `superseded`; nothing is edited in place.
+Because ids carry their own type, the same verb rules on a decision an agent
+proposed:
+
+```bash
+writ set D-0001 active
+writ set D-0002 rejected --reason "packaging is M03, not this task's call"
+```
 
 ## Dispatch
 

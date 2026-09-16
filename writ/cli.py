@@ -12,6 +12,11 @@ The command surface is deliberately small. Three rules keep it that way:
    claim about its acceptance criteria, so it is made by the agent that did the
    work and checked by a reviewer agent — not typed in by hand. `set` cannot
    reach `completed`; `override` can, and records that a human said so.
+
+   The same rule runs the decision log. An agent that resolves a question the
+   design left open proposes a record as part of its verdict, because the choice
+   outlives the task. Proposals are inert until confirmed: an agent may report
+   what it decided, but it may not commit the project on its own authority.
 """
 from __future__ import annotations
 
@@ -19,6 +24,7 @@ import argparse
 import sys
 
 from . import commands
+from .decisions import SETTABLE_DECISION_STATUSES
 from .model import JUDGED_STATUSES, SETTABLE_STATUSES
 from .state import WritError
 
@@ -34,8 +40,9 @@ Typical flow:
   writ dispatch M01-001        an agent implements it and reports a verdict
   writ review M01-001          a second agent checks the claim and signs off
 
-Statuses and acceptance criteria are set by those agents, not by hand. Use
-`writ override` when a human needs the last word, which records that they took it.
+Statuses, acceptance criteria, and decision records come from those agents rather
+than by hand. Use `writ override` when a human needs the last word on a task, and
+`writ set D-0001 active` to confirm a decision an agent proposed.
 """
 
 EPILOG = """\
@@ -185,6 +192,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="only tasks an agent has reported and a reviewer has not checked",
     )
+    p.add_argument(
+        "--proposed",
+        action="store_true",
+        help="only decisions an agent proposed and nobody has ruled on",
+    )
     p.add_argument("--active", action="store_true", help="only live runs")
     p.add_argument("--limit", type=int, help="show at most N rows")
     p.set_defaults(func=commands.cmd_list)
@@ -221,17 +233,29 @@ def build_parser() -> argparse.ArgumentParser:
     # -------------------------------------------------------------- mutation
     p = sub.add_parser(
         "set",
-        help=f"set a task's workflow status ({', '.join(SETTABLE_STATUSES)})",
+        help="set the status of a task or a proposed decision",
         description=(
-            "Move a task around the board. This cannot mark a task completed: "
-            "completion is a judgement about acceptance criteria, made by the "
-            "agent that did the work and checked by `writ review`. Use "
-            "`writ override` if a human has to decide."
+            "Move a task around the board, or rule on a decision an agent "
+            f"proposed. Task statuses: {', '.join(SETTABLE_STATUSES)}. Decision "
+            f"statuses: {', '.join(SETTABLE_DECISION_STATUSES)}.\n\n"
+            "This cannot mark a task completed: completion is a judgement about "
+            "acceptance criteria, made by the agent that did the work and "
+            "checked by `writ review`. Use `writ override` if a human has to "
+            "decide."
         ),
     )
-    p.add_argument("id")
-    p.add_argument("status", choices=SETTABLE_STATUSES)
+    p.add_argument("id", help="task id, or a D-NNNN decision id")
+    p.add_argument(
+        "status",
+        choices=sorted(set(SETTABLE_STATUSES + SETTABLE_DECISION_STATUSES)),
+    )
     p.add_argument("--evidence", help="note recorded with the transition")
+    p.add_argument(
+        "--reason", help="why a decision was rejected (required to reject)"
+    )
+    p.add_argument(
+        "--supersedes", help="when confirming a decision, the id it replaces"
+    )
     p.add_argument(
         "--force", action="store_true", help="bypass the dependency gate"
     )
@@ -300,16 +324,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow", action="append", help="allowed file/package (repeatable)")
     p.add_argument("--forbid", action="append", help="forbidden path (repeatable)")
     p.set_defaults(func=commands.cmd_task)
-
-    p = sub.add_parser("decide", help="append a decision to the log")
-    p.add_argument("title")
-    p.add_argument("--decision", required=True, help="the decision itself")
-    p.add_argument("--context", help="why the decision was needed")
-    p.add_argument("--consequences", help="what it commits or invalidates")
-    p.add_argument("--supersedes", help="decision id this replaces")
-    p.add_argument("--task", action="append", help="related task id (repeatable)")
-    p.add_argument("--export", metavar="PATH", help="also write the log as markdown")
-    p.set_defaults(func=commands.cmd_decide)
 
     # -------------------------------------------------------------- dispatch
     p = sub.add_parser("dispatch", help="hand a task to a coding agent")

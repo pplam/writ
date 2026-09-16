@@ -51,6 +51,14 @@ SCHEMA = """\
 behaviour that demonstrates this bar is met"
     }
   ],
+  "decisions": [
+    {
+      "title": "short name for the choice",
+      "decision": "what you decided, in one or two sentences",
+      "context": "what the document left open, or what forced the choice",
+      "consequences": "what this commits the project to, or rules out"
+    }
+  ],
   "blocked_on": "only when outcome is blocked: what stopped you",
   "notes": "assumptions, deviations, risks, anything the next agent needs"
 }"""
@@ -67,6 +75,37 @@ Rules for the verdict:
 6. Report honestly. A verdict is checked by a reviewer that did not write your
    code, and a false pass is worse than an admitted failure."""
 
+DECISION_RULES = """\
+Record decisions for choices the design document did not make for you.
+
+You will hit questions the document leaves open: a data format, an error
+semantic, a boundary case, a dependency, a name that will be hard to change
+later. Whichever way you answer one, the next agent inherits it and cannot tell
+your deliberate choice from an accident. Put it in `decisions`.
+
+The test is consequence, not effort. Record a choice when a later agent who
+decided differently would have to change your code, or when someone reading the
+code a month from now would ask "why this way?" and the document would not
+answer them.
+
+What belongs there:
+- an interpretation you had to pick between, where the document allowed both
+- a behaviour you defined because the document was silent on it
+- a constraint you accepted, or a simpler approach you rejected and why
+- anything you wrote in `notes` starting with "assumed" or "decided"
+
+What does not:
+- restating a requirement the document already fixed
+- ordinary implementation detail with no consequence for later work
+- routine facts about how you worked: where you put files, that you ran the
+  tests, that you added no dependencies
+- one entry per file you touched; these are decisions, not a changelog
+
+Prefer two or three real ones to a long list. Every entry costs a human a
+decision, so an entry that does not need ruling on is a cost with no return.
+Leave `decisions` empty if the document genuinely settled everything; an empty
+list is a real answer, and padding it is not."""
+
 REVIEW_SCHEMA = """\
 {
   "decision": "accept" | "reject",
@@ -76,6 +115,14 @@ REVIEW_SCHEMA = """\
       "number": 1,
       "status": "passed" | "failed" | "pending",
       "evidence": "what you ran or read to reach this conclusion"
+    }
+  ],
+  "decisions": [
+    {
+      "title": "short name for the choice",
+      "decision": "what was decided, in one or two sentences",
+      "context": "what the document left open",
+      "consequences": "what it commits the project to"
     }
   ],
   "notes": "anything the implementer missed, or risks worth recording"
@@ -90,7 +137,10 @@ Rules for the review:
 3. `accept` requires that you personally confirmed every criterion passes.
 4. Reject if a criterion is unmet, if the evidence does not support the claim, or
    if the tests do not actually exercise the behaviour they name.
-5. Do not modify the repository. You are reading and running, not fixing."""
+5. Do not modify the repository. You are reading and running, not fixing.
+6. Use `decisions` for consequential choices the implementer made silently, or
+   made without recording. A choice you can see in the diff but not in their
+   decisions is exactly what this field is for."""
 
 
 # --------------------------------------------------------------------------
@@ -107,12 +157,28 @@ class Criterion:
 
 
 @dataclass
+class ProposedDecision:
+    """A choice an agent made that outlives the task it was made in.
+
+    Proposed, not recorded: an agent may not commit the project to an
+    architectural position on its own say-so. These land in the log as
+    `proposed` and need confirming.
+    """
+
+    title: str
+    decision: str
+    context: str = ""
+    consequences: str = ""
+
+
+@dataclass
 class Verdict:
     """An agent's report on a task, validated but not yet applied."""
 
     outcome: str
     summary: str = ""
     criteria: list[Criterion] = field(default_factory=list)
+    decisions: list[ProposedDecision] = field(default_factory=list)
     blocked_on: str | None = None
     notes: str | None = None
     #: `agent` for the implementer, `reviewer` for an independent check
@@ -216,6 +282,7 @@ def parse(text: str, *, role: str = "agent", where: str = "verdict") -> Verdict:
         raise WritError(f"{where}: expected a JSON object")
 
     criteria = _criteria(raw.get("criteria"), where)
+    proposals = _decisions(raw.get("decisions"), where)
     summary = _text(raw.get("summary"))
     notes = _text(raw.get("notes")) or None
 
@@ -233,6 +300,7 @@ def parse(text: str, *, role: str = "agent", where: str = "verdict") -> Verdict:
             outcome="complete" if decision == "accept" else "incomplete",
             summary=summary,
             criteria=criteria,
+            decisions=proposals,
             notes=notes,
             role="reviewer",
             decision=decision,
@@ -253,10 +321,64 @@ def parse(text: str, *, role: str = "agent", where: str = "verdict") -> Verdict:
         outcome=outcome,
         summary=summary,
         criteria=criteria,
+        decisions=proposals,
         blocked_on=blocked_on,
         notes=notes,
         role="agent",
     )
+
+
+#: a proposal with no more text than this is a label, not a decision
+MIN_DECISION_CHARS = 12
+
+
+def _decisions(value: Any, where: str) -> list[ProposedDecision]:
+    """Validate proposed decisions, rejecting the empty gestures.
+
+    An agent asked for decisions will sometimes produce a title and nothing else,
+    which costs a reader more than it gives them. A proposal has to actually say
+    what was decided.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise WritError(f"{where}: decisions must be a list")
+    out: list[ProposedDecision] = []
+    for index, item in enumerate(value, start=1):
+        if not isinstance(item, dict):
+            raise WritError(f"{where}: decisions[{index}] must be an object")
+        title = _text(_pick(item, ("title", "name", "summary")))
+        statement = _text(_pick(item, ("decision", "choice", "what", "text")))
+        if not title:
+            raise WritError(f"{where}: decisions[{index}] has no title")
+        if not statement:
+            raise WritError(
+                f"{where}: decision {title!r} does not say what was decided"
+            )
+        if len(statement) < MIN_DECISION_CHARS:
+            raise WritError(
+                f"{where}: decision {title!r} is too thin to be useful "
+                f"({statement!r}); say what was chosen and why"
+            )
+        out.append(
+            ProposedDecision(
+                title=title,
+                decision=statement,
+                context=_text(_pick(item, ("context", "why", "problem"))),
+                consequences=_text(
+                    _pick(item, ("consequences", "consequence", "implications"))
+                ),
+            )
+        )
+    return out
+
+
+def _pick(mapping: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    """First present key, so a model's near-miss field name still lands."""
+    for key in keys:
+        if key in mapping and mapping[key] not in (None, ""):
+            return mapping[key]
+    return None
 
 
 def _criteria(value: Any, where: str) -> list[Criterion]:
@@ -335,6 +457,7 @@ def apply(
     required; it parks the task at `awaiting-review` instead. This is the whole
     point of the split, so it is enforced here rather than left to the caller.
     """
+    from . import decisions as decision_log
     from .model import add_evidence, refresh_milestones
 
     for criterion in verdict.criteria:
@@ -368,6 +491,16 @@ def apply(
         add_evidence(task, f"notes: {verdict.notes}", actor=actor)
     if verdict.blocked_on:
         add_evidence(task, f"blocked on: {verdict.blocked_on}", actor=actor)
+    for proposal in verdict.decisions:
+        decision_log.propose(
+            data,
+            title=proposal.title,
+            decision=proposal.decision,
+            context=proposal.context,
+            consequences=proposal.consequences,
+            proposed_by=actor,
+            tasks=[task["id"]],
+        )
     refresh_milestones(data)
     return status
 

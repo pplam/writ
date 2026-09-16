@@ -472,3 +472,160 @@ def test_two_runs_in_the_same_second_do_not_collide(planned, writ, project):
     data = state.load(project)
     assert len(data["runs"]) == 2
     assert data["tasks"]["M01-001"]["runs"] == sorted(data["runs"])
+
+
+# --------------------------------------------------------------------------
+# proposed decisions
+
+
+def with_decisions(*proposals, count=3):
+    return json.dumps(
+        {
+            "outcome": "complete",
+            "summary": "implemented the thing",
+            "criteria": [
+                {"number": n, "status": "passed", "evidence": "ran: pytest -q"}
+                for n in range(1, count + 1)
+            ],
+            "decisions": list(proposals),
+        }
+    )
+
+
+GOOD = {
+    "title": "Length-prefixed frames",
+    "decision": "Records are length-prefixed rather than newline-delimited.",
+    "context": "The design did not say how records are framed.",
+    "consequences": "Payloads may contain newlines; readers must buffer.",
+}
+
+
+def test_a_verdict_can_propose_a_decision(planned, writ, project):
+    writ("dispatch", "M01-001", "--agent", agent_reporting(with_decisions(GOOD)))
+    records = state.load(project)["decisions"]
+    assert len(records) == 1
+    assert records[0]["title"] == "Length-prefixed frames"
+    assert records[0]["context"] == "The design did not say how records are framed."
+    assert records[0]["consequences"].startswith("Payloads may contain")
+
+
+def test_a_proposed_decision_is_linked_to_its_task(planned, writ, project):
+    writ("dispatch", "M01-001", "--agent", agent_reporting(with_decisions(GOOD)))
+    assert state.load(project)["decisions"][0]["tasks"] == ["M01-001"]
+
+
+def test_a_proposal_does_not_block_the_verdict(planned, writ, project):
+    """The criteria still apply; a decision rides along, it does not gate."""
+    writ("dispatch", "M01-001", "--agent", agent_reporting(with_decisions(GOOD)))
+    assert state.load(project)["tasks"]["M01-001"]["status"] == "awaiting-review"
+
+
+def test_a_reviewer_can_propose_a_decision_too(planned, writ, project):
+    """A choice the implementer made silently is exactly what review catches."""
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    payload = json.dumps(
+        {
+            "decision": "accept",
+            "summary": "verified",
+            "criteria": [
+                {"number": n, "status": "passed", "evidence": "re-ran: pytest -q"}
+                for n in (1, 2, 3)
+            ],
+            "decisions": [
+                {
+                    "title": "ASCII-only slugs",
+                    "decision": "Non-ASCII input is dropped rather than transliterated.",
+                }
+            ],
+        }
+    )
+    writ("review", "M01-001", "--agent", agent_reporting(payload))
+    records = state.load(project)["decisions"]
+    assert [r["title"] for r in records] == ["ASCII-only slugs"]
+    assert records[0]["proposed_by"].startswith("reviewer(")
+
+
+def test_a_titleless_proposal_is_rejected(planned, writ, project):
+    bad = with_decisions({"decision": "we chose the other thing"})
+    writ("dispatch", "M01-001", "--agent", agent_reporting(bad))
+    data = state.load(project)
+    assert data["decisions"] == []
+    assert "no title" in data["runs"][next(iter(data["runs"]))]["verdict_error"]
+
+
+def test_a_proposal_with_no_statement_is_rejected(planned, writ, project):
+    bad = with_decisions({"title": "Framing"})
+    writ("dispatch", "M01-001", "--agent", agent_reporting(bad))
+    data = state.load(project)
+    assert data["decisions"] == []
+    error = data["runs"][next(iter(data["runs"]))]["verdict_error"]
+    assert "does not say what was decided" in error
+
+
+def test_a_one_word_decision_is_rejected(planned, writ, project):
+    """A title with a shrug attached is not a decision record."""
+    bad = with_decisions({"title": "Framing", "decision": "yes"})
+    writ("dispatch", "M01-001", "--agent", agent_reporting(bad))
+    data = state.load(project)
+    assert data["decisions"] == []
+    assert "too thin" in data["runs"][next(iter(data["runs"]))]["verdict_error"]
+
+
+def test_a_bad_proposal_takes_the_whole_verdict_with_it(planned, writ, project):
+    """Partial application would leave criteria passed against a rejected report."""
+    bad = with_decisions({"title": "Framing"})
+    writ("dispatch", "M01-001", "--agent", agent_reporting(bad))
+    task = state.load(project)["tasks"]["M01-001"]
+    assert task["status"] != "awaiting-review"
+    assert all(a["status"] != "passed" for a in task["acceptances"])
+
+
+def test_near_miss_field_names_still_land():
+    """Models reach for `name`/`why`; the content matters more than the key."""
+    parsed = verdict.parse(
+        json.dumps(
+            {
+                "outcome": "incomplete",
+                "criteria": [],
+                "decisions": [
+                    {
+                        "name": "Framing",
+                        "choice": "Length-prefixed records, not newline-delimited.",
+                        "why": "the design was silent",
+                    }
+                ],
+            }
+        ),
+        where="test",
+    )
+    assert parsed.decisions[0].title == "Framing"
+    assert parsed.decisions[0].context == "the design was silent"
+
+
+def test_decisions_must_be_a_list():
+    with pytest.raises(WritError, match="must be a list"):
+        verdict.parse(
+            json.dumps(
+                {"outcome": "incomplete", "criteria": [], "decisions": "one thing"}
+            ),
+            where="test",
+        )
+
+
+def test_the_prompt_asks_for_decisions(planned, writ):
+    _, out, _ = writ("dispatch", "M01-001", "--dry-run")
+    assert "decisions" in out
+    assert "design document did not make for you" in out
+
+
+def test_the_review_prompt_asks_for_them_too(planned, writ):
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    _, out, _ = writ("review", "M01-001", "--dry-run")
+    assert "design document did not make for you" in out
+
+
+def test_the_reviewer_sees_decisions_already_recorded(planned, writ):
+    writ("dispatch", "M01-001", "--agent", agent_reporting(with_decisions(GOOD)))
+    _, out, _ = writ("review", "M01-001", "--dry-run")
+    assert "Decisions already recorded against this task:" in out
+    assert "[proposed] Length-prefixed frames" in out
