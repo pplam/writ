@@ -872,9 +872,35 @@ def _graph_levels(data, tasks) -> str:
     return "\n".join(lines).rstrip()
 
 
+#: fill colours by status, for `--dot`. Muted on purpose: the graph is read for
+#: its shape, and saturated fills fight the structure for attention.
+DOT_FILLS = {
+    "completed": "#d8ece0",
+    "awaiting-review": "#fdf0cf",
+    "reviewing": "#fdf0cf",
+    "running": "#d9e7f7",
+    "failed": "#f8d9d9",
+    "blocked": "#f8d9d9",
+    "cancelled": "#eeeeee",
+    "ready": "#ffffff",
+    "planned": "#f7f7f7",
+}
+
+
 def _graph_dot(data, tasks) -> None:
+    """Emit graphviz, carrying the status the terminal view shows.
+
+    A rendered graph is where progress is most legible, so dropping status here
+    would make the prettier output the less useful one.
+    """
     print("digraph writ {")
-    print('  rankdir=LR; node [shape=box, fontname="Helvetica"];')
+    print('  rankdir=LR;')
+    print('  graph [fontname="Helvetica", fontsize=11];')
+    print(
+        '  node [shape=box, style="rounded,filled", fontname="Helvetica", '
+        'fontsize=10, color="#999999"];'
+    )
+    print('  edge [color="#777777", arrowsize=0.7];')
     for milestone_id in sorted(data["milestones"]):
         members = [
             task_id
@@ -883,17 +909,41 @@ def _graph_dot(data, tasks) -> None:
         ]
         if not members:
             continue
-        title = data["milestones"][milestone_id]["title"].replace('"', "'")
+        title = _dot_escape(data["milestones"][milestone_id]["title"])
+        # An autocreated milestone is titled with its own id; "M02  M02" is noise.
+        heading = milestone_id if title == milestone_id else f"{milestone_id}  {title}"
         print(f"  subgraph cluster_{milestone_id.replace('-', '_')} {{")
-        print(f'    label="{milestone_id}  {title}"; style=rounded; color=gray;')
+        print(
+            f'    label="{heading}"; style=rounded; '
+            'color="#bbbbbb"; fontsize=11;'
+        )
         for task_id in members:
-            label = tasks[task_id]["title"].replace('"', "'")
-            print(f'    "{task_id}" [label="{task_id}\\n{label}"];')
+            print(f"    {_dot_node(data, tasks[task_id], task_id)}")
         print("  }")
+    loose = [t for t in sorted(tasks) if tasks[t].get("milestone") not in data["milestones"]]
+    for task_id in loose:
+        print(f"  {_dot_node(data, tasks[task_id], task_id)}")
     for task_id in sorted(tasks):
         for dep in tasks[task_id].get("depends_on", []):
             print(f'  "{dep}" -> "{task_id}";')
     print("}")
+
+
+def _dot_node(data, task, task_id: str) -> str:
+    status = effective_status(data, task)
+    summary = acceptance_summary(task)
+    label = f"{task_id}\\n{_dot_escape(task['title'])}"
+    if summary["total"]:
+        label += f"\\n{status}  {summary['passed']}/{summary['total']}"
+    else:
+        label += f"\\n{status}"
+    fill = DOT_FILLS.get(status, "#f7f7f7")
+    extra = ' penwidth=2 color="#555555"' if status == "ready" else ""
+    return f'"{task_id}" [label="{label}", fillcolor="{fill}"{extra}];'
+
+
+def _dot_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace('"', "'")
 
 
 # --------------------------------------------------------------------------

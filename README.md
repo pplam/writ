@@ -345,9 +345,37 @@ level 3  (3 tasks)
   · M01-006  Rate limit   after M01-003
 ```
 
-`--verbose` adds each task's status and acceptance count. `--dot` emits graphviz
-with tasks clustered by milestone, and `--json` gives the levels plus both edge
-directions per task.
+`--verbose` adds each task's status and acceptance count, and `--json` gives the
+levels plus both edge directions per task.
+
+### Rendering the graph as an image
+
+`--dot` emits graphviz, so pipe it to `dot`:
+
+```bash
+writ graph --dot | dot -Tsvg -o graph.svg
+writ graph --dot | dot -Tpng -o graph.png       # for pasting into a review
+writ graph --dot > graph.dot                    # keep the source
+```
+
+Install graphviz first: `brew install graphviz`, `apt install graphviz`, or
+`choco install graphviz`. On macOS, `open graph.svg` opens it in a browser.
+
+Nodes carry the same status the terminal view shows — the status name, the
+acceptance count, a muted fill by state, and a heavier border on tasks that can
+start now — because progress is the reason to look at a picture of the graph.
+Tasks are clustered by milestone.
+
+`dot` is the right engine here; it ranks nodes by dependency depth, which is what
+the graph means. `neato` and `circo` will render it but arrange it by other
+criteria, losing the ordering.
+
+For a graph too wide for a page, `-Grankdir=TB` stacks it vertically, and
+`unflatten` before `dot` evens out the aspect ratio:
+
+```bash
+writ graph --dot | unflatten -l3 | dot -Tsvg -o graph.svg
+```
 
 ### A status is a value, not a verb
 

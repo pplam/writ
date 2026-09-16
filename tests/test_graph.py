@@ -238,3 +238,76 @@ def test_a_cycle_is_reported_not_drawn(planned, writ, project):
         data["tasks"]["M01-001"]["depends_on"] = ["M03-001"]
     code, _, err = writ("graph")
     assert code == 2 and "dependency cycle" in err
+
+
+# --------------------------------------------------------------------------
+# graphviz output
+
+
+def test_dot_carries_status_and_progress(planned, writ):
+    """The rendered graph is where progress is most legible; do not drop it."""
+    _, out, _ = writ("graph", "--dot")
+    assert "ready" in out
+    assert "0/1" in out or "0/3" in out
+    assert "fillcolor=" in out
+
+
+def test_dot_colours_by_status(planned, writ, project):
+    from writ import render
+
+    _, before, _ = writ("graph", "--dot")
+    assert 'fillcolor="#f7f7f7"' in before  # planned
+    writ("override", "M01-001", "completed", "--reason", "done by hand", "--accept", "1")
+    _, after, _ = writ("graph", "--dot")
+    assert 'fillcolor="#d8ece0"' in after  # completed
+
+
+def test_dot_marks_the_ready_frontier(planned, writ):
+    """What can start now is the question a rendered graph is opened to answer."""
+    _, out, _ = writ("graph", "--dot")
+    ready = [line for line in out.splitlines() if "M01-001" in line and "label" in line]
+    assert "penwidth=2" in ready[0]
+
+
+def test_dot_does_not_repeat_an_id_as_its_own_title(planned, writ):
+    """`writ task --milestone M09` titles the new milestone `M09`."""
+    writ("task", "--title", "Late", "--milestone", "M09", "--acceptance", "x")
+    _, out, _ = writ("graph", "--dot")
+    assert 'label="M09"' in out
+    assert 'label="M09  M09"' not in out
+
+
+def test_dot_quotes_are_escaped(planned, writ):
+    writ("task", "--title", 'Handle "quoted" input', "--milestone", "M01",
+         "--acceptance", "x")
+    _, out, _ = writ("graph", "--dot")
+    assert '\\"' not in out.replace('\\n', '')  # no raw escapes breaking the label
+    assert "Handle 'quoted' input" in out
+
+
+def test_dot_includes_tasks_with_no_milestone(planned, writ, project):
+    """A task outside every cluster must still reach the drawing."""
+    from writ import state
+
+    with state.transaction(project) as data:
+        data["tasks"]["M01-001"]["milestone"] = None
+    _, out, _ = writ("graph", "--dot")
+    assert '"M01-001" [label=' in out
+
+
+def test_dot_is_valid_graphviz(planned, writ):
+    """Render it if graphviz is here; a malformed graph is worse than no graph."""
+    import shutil
+    import subprocess
+
+    if not shutil.which("dot"):
+        pytest.skip("graphviz not installed")
+    _, out, _ = writ("graph", "--dot")
+    result = subprocess.run(
+        ["dot", "-Tsvg", "-o", "/dev/null"],
+        input=out,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not result.stderr.strip(), result.stderr
