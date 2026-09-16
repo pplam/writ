@@ -95,7 +95,7 @@ def test_unknown_ids_are_rejected():
     data = base_state()
     with pytest.raises(WritError, match="unknown task"):
         model.get_task(data, "nope")
-    with pytest.raises(WritError, match="unknown task or milestone"):
+    with pytest.raises(WritError, match="unknown id"):
         model.find(data, "nope")
 
 

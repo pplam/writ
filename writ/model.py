@@ -28,12 +28,23 @@ def get_milestone(data: dict[str, Any], milestone_id: str) -> dict[str, Any]:
 
 
 def find(data: dict[str, Any], item_id: str) -> tuple[str, dict[str, Any]]:
-    """Resolve an id that may be either a task or a milestone."""
+    """Resolve an id of any kind: task, milestone, run, or decision.
+
+    Ids are distinguishable by shape (`M01`, `M01-001`, `M01-001-<stamp>`,
+    `D-0001`), so the caller does not have to say which kind it holds. Checked
+    most-specific first: a run id starts with its task id, so tasks would
+    otherwise shadow it.
+    """
     if item_id in data["tasks"]:
         return "task", data["tasks"][item_id]
     if item_id in data["milestones"]:
         return "milestone", data["milestones"][item_id]
-    raise WritError(f"unknown task or milestone: {item_id}")
+    if item_id in data.get("runs", {}):
+        return "run", data["runs"][item_id]
+    for record in data.get("decisions", []):
+        if record["id"] == item_id:
+            return "decision", record
+    raise WritError(f"unknown id: {item_id} (not a task, milestone, run, or decision)")
 
 
 def blocking_dependencies(data: dict[str, Any], task: dict[str, Any]) -> list[str]:

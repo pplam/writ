@@ -30,7 +30,7 @@ def test_dry_run_prints_the_prompt_without_a_run(planned, writ, project):
 
 
 def test_prompt_includes_design_excerpt_and_constraints(planned, writ):
-    writ("edit-task", "M01-001", "--allow", "internal/store", "--forbid", "api/")
+    writ("task", "M01-001", "--allow", "internal/store", "--forbid", "api/")
     _, out, _ = writ("dispatch", "M01-001", "--dry-run")
     assert "Relevant design section:" in out
     assert "Set up the harness." in out
@@ -113,7 +113,7 @@ def test_detached_run_is_observable_while_it_works(planned, writ, project):
     assert payload["running"] == ["M01-001"]
     assert payload["active_runs"] and payload["active_runs"][0]["alive"] is True
 
-    _, runs, _ = writ("--json", "runs", "--active")
+    _, runs, _ = writ("--json", "list", "runs", "--active")
     run_id = json.loads(runs)[0]["id"]
 
     assert writ("cancel", run_id)[0] == 0
@@ -148,11 +148,12 @@ def test_logs_for_task_without_runs(planned, writ):
 def test_run_show_and_runs_filter(planned, writ, project):
     writ("dispatch", "M01-001", "--agent", ECHO)
     run_id = next(iter(state.load(project)["runs"]))
-    code, out, _ = writ("run", run_id)
-    assert code == 0 and f"id: {run_id}" in out and "alive: no" in out
-    _, filtered, _ = writ("--json", "runs", "--task", "M01-001")
+    code, out, _ = writ("show", run_id)
+    assert code == 0 and run_id in out and "alive: no" in out
+    assert "status: completed  exit: 0" in out
+    _, filtered, _ = writ("--json", "list", "runs", "--task", "M01-001")
     assert [r["id"] for r in json.loads(filtered)] == [run_id]
-    _, empty, _ = writ("--json", "runs", "--task", "M03-001")
+    _, empty, _ = writ("--json", "list", "runs", "--task", "M03-001")
     assert json.loads(empty) == []
 
 
@@ -165,12 +166,12 @@ def test_reap_reconciles_a_dead_run(planned, writ, project):
         data["runs"][run_id].pop("supervisor_pid", None)
         data["tasks"]["M01-001"]["status"] = "running"
 
-    code, out, _ = writ("reap")
+    code, out, _ = writ("cancel")
     assert code == 0 and run_id in out
     data = state.load(project)
     assert data["runs"][run_id]["status"] == "interrupted"
     assert data["tasks"]["M01-001"]["status"] == "planned"
-    assert writ("reap")[1].strip() == "no stale runs"
+    assert writ("cancel")[1].strip() == "no stale runs"
 
 
 def test_status_renders_progress(planned, writ):

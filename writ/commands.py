@@ -19,7 +19,6 @@ from .model import (
     blocking_dependencies,
     effective_status,
     find,
-    get_milestone,
     get_task,
     milestone_tasks,
     ready_tasks,
@@ -275,43 +274,32 @@ def _resolve_depends(
 # listing and inspection
 
 
-def cmd_milestones(args) -> None:
+def cmd_list(args) -> None:
+    """One listing command for every collection.
+
+    Which noun you want is an argument, not a separate command: the filters and
+    the JSON shape are the same idea in each case, and keeping them together
+    means `--json` and `--limit` behave identically everywhere.
+    """
     data = state.load(args.root)
-    refresh_milestones(data)
-    rows = []
-    payload = []
-    for milestone_id in sorted(data["milestones"]):
-        milestone = data["milestones"][milestone_id]
-        tasks = milestone_tasks(data, milestone_id)
-        done = sum(1 for task in tasks if task["status"] == "completed")
-        rows.append(
-            [
-                render.mark(milestone["status"]),
-                milestone_id,
-                milestone["status"],
-                f"{done}/{len(tasks)}",
-                milestone["title"],
-            ]
-        )
-        payload.append(
-            {
-                "id": milestone_id,
-                "status": milestone["status"],
-                "title": milestone["title"],
-                "tasks_total": len(tasks),
-                "tasks_completed": done,
-            }
-        )
+    handler = {
+        "tasks": _list_tasks,
+        "milestones": _list_milestones,
+        "runs": _list_runs,
+        "decisions": _list_decisions,
+    }[args.what]
+    headers, rows, payload = handler(data, args)
+    if args.limit:
+        rows, payload = rows[: args.limit], payload[: args.limit]
     if args.json:
         render.emit_json(payload)
         return
-    print(render.table(["", "ID", "STATUS", "DONE", "TITLE"], rows))
+    print(render.table(headers, rows))
 
 
-def cmd_tasks(args) -> None:
-    data = state.load(args.root)
-    rows = []
-    payload = []
+def _list_tasks(data, args):
+    refresh_milestones(data)
+    rows, payload = [], []
     for task_id in sorted(data["tasks"]):
         task = data["tasks"][task_id]
         status = effective_status(data, task)
@@ -342,10 +330,156 @@ def cmd_tasks(args) -> None:
                 "acceptances": counts,
             }
         )
-    if args.json:
-        render.emit_json(payload)
+    return ["", "ID", "STATUS", "ACC", "DEPS", "TITLE"], rows, payload
+
+
+def _list_milestones(data, args):
+    refresh_milestones(data)
+    rows, payload = [], []
+    for milestone_id in sorted(data["milestones"]):
+        milestone = data["milestones"][milestone_id]
+        if args.status and milestone["status"] != args.status:
+            continue
+        tasks = milestone_tasks(data, milestone_id)
+        done = sum(1 for task in tasks if task["status"] == "completed")
+        rows.append(
+            [
+                render.mark(milestone["status"]),
+                milestone_id,
+                milestone["status"],
+                f"{done}/{len(tasks)}",
+                milestone["title"],
+            ]
+        )
+        payload.append(
+            {
+                "id": milestone_id,
+                "status": milestone["status"],
+                "title": milestone["title"],
+                "tasks_total": len(tasks),
+                "tasks_completed": done,
+            }
+        )
+    return ["", "ID", "STATUS", "DONE", "TITLE"], rows, payload
+
+
+def _list_runs(data, args):
+    rows, payload = [], []
+    for run_id in sorted(data["runs"]):
+        run = data["runs"][run_id]
+        if args.task and run["task"] != args.task:
+            continue
+        if args.status and run["status"] != args.status:
+            continue
+        if args.active and run["status"] not in runner.ACTIVE_RUN_STATUSES:
+            continue
+        alive = runner.process_alive(run.get("pid"))
+        rows.append(
+            [
+                render.mark(run["status"]),
+                run_id,
+                run["task"],
+                run["status"],
+                run.get("exit_code") if run.get("exit_code") is not None else "-",
+                "yes" if alive else "no",
+                run.get("started_at") or run.get("created_at") or "-",
+            ]
+        )
+        payload.append({**run, "alive": alive})
+    return ["", "RUN", "TASK", "STATUS", "EXIT", "ALIVE", "STARTED"], rows, payload
+
+
+def _list_decisions(data, args):
+    items = data["decisions"]
+    if args.task:
+        items = [item for item in items if args.task in item.get("tasks", [])]
+    if args.status:
+        items = [item for item in items if item["status"] == args.status]
+    rows = [[i["id"], i["status"], i["date"], i["title"]] for i in items]
+    return ["ID", "STATUS", "DATE", "TITLE"], rows, list(items)
+
+
+def cmd_show(args) -> None:
+    """Show any one thing, whatever kind of id it is.
+
+    Ids carry their own type (`M01`, `M01-001`, a run stamp, `D-0001`), so
+    asking the user to also name the type would be redundant.
+    """
+    data = state.load(args.root)
+    refresh_milestones(data)
+    kind, item = find(data, args.id)
+    if kind == "run" and getattr(args, "prompt", False):
+        print(_run_prompt(item), end="")
         return
-    print(render.table(["", "ID", "STATUS", "ACC", "DEPS", "TITLE"], rows))
+    if args.json:
+        if kind == "milestone":
+            item = dict(item)
+            item["task_details"] = sorted(
+                milestone_tasks(data, args.id), key=lambda t: t["id"]
+            )
+        elif kind == "run":
+            item = {**item, "alive": runner.process_alive(item.get("pid"))}
+        render.emit_json(item)
+        return
+    renderer = {
+        "task": lambda: _render_task(data, item),
+        "milestone": lambda: _render_milestone(
+            data, item, verbose=getattr(args, "verbose", False)
+        ),
+        "run": lambda: _render_run(item),
+        "decision": lambda: _render_decision(item),
+    }[kind]
+    print(renderer())
+
+
+def _run_prompt(run: dict[str, Any]) -> str:
+    path = Path(run["dir"]) / "prompt.txt"
+    if not path.exists():
+        raise WritError(f"no prompt recorded for run {run['id']}")
+    return path.read_text(encoding="utf-8")
+
+
+def _render_run(run: dict[str, Any]) -> str:
+    lines = [f"{run['id']}  ({run['task']})"]
+    lines.append(f"status: {run['status']}  exit: {run.get('exit_code')}")
+    lines.append(f"command: {shlex.join(run['command'])}")
+    if run.get("model"):
+        lines.append(f"model: {run['model']}")
+    lines.append(f"cwd: {run.get('cwd')}")
+    lines.append(f"timeout: {run.get('timeout') or '-'}")
+    lines.append(
+        f"pid: {run.get('pid') or '-'}  "
+        f"alive: {'yes' if runner.process_alive(run.get('pid')) else 'no'}"
+    )
+    if run.get("supervisor_pid"):
+        lines.append(f"supervisor pid: {run['supervisor_pid']}")
+    lines.append(f"created: {run.get('created_at')}")
+    lines.append(f"started: {run.get('started_at') or '-'}")
+    lines.append(f"finished: {run.get('finished_at') or '-'}")
+    if run.get("note"):
+        lines.append(f"note: {run['note']}")
+    lines.append(f"dir: {run.get('dir')}")
+    lines.append(f"\noutput: writ logs {run['id']}")
+    lines.append(f"prompt: writ show {run['id']} --prompt")
+    return "\n".join(lines)
+
+
+def _render_decision(record: dict[str, Any]) -> str:
+    lines = [f"{record['id']} — {record['title']}"]
+    lines.append(f"date: {record['date']}")
+    lines.append(f"status: {record['status']}")
+    if record.get("supersedes"):
+        lines.append(f"supersedes: {record['supersedes']}")
+    if record.get("superseded_by"):
+        lines.append(f"superseded by: {record['superseded_by']}")
+    if record.get("tasks"):
+        lines.append(f"tasks: {', '.join(record['tasks'])}")
+    if record.get("context"):
+        lines.append(f"\ncontext:\n{record['context']}")
+    lines.append(f"\ndecision:\n{record['decision']}")
+    if record.get("consequences"):
+        lines.append(f"\nconsequences:\n{record['consequences']}")
+    return "\n".join(lines)
 
 
 def _render_milestone(
@@ -396,7 +530,7 @@ def _render_milestone(
             ],
         )
     )
-    lines.append(f"\nfull detail: writ milestones show {milestone['id']} --verbose")
+    lines.append(f"\nfull detail: writ show {milestone['id']} --verbose")
     return "\n".join(lines)
 
 
@@ -499,97 +633,36 @@ def _status_payload(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def cmd_milestone_show(args) -> None:
-    data = state.load(args.root)
-    refresh_milestones(data)
-    milestone = get_milestone(data, args.id)
-    if args.json:
-        payload = dict(milestone)
-        payload["task_details"] = sorted(
-            milestone_tasks(data, args.id), key=lambda t: t["id"]
-        )
-        render.emit_json(payload)
-        return
-    print(_render_milestone(data, milestone, verbose=args.verbose))
-
-
-def cmd_task_show(args) -> None:
-    data = state.load(args.root)
-    refresh_milestones(data)
-    task = get_task(data, args.id)
-    if args.json:
-        render.emit_json(task)
-        return
-    print(_render_task(data, task))
-
-
-def cmd_show(args) -> None:
-    data = state.load(args.root)
-    refresh_milestones(data)
-    kind, item = find(data, args.id)
-    if args.json:
-        render.emit_json(item)
-        return
-    if kind == "milestone":
-        print(_render_milestone(data, item, verbose=getattr(args, "verbose", False)))
-        return
-    print(_render_task(data, item))
-
-
-def _status_payload(data: dict[str, Any]) -> dict[str, Any]:
-    refresh_milestones(data)
-    tasks = data["tasks"]
-    counts: dict[str, int] = {}
-    for task in tasks.values():
-        status = effective_status(data, task)
-        counts[status] = counts.get(status, 0) + 1
-    active_runs = [
-        run
-        for run in data["runs"].values()
-        if run["status"] in runner.ACTIVE_RUN_STATUSES
-    ]
-    return {
-        "design_docs": data.get("design_docs", []),
-        "milestones": len(data["milestones"]),
-        "milestones_completed": sum(
-            1 for m in data["milestones"].values() if m["status"] == "completed"
-        ),
-        "tasks": len(tasks),
-        "tasks_completed": counts.get("completed", 0),
-        "counts": counts,
-        "ready": [task["id"] for task in ready_tasks(data)],
-        "running": [
-            task_id
-            for task_id, task in sorted(tasks.items())
-            if task["status"] == "running"
-        ],
-        "failed": [
-            task_id
-            for task_id, task in sorted(tasks.items())
-            if task["status"] == "failed"
-        ],
-        "active_runs": [
-            {
-                "id": run["id"],
-                "task": run["task"],
-                "status": run["status"],
-                "pid": run.get("pid"),
-                "started_at": run.get("started_at"),
-                "alive": runner.process_alive(run.get("pid")),
-            }
-            for run in active_runs
-        ],
-        "decisions": len(data["decisions"]),
-    }
-
-
 def cmd_status(args) -> None:
+    """Progress and live runs, once or repeatedly.
+
+    Following is a mode of looking at status, not a different question, so it is
+    a flag rather than a `watch` command.
+    """
+    if getattr(args, "watch", False):
+        _watch_status(args)
+        return
     data = state.load(args.root)
     payload = _status_payload(data)
     if args.json:
         render.emit_json(payload)
         return
     print(_render_status(payload))
+
+
+def _watch_status(args) -> None:  # pragma: no cover - interactive loop
+    try:
+        while True:
+            payload = _status_payload(state.load(args.root))
+            if not args.no_clear:
+                os.system("clear" if shutil.which("clear") else "")
+            print(f"writ status --watch — {state.utcnow()}  (ctrl-c to exit)\n")
+            print(_render_status(payload))
+            if not payload["active_runs"] and args.until_idle:
+                return
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print()
 
 
 def _render_status(payload: dict[str, Any]) -> str:
@@ -634,23 +707,6 @@ def _render_status(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def cmd_next(args) -> None:
-    data = state.load(args.root)
-    candidates = ready_tasks(data)[: args.limit]
-    if args.json:
-        render.emit_json([task["id"] for task in candidates])
-        return
-    if not candidates:
-        print("nothing is ready; run `writ status` to see what is blocking")
-        return
-    print(
-        render.table(
-            ["ID", "MILESTONE", "TITLE"],
-            [[t["id"], t.get("milestone") or "-", t["title"]] for t in candidates],
-        )
-    )
-
-
 def cmd_graph(args) -> None:
     data = state.load(args.root)
     check_dag(data)
@@ -676,12 +732,12 @@ def cmd_graph(args) -> None:
 # mutation
 
 
-def cmd_set_status(args, status: str) -> None:
+def cmd_set(args) -> None:
     with state.transaction(args.root) as data:
         set_status(
-            data, args.id, status, evidence=args.evidence, force=args.force
+            data, args.id, args.status, evidence=args.evidence, force=args.force
         )
-    print(f"{args.id} -> {status}")
+    print(f"{args.id} -> {args.status}")
 
 
 def cmd_accept(args) -> None:
@@ -694,12 +750,23 @@ def cmd_accept(args) -> None:
     )
 
 
-def cmd_add_task(args) -> None:
+def cmd_task(args) -> None:
+    """Create a task, or amend an existing one.
+
+    Creating and amending take the same fields and differ only in whether the id
+    already exists, so they are one command. Passing a known id amends it;
+    omitting the id creates.
+    """
+    if args.id:
+        _amend_task(args)
+        return
+    if not args.title:
+        raise WritError("creating a task needs --title")
     with state.transaction(args.root) as data:
         milestone = args.milestone
         if milestone and milestone not in data["milestones"]:
             add_milestone(data, milestone_id=milestone, title=milestone)
-        task_id = args.id or _next_task_id(data, milestone)
+        task_id = _next_task_id(data, milestone)
         add_task(
             data,
             task_id=task_id,
@@ -715,13 +782,7 @@ def cmd_add_task(args) -> None:
     print(f"created {task_id}")
 
 
-def _next_task_id(data: dict[str, Any], milestone: str | None) -> str:
-    prefix = milestone or "T"
-    existing = [key for key in data["tasks"] if key.startswith(f"{prefix}-")]
-    return f"{prefix}-{len(existing) + 1:03d}"
-
-
-def cmd_edit_task(args) -> None:
+def _amend_task(args) -> None:
     with state.transaction(args.root) as data:
         task = get_task(data, args.id)
         if args.title:
@@ -739,14 +800,20 @@ def cmd_edit_task(args) -> None:
             task["allowed"] = args.allow
         if args.forbid:
             task["forbidden"] = args.forbid
+        if args.milestone:
+            if args.milestone not in data["milestones"]:
+                raise WritError(f"unknown milestone: {args.milestone}")
+            task["milestone"] = args.milestone
         task["updated_at"] = state.utcnow()
         check_dag(data)
         refresh_milestones(data)
     print(f"updated {args.id}")
 
 
-# --------------------------------------------------------------------------
-# dispatch and monitoring
+def _next_task_id(data: dict[str, Any], milestone: str | None) -> str:
+    prefix = milestone or "T"
+    existing = [key for key in data["tasks"] if key.startswith(f"{prefix}-")]
+    return f"{prefix}-{len(existing) + 1:03d}"
 
 
 def cmd_dispatch(args) -> int:
@@ -857,69 +924,10 @@ def cmd_supervise(args) -> int:
     return runner.execute(Path(args.root), args.run_id)
 
 
-def cmd_runs(args) -> None:
-    data = state.load(args.root)
-    rows = []
-    payload = []
-    for run_id in sorted(data["runs"]):
-        run = data["runs"][run_id]
-        if args.task and run["task"] != args.task:
-            continue
-        if args.active and run["status"] not in runner.ACTIVE_RUN_STATUSES:
-            continue
-        alive = runner.process_alive(run.get("pid"))
-        rows.append(
-            [
-                render.mark(run["status"]),
-                run_id,
-                run["task"],
-                run["status"],
-                run.get("exit_code") if run.get("exit_code") is not None else "-",
-                "yes" if alive else "no",
-                run.get("started_at") or run.get("created_at") or "-",
-            ]
-        )
-        payload.append({**run, "alive": alive})
-    if args.json:
-        render.emit_json(payload)
-        return
-    print(
-        render.table(
-            ["", "RUN", "TASK", "STATUS", "EXIT", "ALIVE", "STARTED"], rows
-        )
-    )
-
-
-def cmd_run_show(args) -> None:
-    data = state.load(args.root)
-    run = runner.resolve_run(data, args.run_id)
-    if args.json:
-        render.emit_json(run)
-        return
-    for key in (
-        "id",
-        "task",
-        "status",
-        "exit_code",
-        "pid",
-        "supervisor_pid",
-        "cwd",
-        "timeout",
-        "created_at",
-        "started_at",
-        "finished_at",
-        "dir",
-    ):
-        if key in run:
-            print(f"{key}: {run[key]}")
-    print(f"command: {' '.join(run['command'])}")
-    print(f"alive: {'yes' if runner.process_alive(run.get('pid')) else 'no'}")
-
-
 def cmd_logs(args) -> None:
     root = Path(args.root)
     data = state.load(root)
-    run_id = args.run_id
+    run_id = args.id
     if run_id in data["tasks"]:
         latest = runner.latest_run_for(data, run_id)
         if latest is None:
@@ -964,11 +972,15 @@ def _follow(path: Path, root: Path, run_id: str) -> None:
 
 
 def cmd_cancel(args) -> None:
-    runner.cancel(Path(args.root), args.run_id)
-    print(f"cancelled {args.run_id}")
+    """Stop one active run, or reconcile every run whose process is gone.
 
-
-def cmd_reap(args) -> None:
+    Both are the same intent: make recorded state match reality. With an id we
+    kill a live run; without one we reap the records whose owner already died.
+    """
+    if args.id:
+        runner.cancel(Path(args.root), args.id)
+        print(f"cancelled {args.id}")
+        return
     reaped = runner.reap(Path(args.root))
     if not reaped:
         print("no stale runs")
@@ -977,27 +989,8 @@ def cmd_reap(args) -> None:
         print(f"marked {run_id} interrupted")
 
 
-def cmd_watch(args) -> None:  # pragma: no cover - interactive loop
-    try:
-        while True:
-            data = state.load(args.root)
-            payload = _status_payload(data)
-            if not args.no_clear:
-                os.system("clear" if shutil.which("clear") else "")
-            print(f"writ watch — {state.utcnow()}  (ctrl-c to exit)\n")
-            print(_render_status(payload))
-            if args.once or not payload["active_runs"] and args.until_idle:
-                return
-            time.sleep(args.interval)
-    except KeyboardInterrupt:
-        print()
-
-
-# --------------------------------------------------------------------------
-# decision log
-
-
-def cmd_decision_add(args) -> None:
+def cmd_decide(args) -> None:
+    """Append a decision. Reading them is `writ list decisions` / `writ show`."""
     with state.transaction(args.root) as data:
         record = decisions.add(
             data,
@@ -1009,55 +1002,10 @@ def cmd_decision_add(args) -> None:
             tasks=args.task or [],
         )
         decisions.sync_markdown(args.root, data)
+        markdown = decisions.render_markdown(data)
+    if args.export:
+        Path(args.export).expanduser().write_text(markdown, encoding="utf-8")
     print(f"recorded {record['id']}: {record['title']}")
     print(f"mirror: {state.decisions_file(args.root)}")
-
-
-def cmd_decision_list(args) -> None:
-    data = state.load(args.root)
-    items = data["decisions"]
-    if args.task:
-        items = [item for item in items if args.task in item.get("tasks", [])]
-    if args.active:
-        items = [item for item in items if item["status"] == "active"]
-    if args.json:
-        render.emit_json(items)
-        return
-    print(
-        render.table(
-            ["ID", "STATUS", "DATE", "TITLE"],
-            [[i["id"], i["status"], i["date"], i["title"]] for i in items],
-        )
-    )
-
-
-def cmd_decision_show(args) -> None:
-    data = state.load(args.root)
-    record = decisions.get(data, args.decision_id)
-    if args.json:
-        render.emit_json(record)
-        return
-    print(f"{record['id']} — {record['title']}")
-    print(f"date: {record['date']}")
-    print(f"status: {record['status']}")
-    if record.get("supersedes"):
-        print(f"supersedes: {record['supersedes']}")
-    if record.get("superseded_by"):
-        print(f"superseded by: {record['superseded_by']}")
-    if record.get("tasks"):
-        print(f"tasks: {', '.join(record['tasks'])}")
-    if record.get("context"):
-        print(f"\ncontext:\n{record['context']}")
-    print(f"\ndecision:\n{record['decision']}")
-    if record.get("consequences"):
-        print(f"\nconsequences:\n{record['consequences']}")
-
-
-def cmd_decision_export(args) -> None:
-    data = state.load(args.root)
-    markdown = decisions.render_markdown(data)
-    if args.out:
-        Path(args.out).expanduser().write_text(markdown, encoding="utf-8")
-        print(f"wrote {args.out}")
-        return
-    print(markdown, end="")
+    if args.export:
+        print(f"exported: {args.export}")
