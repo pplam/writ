@@ -173,6 +173,69 @@ def test_reap_reconciles_a_dead_run(planned, writ, project):
     assert writ("reap")[1].strip() == "no stale runs"
 
 
-def test_watch_once_renders_a_frame(planned, writ):
-    code, out, _ = writ("watch", "--once", "--no-clear")
-    assert code == 0 and "writ watch" in out and "tasks 0/4" in out
+def test_status_renders_progress(planned, writ):
+    code, out, _ = writ("status")
+    assert code == 0 and "tasks 0/4" in out
+
+
+def test_dispatch_makes_a_known_agent_headless(planned, writ, project, monkeypatch):
+    """Bare `pi` would open a TUI and hang; dispatch must add its print flag."""
+    from writ import runner
+
+    monkeypatch.setattr(runner, "execute", lambda root, run_id, **kwargs: 0)
+    writ("dispatch", "M01-001", "--agent", "pi", "--model", "sonnet")
+    run = next(iter(state.load(project)["runs"].values()))
+    assert run["command"] == ["pi", "-p", "--model", "sonnet"]
+    assert run["model"] == "sonnet"
+
+
+def test_dispatch_warns_about_an_unrecognised_agent(planned, writ):
+    _, out, err = writ("dispatch", "M01-001", "--agent", ECHO)
+    assert "cannot confirm it runs without a terminal" in err
+    assert "running:" in out
+
+
+def test_dispatch_timeout_explains_a_likely_interactive_agent(planned, writ):
+    code, _, err = writ("dispatch", "M01-001", "--agent", SLEEP, "--timeout", "1")
+    assert code == 124
+    assert "interactive session" in err
+
+
+def test_dispatch_mirrors_agent_output_live(planned, writ):
+    """A long implementation run must look alive, not hung."""
+    chatty = (
+        f"{sys.executable} -c 'import sys; sys.stdin.read(); "
+        "print(\"editing store.go\"); sys.stdout.flush(); print(\"tests pass\")'"
+    )
+    code, out, _ = writ("dispatch", "M01-001", "--agent", chatty)
+    assert code == 0
+    assert "| editing store.go" in out
+    assert "| tests pass" in out
+
+
+def test_dispatch_quiet_keeps_output_in_the_log_only(planned, writ, project):
+    code, out, _ = writ("dispatch", "M01-001", "--agent", ECHO, "--quiet")
+    assert code == 0
+    assert "| Task M01-001" not in out
+    run_id = next(iter(state.load(project)["runs"]))
+    assert "Task M01-001" in (state.run_dir(project, run_id) / "stdout.log").read_text()
+
+
+def test_streamed_dispatch_records_the_same_transcript(planned, writ, project):
+    writ("dispatch", "M01-001", "--agent", ECHO)
+    run_id = next(iter(state.load(project)["runs"]))
+    log = (state.run_dir(project, run_id) / "stdout.log").read_text()
+    # the prompt came back through the echo agent, unprefixed on disk
+    assert "Task M01-001" in log
+    assert "| Task" not in log
+
+
+def test_streamed_dispatch_still_records_failure(planned, writ, project):
+    code, _, err = writ("dispatch", "M01-001", "--agent", FAIL)
+    assert code == 3
+    assert "boom" in err  # mirrored live
+    data = state.load(project)
+    run = next(iter(data["runs"].values()))
+    assert run["status"] == "failed" and run["exit_code"] == 3
+    assert data["tasks"]["M01-001"]["status"] == "failed"
+    assert "boom" in (state.run_dir(project, run["id"]) / "stderr.log").read_text()

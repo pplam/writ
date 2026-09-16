@@ -70,7 +70,7 @@ def writ(project: Path):
 @pytest.fixture
 def planned(writ, design: Path):
     writ("init")
-    writ("plan", str(design))
+    writ("plan", str(design), "--extract")
     return writ
 
 

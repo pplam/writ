@@ -50,6 +50,35 @@ writ decision add \
   --task M01-001
 ```
 
+## Agent invocation
+
+Every coding agent CLI opens an interactive session by default. Piping a prompt
+into bare `pi` or `claude` does not run them headless — they wait on a terminal
+that is not there, and the run hangs until the timeout kills it.
+
+So Writ adds the non-interactive flag itself, and translates `--model` to
+whatever each agent calls it:
+
+```bash
+writ agents                                   # the whole table
+writ agents --agent codex --model gpt-5-codex  # codex exec --model gpt-5-codex -
+```
+
+| Agent | Invocation |
+|---|---|
+| `pi`, `claude`, `cursor-agent` | `-p` |
+| `codex` | `exec -` (prompt on stdin) |
+| `opencode` | `run` |
+| `amp` | `-x` |
+| `gemini` | none needed; a pipe is enough |
+
+Explicit flags win. `--agent 'pi -p'` is not given a second `-p`, and
+`--agent 'codex exec'` is not given a second `exec`. Any other command is passed
+through untouched, with a warning that Writ cannot confirm it runs without a
+terminal — add its own headless flag to `--agent`. When a run is killed on
+timeout having produced no output at all, that is the first thing Writ suggests
+checking.
+
 ## Storage
 
 ```

@@ -2,21 +2,24 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
-from . import decisions, planner, render, runner, state
+from . import agents, decisions, planner, planning, render, runner, state
 from .model import (
     acceptance_summary,
+    add_evidence,
     add_milestone,
     add_task,
     check_dag,
     blocking_dependencies,
     effective_status,
     find,
+    get_milestone,
     get_task,
     milestone_tasks,
     ready_tasks,
@@ -37,30 +40,145 @@ def cmd_init(args) -> None:
     print("next: writ plan <design.md>")
 
 
-def cmd_plan(args) -> None:
+def cmd_plan(args) -> int:
+    """Turn a design document into a task DAG.
+
+    By default a coding agent does the planning: it reads the document and the
+    repository and returns a plan as JSON, which Writ validates before any of it
+    reaches project state. `--extract` uses the deterministic heading parser
+    instead, and `--from-plan` re-imports a plan artifact without paying for
+    another agent run.
+    """
+    root = Path(args.root)
     doc = Path(args.design).expanduser()
     if not doc.exists():
         raise WritError(f"design document not found: {doc}")
-    milestones = planner.parse(
-        doc.read_text(encoding="utf-8"),
-        milestone_level=args.level,
-        split_subsections=not args.flat,
-    )
-    summary = planner.summarize(milestones)
-    if args.dry_run:
-        for milestone in milestones:
-            print(f"{milestone.title}")
-            for task in milestone.tasks:
-                print(f"  - {task.title}")
-                for item in task.acceptances:
-                    print(f"      · {item}")
-        print(
-            f"\nwould create {summary['milestones']} milestones, "
-            f"{summary['tasks']} tasks, {summary['acceptances']} acceptance criteria"
-        )
-        return
 
-    with state.transaction(args.root) as data:
+    plan_path: Path | None = None
+    if args.from_plan:
+        plan_path = Path(args.from_plan).expanduser()
+        milestones = planning.read_plan(plan_path)
+        source = f"plan {plan_path.name}"
+    elif args.extract:
+        milestones = planner.parse(
+            doc.read_text(encoding="utf-8"),
+            milestone_level=args.level,
+            split_subsections=not args.flat,
+        )
+        source = f"{doc.name} (extracted)"
+    else:
+        data = state.load(root)
+        # check the overwrite gate before paying for an agent run, not after
+        if data["tasks"] and not (args.append or args.force or args.dry_run):
+            raise WritError(
+                "this project already has tasks; use --append to add, "
+                "or --force to replace the plan"
+            )
+        context = planning.plan_context(data)
+        if args.dry_run:
+            print(
+                planning.build_prompt(
+                    root=root.resolve(),
+                    doc=doc,
+                    plan_path=state.plan_dir(root, "<plan-id>") / "plan.json",
+                    instructions=args.instructions,
+                    context=context,
+                )
+            )
+            return 0
+        print(f"planning {doc.name} with {args.agent}...")
+
+        def announce(resolved: agents.ResolvedAgent, directory: Path) -> None:
+            print(f"  running: {resolved.display}")
+            if resolved.warning:
+                print(f"  warning: {resolved.warning}", file=sys.stderr)
+            print(f"  transcript: {directory}")
+            if not args.quiet:
+                print("  " + "─" * 60)
+            sys.stdout.flush()
+
+        milestones, plan_path, code = planning.generate(
+            root=root,
+            doc=doc,
+            agent=args.agent,
+            agent_args=list(getattr(args, "agent_args", []) or []),
+            model=args.model,
+            timeout=args.timeout,
+            cwd=args.cwd,
+            instructions=args.instructions,
+            context=context,
+            stream=not args.quiet,
+            on_start=announce,
+        )
+        if not args.quiet:
+            print("  " + "─" * 60)
+        print(f"planning agent exited {code}; plan: {plan_path}")
+        source = f"{doc.name} (agent)"
+
+    summary = planner.summarize(milestones)
+    missing = planning.unresolved_sections(milestones, doc)
+
+    if args.dry_run:
+        _print_plan(milestones, summary, missing)
+        return 0
+
+    created = _commit_plan(
+        args,
+        root=root,
+        doc=doc,
+        milestones=milestones,
+        plan_path=plan_path,
+        source=source,
+    )
+    print(
+        f"created {summary['milestones']} milestones and {created} tasks "
+        f"from {source}"
+    )
+    for section in missing:
+        print(f"note: no section titled {section!r} in {doc.name}", file=sys.stderr)
+    print("next: writ status")
+    return 0
+
+
+def _print_plan(
+    milestones: list[planner.PlannedMilestone],
+    summary: dict[str, Any],
+    missing: list[str],
+) -> None:
+    for milestone in milestones:
+        print(milestone.title)
+        if milestone.notes:
+            print(f"    {milestone.notes}")
+        for task in milestone.tasks:
+            print(f"  - {task.title}")
+            if task.notes:
+                print(f"      {task.notes}")
+            for item in task.acceptances:
+                print(f"      · {item}")
+            if task.depends_on:
+                print(f"      after: {', '.join(task.depends_on)}")
+            if task.allowed:
+                print(f"      allowed: {', '.join(task.allowed)}")
+            if task.forbidden:
+                print(f"      forbidden: {', '.join(task.forbidden)}")
+    print(
+        f"\nwould create {summary['milestones']} milestones, "
+        f"{summary['tasks']} tasks, {summary['acceptances']} acceptance criteria"
+    )
+    for section in missing:
+        print(f"note: design section {section!r} was not found", file=sys.stderr)
+
+
+def _commit_plan(
+    args,
+    *,
+    root: Path,
+    doc: Path,
+    milestones: list[planner.PlannedMilestone],
+    plan_path: Path | None,
+    source: str,
+) -> int:
+    with state.transaction(root) as data:
         if data["tasks"] and not (args.append or args.force):
             raise WritError(
                 "this project already has tasks; use --append to add, "
@@ -73,12 +191,15 @@ def cmd_plan(args) -> None:
         doc_path = str(doc.resolve())
         if doc_path not in data["design_docs"]:
             data["design_docs"].append(doc_path)
+
+        built = planner.build_ids(milestones, offset)
+        translate = planner.ref_map(built)
         previous: str | None = None
         if args.append:
             existing = sorted(data["tasks"])
             previous = existing[-1] if existing else None
-        created_tasks = 0
-        for milestone_id, milestone, tasks in planner.build_ids(milestones, offset):
+        created = 0
+        for milestone_id, milestone, tasks in built:
             add_milestone(
                 data,
                 milestone_id=milestone_id,
@@ -86,26 +207,68 @@ def cmd_plan(args) -> None:
                 design_section=milestone.section,
             )
             for task_id, task in tasks:
+                depends = _resolve_depends(
+                    task, translate, data, previous, chain=not args.parallel
+                )
                 add_task(
                     data,
                     task_id=task_id,
                     title=task.title,
                     milestone=milestone_id,
-                    depends_on=[previous] if previous and not args.parallel else [],
+                    depends_on=depends,
                     acceptances=task.acceptances,
+                    allowed=task.allowed,
+                    forbidden=task.forbidden,
                     design_section=task.section,
                     design_doc=doc_path,
                 )
-                created_tasks += 1
-                if not args.parallel:
-                    previous = task_id
+                if task.notes:
+                    add_evidence(data["tasks"][task_id], f"plan: {task.notes}")
+                created += 1
+                previous = task_id
         check_dag(data)
         refresh_milestones(data)
-    print(
-        f"created {summary['milestones']} milestones and {created_tasks} tasks "
-        f"from {doc.name}"
-    )
-    print("next: writ status")
+        data.setdefault("plans", []).append(
+            {
+                "source": source,
+                "design_doc": doc_path,
+                "artifact": str(plan_path) if plan_path else None,
+                "milestones": [milestone_id for milestone_id, _, _ in built],
+                "created_at": state.utcnow(),
+            }
+        )
+    return created
+
+
+def _resolve_depends(
+    task: planner.PlannedTask,
+    translate: dict[str, str],
+    data: dict[str, Any],
+    previous: str | None,
+    *,
+    chain: bool,
+) -> list[str]:
+    """Map a planned task's stated dependencies onto real task ids.
+
+    A generated plan refers to tasks by the ids it invented, and may also refer
+    to tasks that already exist. Anything we cannot resolve is an error, not a
+    silently dropped edge. When the plan states no dependencies at all we fall
+    back to the historical behaviour: chain onto the previous task unless
+    `--parallel` said to leave tasks independent.
+    """
+    if not task.depends_on:
+        return [previous] if chain and previous else []
+    resolved: list[str] = []
+    for ref in task.depends_on:
+        target = translate.get(ref) or (ref if ref in data["tasks"] else None)
+        if target is None:
+            raise WritError(
+                f"task {task.title!r} depends on {ref!r}, which is neither in "
+                "this plan nor an existing task"
+            )
+        if target not in resolved:
+            resolved.append(target)
+    return resolved
 
 
 # --------------------------------------------------------------------------
@@ -185,6 +348,181 @@ def cmd_tasks(args) -> None:
     print(render.table(["", "ID", "STATUS", "ACC", "DEPS", "TITLE"], rows))
 
 
+def _render_milestone(
+    data: dict[str, Any], milestone: dict[str, Any], *, verbose: bool = False
+) -> str:
+    """A milestone, its rollup, and its member tasks.
+
+    With `verbose`, every member task is expanded in full, so one command can
+    answer "what does this milestone actually commit me to".
+    """
+    tasks = sorted(milestone_tasks(data, milestone["id"]), key=lambda t: t["id"])
+    done = sum(1 for task in tasks if task["status"] == "completed")
+    lines = [f"{milestone['id']}  {milestone['title']}"]
+    lines.append(f"status: {milestone['status']}")
+    lines.append(f"tasks: {done}/{len(tasks)}  {render.bar(done, len(tasks))}")
+    lines.append(f"design section: {milestone.get('design_section') or '-'}")
+    criteria = sum(len(task.get("acceptances", [])) for task in tasks)
+    passed = sum(
+        1
+        for task in tasks
+        for item in task.get("acceptances", [])
+        if item["status"] == "passed"
+    )
+    lines.append(f"acceptance criteria: {passed}/{criteria} passed")
+
+    if verbose:
+        for task in tasks:
+            lines.append("")
+            lines.append("-" * 60)
+            lines.append(_render_task(data, task))
+        return "\n".join(lines)
+
+    lines.append("\ntasks:")
+    lines.append(
+        render.table(
+            ["", "ID", "STATUS", "ACC", "DEPS", "TITLE"],
+            [
+                [
+                    render.mark(effective_status(data, task)),
+                    task["id"],
+                    effective_status(data, task),
+                    f"{acceptance_summary(task)['passed']}/"
+                    f"{acceptance_summary(task)['total']}",
+                    ",".join(task.get("depends_on", [])) or "-",
+                    task["title"],
+                ]
+                for task in tasks
+            ],
+        )
+    )
+    lines.append(f"\nfull detail: writ milestones show {milestone['id']} --verbose")
+    return "\n".join(lines)
+
+
+def _render_task(data: dict[str, Any], task: dict[str, Any]) -> str:
+    """Everything recorded about one task, including what depends on it."""
+    status = effective_status(data, task)
+    lines = [f"{task['id']}  {task['title']}"]
+    lines.append(f"status: {status}")
+    milestone_id = task.get("milestone")
+    if milestone_id:
+        milestone = data["milestones"].get(milestone_id, {})
+        lines.append(f"milestone: {milestone_id} — {milestone.get('title', '')}")
+    else:
+        lines.append("milestone: -")
+    lines.append(f"depends on: {', '.join(task.get('depends_on', [])) or '-'}")
+    blockers = blocking_dependencies(data, task)
+    if blockers:
+        lines.append(f"blocked by: {', '.join(blockers)}")
+    dependents = [
+        other["id"]
+        for other in sorted(data["tasks"].values(), key=lambda t: t["id"])
+        if task["id"] in other.get("depends_on", [])
+    ]
+    if dependents:
+        lines.append(f"blocks: {', '.join(dependents)}")
+    lines.append(f"design: {task.get('design_doc') or '-'}")
+    lines.append(f"section: {task.get('design_section') or '-'}")
+    counts = acceptance_summary(task)
+    lines.append(
+        f"\nacceptance criteria ({counts['passed']}/{counts['total']} passed):"
+    )
+    for index, acceptance in enumerate(task.get("acceptances", []), start=1):
+        lines.append(render.acceptance_line(index, acceptance))
+    if not task.get("acceptances"):
+        lines.append("  (none recorded)")
+    if task.get("allowed"):
+        lines.append("\nallowed:")
+        lines.extend(f"  - {entry}" for entry in task["allowed"])
+    if task.get("forbidden"):
+        lines.append("\nforbidden:")
+        lines.extend(f"  - {entry}" for entry in task["forbidden"])
+    if task.get("runs"):
+        lines.append("\nruns:")
+        for run_id in task["runs"]:
+            run = data["runs"].get(run_id, {})
+            lines.append(
+                f"  - {run_id}  {run.get('status')}  exit={run.get('exit_code')}"
+            )
+    if task.get("evidence"):
+        lines.append("\nevidence:")
+        for entry in task["evidence"]:
+            lines.append(f"  - {entry['at']}  {entry['text']}")
+    return "\n".join(lines)
+
+
+def _status_payload(data: dict[str, Any]) -> dict[str, Any]:
+    refresh_milestones(data)
+    tasks = data["tasks"]
+    counts: dict[str, int] = {}
+    for task in tasks.values():
+        status = effective_status(data, task)
+        counts[status] = counts.get(status, 0) + 1
+    active_runs = [
+        run
+        for run in data["runs"].values()
+        if run["status"] in runner.ACTIVE_RUN_STATUSES
+    ]
+    return {
+        "design_docs": data.get("design_docs", []),
+        "milestones": len(data["milestones"]),
+        "milestones_completed": sum(
+            1 for m in data["milestones"].values() if m["status"] == "completed"
+        ),
+        "tasks": len(tasks),
+        "tasks_completed": counts.get("completed", 0),
+        "counts": counts,
+        "ready": [task["id"] for task in ready_tasks(data)],
+        "running": [
+            task_id
+            for task_id, task in sorted(tasks.items())
+            if task["status"] == "running"
+        ],
+        "failed": [
+            task_id
+            for task_id, task in sorted(tasks.items())
+            if task["status"] == "failed"
+        ],
+        "active_runs": [
+            {
+                "id": run["id"],
+                "task": run["task"],
+                "status": run["status"],
+                "pid": run.get("pid"),
+                "started_at": run.get("started_at"),
+                "alive": runner.process_alive(run.get("pid")),
+            }
+            for run in active_runs
+        ],
+        "decisions": len(data["decisions"]),
+    }
+
+
+def cmd_milestone_show(args) -> None:
+    data = state.load(args.root)
+    refresh_milestones(data)
+    milestone = get_milestone(data, args.id)
+    if args.json:
+        payload = dict(milestone)
+        payload["task_details"] = sorted(
+            milestone_tasks(data, args.id), key=lambda t: t["id"]
+        )
+        render.emit_json(payload)
+        return
+    print(_render_milestone(data, milestone, verbose=args.verbose))
+
+
+def cmd_task_show(args) -> None:
+    data = state.load(args.root)
+    refresh_milestones(data)
+    task = get_task(data, args.id)
+    if args.json:
+        render.emit_json(task)
+        return
+    print(_render_task(data, task))
+
+
 def cmd_show(args) -> None:
     data = state.load(args.root)
     refresh_milestones(data)
@@ -193,52 +531,9 @@ def cmd_show(args) -> None:
         render.emit_json(item)
         return
     if kind == "milestone":
-        print(f"{item['id']}  {item['title']}")
-        print(f"status: {item['status']}")
-        print(f"design section: {item.get('design_section') or '-'}")
-        print("\ntasks:")
-        rows = [
-            [
-                render.mark(effective_status(data, task)),
-                task["id"],
-                effective_status(data, task),
-                task["title"],
-            ]
-            for task in sorted(milestone_tasks(data, item["id"]), key=lambda t: t["id"])
-        ]
-        print(render.table(["", "ID", "STATUS", "TITLE"], rows))
+        print(_render_milestone(data, item, verbose=getattr(args, "verbose", False)))
         return
-
-    status = effective_status(data, item)
-    print(f"{item['id']}  {item['title']}")
-    print(f"status: {status}")
-    print(f"milestone: {item.get('milestone') or '-'}")
-    print(f"depends on: {', '.join(item.get('depends_on', [])) or '-'}")
-    blockers = blocking_dependencies(data, item)
-    if blockers:
-        print(f"blocked by: {', '.join(blockers)}")
-    print(f"design: {item.get('design_doc') or '-'}")
-    print(f"section: {item.get('design_section') or '-'}")
-    print("\nacceptance criteria:")
-    for index, acceptance in enumerate(item.get("acceptances", []), start=1):
-        print(render.acceptance_line(index, acceptance))
-    if item.get("allowed"):
-        print("\nallowed:")
-        for entry in item["allowed"]:
-            print(f"  - {entry}")
-    if item.get("forbidden"):
-        print("\nforbidden:")
-        for entry in item["forbidden"]:
-            print(f"  - {entry}")
-    if item.get("runs"):
-        print("\nruns:")
-        for run_id in item["runs"]:
-            run = data["runs"].get(run_id, {})
-            print(f"  - {run_id}  {run.get('status')}  exit={run.get('exit_code')}")
-    if item.get("evidence"):
-        print("\nevidence:")
-        for entry in item["evidence"]:
-            print(f"  - {entry['at']}  {entry['text']}")
+    print(_render_task(data, item))
 
 
 def _status_payload(data: dict[str, Any]) -> dict[str, Any]:
@@ -461,30 +756,100 @@ def cmd_dispatch(args) -> int:
         task = get_task(data, args.id)
         print(runner.build_prompt(data, task, Path(args.root)))
         return 0
-    run_id, directory, _ = runner.prepare(
+    run_id, directory, _, resolved = runner.prepare(
         Path(args.root),
         args.id,
         args.agent,
         extra,
+        model=args.model,
         timeout=args.timeout,
         cwd=args.cwd,
         force=args.force,
     )
+    if resolved.warning:
+        print(f"warning: {resolved.warning}", file=sys.stderr)
     if args.detach:
         pid = runner.detach(Path(args.root), run_id)
         print(f"dispatched {args.id} as run {run_id} (detached, supervisor pid {pid})")
         print(f"logs: writ logs {run_id} --follow")
         return 0
     print(f"dispatched {args.id} as run {run_id}")
+    print(f"running: {resolved.display}")
     print(f"logs: {directory}")
-    code = runner.execute(Path(args.root), run_id)
+    if not args.quiet:
+        print("" + "─" * 62)
+        sys.stdout.flush()
+    code = runner.execute(
+        Path(args.root), run_id, stream=not args.quiet, prefix="| "
+    )
+    if not args.quiet:
+        print("" + "─" * 62)
     print(f"run {run_id} finished with exit code {code}")
+    if code == 124 and not runner.produced_output(directory):
+        print(agents.hang_hint(resolved), file=sys.stderr)
     if code == 0:
         print(
             f"next: verify acceptances, then `writ accept {args.id} <n> passed` "
             f"and `writ complete {args.id}`"
         )
     return code
+
+
+def cmd_agents(args) -> None:
+    """Show the headless invocation writ will use.
+
+    Agent CLIs open an interactive session by default, which hangs when the
+    prompt arrives on a pipe. This is how to check what writ will actually run
+    before committing a long planning job to it.
+    """
+    if args.agent:
+        resolved = agents.resolve(args.agent, [], args.model)
+        if args.json:
+            render.emit_json(
+                {
+                    "agent": resolved.name,
+                    "command": resolved.command,
+                    "known": resolved.profile is not None,
+                    "warning": resolved.warning,
+                }
+            )
+            return
+        print(resolved.display)
+        if resolved.profile and resolved.profile.note:
+            print(f"note: {resolved.profile.note}")
+        if resolved.warning:
+            print(f"warning: {resolved.warning}", file=sys.stderr)
+        return
+
+    rows = []
+    payload = []
+    for name in agents.KNOWN_AGENTS:
+        resolved = agents.resolve(name, [], None)
+        profile = agents.PROFILES[name]
+        available = "yes" if shutil.which(name) else "no"
+        rows.append(
+            [
+                name,
+                available,
+                shlex.join(resolved.command),
+                profile.model_flag or "-",
+            ]
+        )
+        payload.append(
+            {
+                "agent": name,
+                "installed": available == "yes",
+                "command": resolved.command,
+                "model_flag": profile.model_flag,
+                "note": profile.note,
+            }
+        )
+    if args.json:
+        render.emit_json(payload)
+        return
+    print(render.table(["AGENT", "FOUND", "HEADLESS INVOCATION", "MODEL FLAG"], rows))
+    print("\nany other command is passed through unchanged; add its own")
+    print("non-interactive flag to --agent so it does not wait on a terminal")
 
 
 def cmd_supervise(args) -> int:

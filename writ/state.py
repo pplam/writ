@@ -11,6 +11,7 @@ Layout under a project root:
         state.lock        advisory lock, held only for the duration of a write
         decisions.md      human-readable, append-only mirror of the decision log
         runs/<run-id>/    prompt.txt, stdout.log, stderr.log, meta.json
+        plans/<plan-id>/  prompt.txt, plan.json, stdout.log, stderr.log
 """
 from __future__ import annotations
 
@@ -29,6 +30,7 @@ STATE_FILENAME = "state.json"
 LOCK_FILENAME = "state.lock"
 DECISIONS_FILENAME = "decisions.md"
 RUNS_DIRNAME = "runs"
+PLANS_DIRNAME = "plans"
 
 LOCK_TIMEOUT_SECONDS = 10.0
 LOCK_STALE_SECONDS = 60.0
@@ -56,6 +58,14 @@ def runs_dir(root: str | os.PathLike[str]) -> Path:
     return store_dir(root) / RUNS_DIRNAME
 
 
+def plans_dir(root: str | os.PathLike[str]) -> Path:
+    return store_dir(root) / PLANS_DIRNAME
+
+
+def plan_dir(root: str | os.PathLike[str], plan_id: str) -> Path:
+    return plans_dir(root) / plan_id
+
+
 def decisions_file(root: str | os.PathLike[str]) -> Path:
     return store_dir(root) / DECISIONS_FILENAME
 
@@ -73,6 +83,7 @@ def empty_state() -> dict[str, Any]:
         "milestones": {},
         "tasks": {},
         "runs": {},
+        "plans": [],
         "decisions": [],
         "counters": {"decision": 0},
     }
@@ -90,6 +101,7 @@ def initialize(root: str | os.PathLike[str], force: bool = False) -> Path:
             f"already initialized at {store_dir(root)} (use --force to reset)"
         )
     runs_dir(root).mkdir(parents=True, exist_ok=True)
+    plans_dir(root).mkdir(parents=True, exist_ok=True)
     _write(target, empty_state())
     return store_dir(root)
 
@@ -111,6 +123,7 @@ def load(root: str | os.PathLike[str]) -> dict[str, Any]:
             f"state schema {version!r} is not supported by this Writ build "
             f"(expected {SCHEMA_VERSION})"
         )
+    data.setdefault("plans", [])
     return data
 
 

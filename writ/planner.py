@@ -1,10 +1,15 @@
-"""Turn a design document into an executable milestone/task DAG.
+"""Structural extraction of a milestone/task DAG from a design document.
 
-The parser is intentionally simple and predictable: headings become milestones,
-optional sub-headings become tasks, and acceptance criteria are lifted from
-explicit gate markers (`**Pass:**`, `**Gate:**`, `Acceptance:`) or from bullet
-lists under an acceptance heading. Anything it cannot find, it says so — it
-never invents a bar that the document did not state.
+This is the deterministic fallback behind `writ plan --extract`. The parser is
+intentionally simple and predictable: headings become milestones, optional
+sub-headings become tasks, and acceptance criteria are lifted from explicit gate
+markers (`**Pass:**`, `**Gate:**`, `Acceptance:`) or from bullet lists under an
+acceptance heading. Anything it cannot find, it says so — it never invents a bar
+that the document did not state.
+
+The richer, judged plan comes from `planning.py`, which asks a coding agent to
+produce the same shapes. Both paths share `PlannedMilestone`/`PlannedTask` and
+`build_ids`, so everything downstream is identical.
 """
 from __future__ import annotations
 
@@ -37,6 +42,14 @@ class PlannedTask:
     acceptances: list[str]
     section: str
     body: str = ""
+    #: id the plan's author used, for resolving intra-plan dependencies
+    ref: str | None = None
+    notes: str = ""
+    depends_on: list[str] = field(default_factory=list)
+    allowed: list[str] = field(default_factory=list)
+    forbidden: list[str] = field(default_factory=list)
+    #: whether `section` was claimed by the author or synthesized from titles
+    stated_section: bool = False
 
 
 @dataclass
@@ -44,6 +57,8 @@ class PlannedMilestone:
     title: str
     section: str
     tasks: list[PlannedTask] = field(default_factory=list)
+    ref: str | None = None
+    notes: str = ""
 
 
 def clean(text: str) -> str:
@@ -159,6 +174,7 @@ def parse(
                         or list(GENERIC_ACCEPTANCES),
                         section=f"{title} / {sub_title}",
                         body=sub_body,
+                        stated_section=True,
                     )
                 )
         else:
@@ -168,6 +184,7 @@ def parse(
                     acceptances=extract_acceptances(body) or list(GENERIC_ACCEPTANCES),
                     section=title,
                     body=body,
+                    stated_section=True,
                 )
             )
         milestones.append(milestone)
@@ -193,7 +210,12 @@ def section_text(doc: Path, section: str) -> str:
 def build_ids(
     milestones: list[PlannedMilestone], offset: int = 0
 ) -> list[tuple[str, PlannedMilestone, list[tuple[str, PlannedTask]]]]:
-    """Assign stable `M01` / `M01-001` identifiers."""
+    """Assign stable `M01` / `M01-001` identifiers.
+
+    Writ owns identity, not the plan's author: whatever ids a generated plan
+    proposed are kept only as a translation table (see `ref_map`) so its stated
+    dependencies can be rewritten onto the ids we actually assign.
+    """
     result = []
     for position, milestone in enumerate(milestones, start=offset + 1):
         milestone_id = f"M{position:02d}"
@@ -203,6 +225,18 @@ def build_ids(
         ]
         result.append((milestone_id, milestone, tasks))
     return result
+
+
+def ref_map(
+    built: list[tuple[str, PlannedMilestone, list[tuple[str, PlannedTask]]]]
+) -> dict[str, str]:
+    """Map the plan author's task ids onto the ids Writ assigned."""
+    return {
+        task.ref: task_id
+        for _, _, tasks in built
+        for task_id, task in tasks
+        if task.ref
+    }
 
 
 def summarize(milestones: list[PlannedMilestone]) -> dict[str, Any]:

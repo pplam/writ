@@ -4,7 +4,7 @@ import json
 def test_init_then_plan_builds_the_dag(writ, design):
     code, out, _ = writ("init")
     assert code == 0 and "initialized" in out
-    code, out, _ = writ("plan", str(design))
+    code, out, _ = writ("plan", str(design), "--extract")
     assert code == 0
     assert "created 3 milestones and 4 tasks" in out
 
@@ -17,7 +17,7 @@ def test_init_then_plan_builds_the_dag(writ, design):
 
 def test_plan_dry_run_writes_nothing(writ, design):
     writ("init")
-    code, out, _ = writ("plan", str(design), "--dry-run")
+    code, out, _ = writ("plan", str(design), "--extract", "--dry-run")
     assert code == 0
     assert "would create 3 milestones" in out
     _, listing, _ = writ("tasks")
@@ -26,16 +26,16 @@ def test_plan_dry_run_writes_nothing(writ, design):
 
 def test_plan_refuses_to_overwrite_without_a_flag(writ, design):
     writ("init")
-    writ("plan", str(design))
-    code, _, err = writ("plan", str(design))
+    writ("plan", str(design), "--extract")
+    code, _, err = writ("plan", str(design), "--extract")
     assert code == 2 and "already has tasks" in err
-    assert writ("plan", str(design), "--force")[0] == 0
+    assert writ("plan", str(design), "--extract", "--force")[0] == 0
 
 
 def test_plan_append_extends_numbering(writ, design):
     writ("init")
-    writ("plan", str(design))
-    writ("plan", str(design), "--append")
+    writ("plan", str(design), "--extract")
+    writ("plan", str(design), "--extract", "--append")
     _, out, _ = writ("--json", "milestones")
     assert [m["id"] for m in json.loads(out)] == [
         "M01", "M02", "M03", "M04", "M05", "M06",
@@ -44,7 +44,7 @@ def test_plan_append_extends_numbering(writ, design):
 
 def test_plan_parallel_leaves_tasks_independent(writ, design):
     writ("init")
-    writ("plan", str(design), "--parallel")
+    writ("plan", str(design), "--extract", "--parallel")
     _, out, _ = writ("--json", "tasks")
     assert all(t["depends_on"] == [] for t in json.loads(out))
 

@@ -54,6 +54,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--dry-run", action="store_true", help="print the plan without writing state"
     )
+    p.add_argument("--agent", default="pi", help="agent command (default: pi)")
+    p.add_argument("--model", help="model for the planning agent")
+    p.add_argument(
+        "--timeout", type=int, default=1800, help="seconds before the agent is killed"
+    )
+    p.add_argument(
+        "--extract",
+        action="store_true",
+        help="derive the plan by parsing headings instead of asking an agent",
+    )
+    p.add_argument("--from-plan", help="commit a plan.json an agent already wrote")
+    p.add_argument("--quiet", "-q", action="store_true", help="do not mirror output")
+    p.add_argument("--cwd", help="directory to run the planning agent in")
+    p.add_argument(
+        "--instructions",
+        help="extra guidance for the planning agent (scope, priorities, constraints)",
+    )
     p.set_defaults(func=commands.cmd_plan)
 
     # inspection
@@ -64,13 +81,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--status", help="filter by status")
     p.add_argument("--milestone", help="filter by milestone id")
     p.add_argument("--ready", action="store_true", help="only dispatchable tasks")
+    tsub = p.add_subparsers(dest="task_cmd")
+    tv = tsub.add_parser("show", help="show one task in detail")
+    tv.add_argument("id")
+    tv.set_defaults(func=commands.cmd_task_show)
     p.set_defaults(func=commands.cmd_tasks)
 
     p = sub.add_parser("milestones", help="list milestones with rollups")
+    msub = p.add_subparsers(dest="milestone_cmd")
+    m = msub.add_parser("show", help="show one milestone in detail")
+    m.add_argument("id")
+    m.add_argument("--verbose", "-v", action="store_true", help="expand every task")
+    m.set_defaults(func=commands.cmd_milestone_show)
     p.set_defaults(func=commands.cmd_milestones)
 
     p = sub.add_parser("show", help="show a task or milestone in detail")
     p.add_argument("id")
+    p.add_argument("--verbose", "-v", action="store_true", help="expand every task")
     p.set_defaults(func=commands.cmd_show)
 
     p = sub.add_parser("next", help="what can be dispatched now")
@@ -139,7 +166,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--dry-run", action="store_true", help="print the prompt and exit"
     )
+    p.add_argument("--model", help="model for the agent")
+    p.add_argument("--quiet", "-q", action="store_true", help="do not mirror output")
     p.set_defaults(func=commands.cmd_dispatch)
+
+    p = sub.add_parser("agents", help="show how writ invokes each known agent")
+    p.add_argument("--agent", help="show one agent")
+    p.add_argument("--model", help="include a model flag")
+    p.set_defaults(func=commands.cmd_agents)
 
     p = sub.add_parser("supervise", help=argparse.SUPPRESS)
     p.add_argument("run_id")
