@@ -39,15 +39,21 @@ writ status                            # progress, ready work, live runs
 writ list --ready                      # what can start now
 writ show M01-001                      # the task and its acceptance bars
 
-writ dispatch M01-001 --agent claude    # implements it, reports a verdict
-writ logs M01-001 --follow             # stream the agent's output
+writ run --parallel 3                  # walk the whole graph: dispatch, review,
+                                       # repeat, three agents at a time
 writ status --watch                    # from any other terminal, any time
-
-writ review M01-001 --agent codex      # a different agent checks the claim
-                                       # its decision completes or fails the task
 
 writ list decisions --proposed         # choices the agents had to make
 writ set D-0001 active                 # confirm one, or reject it with --reason
+```
+
+To drive one task at a time instead:
+
+```bash
+writ dispatch M01-001 --agent claude   # implements it, reports a verdict
+writ logs M01-001 --follow             # stream the agent's output
+writ review M01-001 --agent codex      # a different agent checks the claim
+                                       # its decision completes or fails the task
 ```
 
 ## Storage
@@ -56,6 +62,7 @@ writ set D-0001 active                 # confirm one, or reject it with --reason
 <project>/.writ/
   state.json          milestones, tasks, runs, decisions
   decisions.md        human-readable mirror of the decision log
+  run.session         the pid of the active `writ run`, if any
   plans/<plan-id>/
     prompt.txt        what the planning agent was asked
     plan.json         the plan it returned, before validation
@@ -153,6 +160,11 @@ planned ──(deps complete)──> ready ──dispatch──> running
 
 `ready` is derived from the DAG, never stored.
 
+If the process working on a task dies, the task goes back to the last status it
+can be resumed from: `running` returns to `planned`, and `reviewing` returns to
+`awaiting-review`. The next `writ run` (or `writ cancel` with no id) does that
+reconciliation.
+
 ### Statuses are set by agents, not by hand
 
 The implementing agent reports a structured verdict; a reviewer agent that did
@@ -247,7 +259,7 @@ writ override M01-002 failed --reason "criterion 2 regressed" --accept 2=failed
 
 ## Commands
 
-Fourteen commands, organized by what you are doing rather than what type it
+Fifteen commands, organized by what you are doing rather than what type it
 operates on.
 
 **Set up**
@@ -279,6 +291,7 @@ operates on.
 
 | Command | Purpose |
 |---|---|
+| `writ run [--parallel N] [--max-tasks N] [--agent CMD] [--model M] [--reviewer CMD] [--reviewer-model M] [--timeout S] [--cwd D] [--force] [--quiet] [--dry-run]` | walk the whole graph until it is done or stuck |
 | `writ dispatch <id> [--agent CMD] [--model M] [--detach] [--timeout S] [--cwd D] [--quiet] [--dry-run] [-- args]` | an agent implements the task and reports a verdict |
 | `writ review [id] [--agent CMD] [--model M] [--timeout S] [--cwd D] [--force] [--quiet] [--dry-run]` | a second agent verifies and signs off; no id reviews all awaiting |
 | `writ cancel [run-id]` | stop a run, or reap dead ones when given no id |
@@ -394,6 +407,144 @@ proposed:
 ```bash
 writ set D-0001 active
 writ set D-0002 rejected --reason "packaging is M03, not this task's call"
+```
+
+## Running the whole graph
+
+`writ dispatch` and `writ review` each move one task one step. `writ run` is the
+loop around them: it dispatches what is ready, reviews what gets reported, and
+repeats until the graph is finished or nothing can move.
+
+```bash
+writ run                               # one agent at a time, to the end
+writ run --parallel 3                  # three at a time where the graph allows
+writ run --max-tasks 5                 # start at most five tasks, then stop
+writ run --max-tasks 0                 # review what is waiting, start nothing
+writ run --dry-run                     # the projected walk, spending nothing
+```
+
+Work only runs when its dependencies are `completed`, and a task is only
+`completed` by a reviewer. So `--parallel` is bounded by the shape of the graph,
+not just the number: a chain of four tasks runs serially however high you set it,
+and a fan of eight runs eight-wide.
+
+Reviews are scheduled ahead of new dispatches. Reported work that nobody has
+checked is what blocks everything downstream, so clearing it first keeps the
+frontier moving. For the same reason `--max-tasks` caps how many tasks *start*,
+but never refuses a review — stopping with work stuck at `awaiting-review` would
+be worse than not having started it.
+
+Use a different model for review than for implementation:
+
+```bash
+writ run --parallel 3 \
+  --agent claude --model sonnet \
+  --reviewer codex --reviewer-model gpt-5-codex
+```
+
+`--reviewer` defaults to `--agent`, which is convenient and weaker: a model
+checking its own work agrees with itself more than it should.
+
+### Preview before spending
+
+`--dry-run` walks the graph in memory and prints the invocations it would make:
+
+```
+would run 8 agent invocations, up to 2 at a time:
+   1. dispatch M01-001
+   2. review   M01-001
+   3. dispatch M02-001
+   4. review   M02-001
+   ...
+
+a projection, not a promise: a rejected verdict changes what comes next
+```
+
+It assumes every review accepts. One rejection changes the rest of the walk,
+which is why it is a projection and says so.
+
+### Stopping and resuming
+
+`writ run` is resumable because it holds no state of its own: everything it
+decides from is in `.writ/state.json`, and every step is recorded before the next
+one starts. Run it again and it picks up from wherever the graph got to.
+
+Stopping has two levels. The first `^C` stops scheduling new work and lets the
+agents already running finish, so their verdicts still count:
+
+```
+stopping: finishing the agents already running (^C again to kill)
+         + M01-005  completed
+         + M01-004  completed
+──────────────────────────────────────────────────────────────
+ran 4 agents over 2 tasks in 7s
+completed 2, failed 0
+project 5/6 tasks complete
+ready to dispatch: M01-006
+
+stopped early; `writ run` again picks up where this left off
+```
+
+A second `^C` kills them. A killed agent loses its own work, never the task's
+place in the graph — the task returns to the queue rather than being recorded as
+failed, because a deliberate stop and a failing agent mean different things.
+
+If the machine dies outright, nothing gets to clean up. The next `writ run`
+reconciles those records before it decides what to do:
+
+```
+resuming: reconciled 3 interrupted run(s)
+```
+
+An interrupted implementation goes back to `planned`. An interrupted *review*
+goes back to `awaiting-review`, not `planned`: the work still stands, only the
+judgement was lost, and re-implementing it would throw away a finished task.
+
+One `writ run` at a time per project. A second refuses rather than racing it:
+
+```
+writ: another writ run is active (pid 4131). Wait for it, stop it, or pass
+--force if you know it is gone.
+```
+
+A session file left behind by a killed run is not treated as active, so this
+normally resolves itself; `--force` is for the case where it does not.
+
+That check is a courtesy, not the actual safety net. Claiming a task happens
+inside the same lock that guards every other write, so a task with a live agent
+on it is refused whatever route you take — a forced second `writ run`, or a
+`writ dispatch` alongside one:
+
+```
+writ: M01-001 already has a running agent (run M01-001-20260916T120150).
+Wait for it, or stop it with `writ cancel M01-001-20260916T120150`.
+```
+
+A recorded-but-dead run does not count as live, or a crashed agent would hold its
+task forever.
+
+### When it stops early
+
+A failed task parks everything downstream of it, and the summary says what:
+
+```
+ran 4 agents over 2 tasks in 12s
+completed 0, failed 2
+project 0/6 tasks complete
+blocked by failed work: M01-002, M01-003
+```
+
+That list is transitive: if C waits on B waits on a failed A, both B and C are
+reported, because both are equally stuck. `writ run` exits 1 when anything
+failed, so it can be used in a script.
+
+Output is a progress log rather than a transcript — with several agents
+interleaved, mirroring their stdout would be unreadable. Each agent's full
+output is on disk:
+
+```bash
+writ logs M01-003                      # what that agent actually did
+writ logs M01-003 --stderr
 ```
 
 ## Dispatch

@@ -5,11 +5,22 @@ import os
 import shlex
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
-from . import agents, decisions, planner, planning, render, runner, state, verdict
+from . import (
+    agents,
+    decisions,
+    orchestrator,
+    planner,
+    planning,
+    render,
+    runner,
+    state,
+    verdict,
+)
 from .model import (
     acceptance_summary,
     add_evidence,
@@ -1344,3 +1355,201 @@ def cmd_cancel(args) -> None:
 
 
 
+
+
+# --------------------------------------------------------------------------
+# autonomous run
+
+
+def cmd_run(args) -> int:
+    """Walk the DAG: dispatch what is ready, review what is reported, repeat.
+
+    The individual commands each move one task one step. This is the one that
+    finishes a project, so its output is a progress log rather than a transcript:
+    with several agents interleaved, mirroring their stdout would be unreadable.
+    Each agent's full output is on disk, and `writ logs <task>` shows it.
+    """
+    root = Path(args.root)
+    data = state.load(root)
+
+    if args.dry_run:
+        return _run_preview(data, args)
+
+    existing = orchestrator.active_session(root)
+    if existing and not args.force:
+        raise WritError(
+            f"another writ run is active (pid {existing}). Wait for it, stop it, "
+            "or pass --force if you know it is gone."
+        )
+
+    # Reconcile before deciding there is nothing to do. A previous session that
+    # was killed leaves tasks parked mid-flight, and they are exactly the work a
+    # resume should pick up first.
+    reaped = runner.reap(root)
+    if reaped and not args.json:
+        print(f"resuming: reconciled {len(reaped)} interrupted run(s)")
+    data = state.load(root)
+
+    jobs = orchestrator.preview(data, budget=args.max_tasks)
+    if not jobs:
+        if args.json:
+            render.emit_json({"event": "idle", "reason": _nothing_to_run(data)})
+        else:
+            print(_nothing_to_run(data))
+        return 0
+
+    orchestrator.claim_session(root, force=args.force)
+    parallel = max(1, args.parallel)
+    if not args.json:
+        print(
+            f"running up to {parallel} agent{'s' if parallel > 1 else ''} at a time"
+            + (f", at most {args.max_tasks} tasks" if args.max_tasks else "")
+        )
+        print(f"logs: {state.runs_dir(root)}")
+        print("─" * 62)
+    reporter = _RunReporter(quiet=args.quiet, json_events=args.json)
+    try:
+        session = orchestrator.run(
+            root,
+            agent=args.agent,
+            model=args.model,
+            reviewer=args.reviewer,
+            reviewer_model=args.reviewer_model,
+            parallel=parallel,
+            max_tasks=args.max_tasks,
+            timeout=args.timeout,
+            cwd=args.cwd,
+            on_event=reporter,
+        )
+    finally:
+        orchestrator.release_session(root)
+    data = state.load(root)
+    if args.json:
+        render.emit_json(
+            {
+                "event": "summary",
+                "agents": session.agent_runs,
+                "tasks": len(set(session.dispatched)),
+                "completed": session.completed,
+                "failed": session.failed,
+                "errors": session.errors,
+                "stopped": session.stopped or session.aborted,
+                "remaining": [
+                    task_id
+                    for task_id, task in sorted(data["tasks"].items())
+                    if task["status"] != "completed"
+                ],
+            }
+        )
+        return 1 if (session.failed or session.errors) else 0
+    print("─" * 62)
+    for line in orchestrator.summary(data, session):
+        print(line)
+    if session.stopped or session.aborted:
+        print()
+        print("stopped early; `writ run` again picks up where this left off")
+    if session.errors:
+        for message in session.errors:
+            print(f"error: {message}", file=sys.stderr)
+        return 1
+    return 1 if session.failed else 0
+
+
+def _run_preview(data, args) -> int:
+    """Show the intended walk without spending anything."""
+    jobs = orchestrator.preview(data, budget=args.max_tasks)
+    if args.json:
+        render.emit_json(
+            {
+                "event": "preview",
+                "parallel": max(1, args.parallel),
+                "invocations": [
+                    {"role": job.role, "task": job.task_id} for job in jobs
+                ],
+            }
+        )
+        return 0
+    if not jobs:
+        print(_nothing_to_run(data))
+        return 0
+    parallel = max(1, args.parallel)
+    print(
+        f"would run {len(jobs)} agent invocations, up to {parallel} at a time:"
+    )
+    for index, job in enumerate(jobs, start=1):
+        print(f"  {index:>2}. {job.verb:<8} {job.task_id}")
+    print()
+    print(
+        "a projection, not a promise: a rejected verdict changes what comes next"
+    )
+    return 0
+
+
+def _nothing_to_run(data) -> str:
+    """Say which kind of nothing this is; they need different responses."""
+    tasks = data["tasks"]
+    if not tasks:
+        return "no tasks (run `writ plan <doc>` first)"
+    if all(task["status"] == "completed" for task in tasks.values()):
+        return "every task is complete"
+    stalled = orchestrator._stalled(data)
+    if stalled:
+        return (
+            "nothing can start: "
+            + ", ".join(stalled)
+            + " wait on failed work (see `writ list --status failed`)"
+        )
+    return "nothing is ready to dispatch or awaiting review"
+
+
+class _RunReporter:
+    """Turns scheduler events into a readable progress log.
+
+    Interleaved agent output is noise, so this reports transitions instead: what
+    started, what it produced, and what that unblocked.
+    """
+
+    def __init__(self, *, quiet: bool, json_events: bool) -> None:
+        self.quiet = quiet
+        self.json_events = json_events
+        self.lock = threading.Lock()
+
+    def __call__(self, name: str, payload: dict[str, Any]) -> None:
+        with self.lock:
+            if self.json_events:
+                render.emit_json({"event": name, **payload})
+                return
+            line = self._format(name, payload)
+            if line is not None:
+                print(line, flush=True)
+
+    def _format(self, name: str, payload: dict[str, Any]) -> str | None:
+        if name == "reaped":
+            runs = ", ".join(payload["runs"])
+            return f"reaped {len(payload['runs'])} interrupted run(s): {runs}"
+        if name == "started":
+            if self.quiet:
+                return None
+            verb = "review  " if payload["role"] == "reviewer" else "dispatch"
+            return f"{verb} {payload['task']}  ->  {payload['command']}"
+        if name == "finished":
+            return self._finished(payload)
+        if name == "stopping":
+            return "\nstopping: finishing the agents already running (^C again to kill)"
+        if name == "abort":
+            return "\naborting: killing the agents still running"
+        if name == "cancelled":
+            return f"cancelled {payload['task']} (run {payload['run']})"
+        if name == "error":
+            return f"error    {payload['task']}: {payload['message']}"
+        return None
+
+    def _finished(self, payload: dict[str, Any]) -> str:
+        status = payload["status"] or "unknown"
+        mark = render.mark(status)
+        detail = f"{mark} {payload['task']}  {status}"
+        if payload["error"]:
+            detail += f"  ({payload['error']})"
+        elif payload["exit_code"] not in (0, None):
+            detail += f"  (exit {payload['exit_code']})"
+        return f"         {detail}"

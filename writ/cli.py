@@ -1,6 +1,6 @@
 """Argument parsing and entry point.
 
-The command surface is deliberately small. Three rules keep it that way:
+The command surface is deliberately small. Four rules keep it that way:
 
 1. One verb per job, not one verb per noun. `show` resolves any id — task,
    milestone, run, or decision — because "show me this thing" is one intent.
@@ -17,6 +17,11 @@ The command surface is deliberately small. Three rules keep it that way:
    design left open proposes a record as part of its verdict, because the choice
    outlives the task. Proposals are inert until confirmed: an agent may report
    what it decided, but it may not commit the project on its own authority.
+4. A loop over a command is not a new kind of command. `run` walks the graph by
+   doing exactly what `dispatch` and `review` do, one task at a time, so
+   anything true of them stays true of it: the same prompts, the same verdicts,
+   the same records. It adds scheduling, not semantics, which is why stopping it
+   halfway leaves a project you can still drive by hand.
 """
 from __future__ import annotations
 
@@ -36,7 +41,10 @@ State lives in <root>/.writ as JSON, markdown, and plain logs.
 Typical flow:
   writ init
   writ plan design.md          an agent reads the doc and the repo
-  writ list --ready            what can start now
+  writ run --parallel 3        work the whole graph, three agents at a time
+  writ status                  where it got to
+
+Or drive it one step at a time:
   writ dispatch M01-001        an agent implements it and reports a verdict
   writ review M01-001          a second agent checks the claim and signs off
 
@@ -346,7 +354,59 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=commands.cmd_task)
 
     # -------------------------------------------------------------- dispatch
-    p = sub.add_parser("dispatch", help="hand a task to a coding agent")
+    p = sub.add_parser(
+        "run",
+        help="work the whole DAG: dispatch, review, repeat",
+        description=(
+            "Walks the task graph until it runs out of work. Dispatches what is "
+            "ready, reviews what agents report, and lets each completion unblock "
+            "the next tasks. Reviews are preferred over new dispatches, because "
+            "only a completed task opens more of the graph.\n\n"
+            "Stop it whenever you like: ^C finishes the agents already running, a "
+            "second ^C kills them. Either way the store stays consistent and "
+            "`writ run` again resumes from it."
+        ),
+    )
+    p.add_argument(
+        "--parallel",
+        "-p",
+        type=int,
+        default=1,
+        metavar="N",
+        help="agents to run at once (default: 1)",
+    )
+    p.add_argument(
+        "--max-tasks",
+        type=int,
+        default=None,
+        metavar="N",
+        help="stop after starting N tasks (reviews of them still finish)",
+    )
+    p.add_argument("--agent", default="pi", help="agent command (default: pi)")
+    p.add_argument("--model", help="model for the implementing agent")
+    p.add_argument(
+        "--reviewer",
+        help="reviewer command (default: --agent), so review can be independent",
+    )
+    p.add_argument("--reviewer-model", help="model for the reviewer")
+    p.add_argument(
+        "--timeout", type=int, default=None, help="seconds before killing an agent"
+    )
+    p.add_argument("--cwd", help="working directory for the agents (default: --root)")
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="start even if another run session looks active",
+    )
+    p.add_argument(
+        "--quiet", "-q", action="store_true", help="only report finished work"
+    )
+    p.add_argument(
+        "--dry-run", action="store_true", help="print the intended walk and stop"
+    )
+    p.set_defaults(func=commands.cmd_run)
+
+    p = sub.add_parser("dispatch", help="hand one task to a coding agent")
     p.add_argument("id")
     p.add_argument("--agent", default="pi", help="agent command (default: pi)")
     p.add_argument(
