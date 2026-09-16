@@ -752,24 +752,148 @@ def _render_status(payload: dict[str, Any]) -> str:
 
 
 def cmd_graph(args) -> None:
+    """Draw the dependency DAG.
+
+    The default is a tree following dependencies forwards, because the useful
+    questions about a DAG are shape questions: what unlocks next, where the work
+    forks, what one task is holding up. A per-task list of dependencies answers
+    none of those without the reader assembling the graph in their head.
+    """
     data = state.load(args.root)
     check_dag(data)
+    tasks = data["tasks"]
     if args.dot:
-        print("digraph writ {")
-        print('  rankdir=LR; node [shape=box, fontname="Helvetica"];')
-        for task_id in sorted(data["tasks"]):
-            task = data["tasks"][task_id]
-            label = task["title"].replace('"', "'")
-            print(f'  "{task_id}" [label="{task_id}\\n{label}"];')
-            for dep in task.get("depends_on", []):
-                print(f'  "{dep}" -> "{task_id}";')
-        print("}")
+        _graph_dot(data, tasks)
         return
-    for task_id in sorted(data["tasks"]):
-        task = data["tasks"][task_id]
-        deps = ", ".join(task.get("depends_on", [])) or "-"
-        status = effective_status(data, task)
-        print(f"{render.mark(status)} {task_id}  <- {deps}")
+    if args.json:
+        render.emit_json(
+            {
+                "levels": render.dag_levels(tasks),
+                "tasks": {
+                    task_id: {
+                        "status": effective_status(data, task),
+                        "depends_on": task.get("depends_on", []),
+                        "blocks": sorted(
+                            other
+                            for other, item in tasks.items()
+                            if task_id in item.get("depends_on", [])
+                        ),
+                    }
+                    for task_id, task in tasks.items()
+                },
+            }
+        )
+        return
+    if not tasks:
+        print("(no tasks)")
+        return
+    if args.levels:
+        print(_graph_levels(data, tasks))
+        return
+    print(_graph_tree(data, tasks, verbose=args.verbose))
+
+
+def _graph_label(data, tasks, task_id: str, *, verbose: bool) -> str:
+    task = tasks[task_id]
+    status = effective_status(data, task)
+    label = f"{render.mark(status)} {task_id}"
+    if verbose:
+        summary = acceptance_summary(task)
+        label += f"  {task['title']}"
+        label += f"  [{status}"
+        if summary["total"]:
+            label += f", {summary['passed']}/{summary['total']}"
+        label += "]"
+    else:
+        label += f"  {task['title']}"
+    return label
+
+
+def _graph_tree(data, tasks, *, verbose: bool) -> str:
+    lines = render.dag_tree(
+        tasks, label=lambda t: _graph_label(data, tasks, t, verbose=verbose)
+    )
+    orphans = _graph_orphans(data, tasks, verbose=verbose)
+    body = "\n".join(lines)
+    if orphans:
+        body += "\n\n" + "\n".join(orphans)
+    return body + "\n\n" + _graph_legend(tasks)
+
+
+def _graph_orphans(data, tasks, *, verbose: bool) -> list[str]:
+    """Tasks the tree cannot reach, which only happens in a broken store.
+
+    `check_dag` rules out cycles, so this should be empty. Printing it anyway
+    beats silently dropping a task from a view someone is using to plan.
+    """
+    drawn = set()
+    for line in render.dag_tree(tasks, label=lambda t: t):
+        stripped = line.strip().lstrip("├└─│↩ ")
+        if stripped:
+            drawn.add(stripped.split()[0])
+    missing = sorted(set(tasks) - drawn)
+    if not missing:
+        return []
+    return ["unreachable (report this):"] + [
+        f"  {_graph_label(data, tasks, t, verbose=verbose)}" for t in missing
+    ]
+
+
+def _graph_legend(tasks) -> str:
+    levels = render.dag_levels(tasks)
+    widest = max(len(level) for level in levels)
+    count = len(tasks)
+    line = f"{count} task{'' if count == 1 else 's'}, {len(levels)} deep"
+    if widest > 1:
+        line += f", up to {widest} in parallel"
+    if any(
+        len([d for d in task.get("depends_on", []) if d in tasks]) > 1
+        for task in tasks.values()
+    ):
+        line += "   ↩ joins a task drawn under its last dependency"
+    return line
+
+
+def _graph_levels(data, tasks) -> str:
+    """The DAG by dependency level: what could run at the same time."""
+    lines = []
+    for index, level in enumerate(render.dag_levels(tasks), start=1):
+        count = len(level)
+        lines.append(f"level {index}  ({count} task{'' if count == 1 else 's'})")
+        for task_id in level:
+            task = tasks[task_id]
+            deps = ", ".join(task.get("depends_on", []))
+            suffix = f"   after {deps}" if deps else ""
+            status = effective_status(data, task)
+            lines.append(
+                f"  {render.mark(status)} {task_id}  {task['title']}{suffix}"
+            )
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def _graph_dot(data, tasks) -> None:
+    print("digraph writ {")
+    print('  rankdir=LR; node [shape=box, fontname="Helvetica"];')
+    for milestone_id in sorted(data["milestones"]):
+        members = [
+            task_id
+            for task_id in sorted(tasks)
+            if tasks[task_id].get("milestone") == milestone_id
+        ]
+        if not members:
+            continue
+        title = data["milestones"][milestone_id]["title"].replace('"', "'")
+        print(f"  subgraph cluster_{milestone_id.replace('-', '_')} {{")
+        print(f'    label="{milestone_id}  {title}"; style=rounded; color=gray;')
+        for task_id in members:
+            label = tasks[task_id]["title"].replace('"', "'")
+            print(f'    "{task_id}" [label="{task_id}\\n{label}"];')
+        print("  }")
+    for task_id in sorted(tasks):
+        for dep in tasks[task_id].get("depends_on", []):
+            print(f'  "{dep}" -> "{task_id}";')
+    print("}")
 
 
 # --------------------------------------------------------------------------

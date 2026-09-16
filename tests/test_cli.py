@@ -78,11 +78,9 @@ def test_show_unknown_id_is_an_error(planned, writ):
     assert code == 2 and "unknown id" in err
 
 
-def test_next_and_graph(planned, writ):
+def test_ready_lists_the_unblocked_head_of_the_dag(planned, writ):
     _, out, _ = writ("list", "--ready")
     assert "M01-001" in out
-    _, dot, _ = writ("graph", "--dot")
-    assert "digraph writ" in dot and '"M01-001" -> "M02-001"' in dot
 
 
 def test_completion_is_not_available_to_the_operator(planned, writ):

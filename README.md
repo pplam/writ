@@ -264,7 +264,7 @@ operates on.
 | `writ status [--watch] [--interval S] [--until-idle]` | progress, ready work, live runs |
 | `writ list [tasks\|milestones\|runs\|decisions] [--status S] [--milestone M] [--task T] [--ready] [--awaiting-review] [--proposed] [--active] [--limit N]` | any collection |
 | `writ show <id> [--verbose] [--prompt]` | any single thing |
-| `writ graph [--dot]` | the dependency DAG |
+| `writ graph [--levels] [--verbose] [--dot]` | the dependency DAG |
 | `writ logs <run-id\|task-id> [--follow] [--stderr] [--tail N]` | agent output |
 
 **Change**
@@ -307,6 +307,47 @@ unblocks), the design section it came from, every run tagged by role
 each line. Each acceptance criterion carries the evidence behind it and the name
 of the agent that judged it, so "2/2 passed" can always be traced back to the
 commands someone actually ran.
+
+### The graph is a shape, not a list
+
+`writ graph` follows dependencies forwards, so the structure is legible at a
+glance:
+
+```
+> M01-001  Foundations
+├─ · M01-002  Schema
+│  ├─ · M01-004  Auth
+│  │  └─ ↩ M01-007
+│  └─ ↩ M01-005
+└─ · M01-003  HTTP layer
+   ├─ · M01-005  Handlers
+   │  └─ ↩ M01-007
+   └─ · M01-006  Rate limit
+      └─ · M01-007  Deploy
+
+7 tasks, 4 deep, up to 3 in parallel   ↩ joins a task drawn under its last dependency
+```
+
+A DAG is not a tree: a task can be reached by several paths. Expanding it under
+each one would draw the same work repeatedly and imply it happens more than once,
+so each task is expanded exactly once — beneath the dependency that comes last,
+the one actually gating it — and every other path shows `↩` and the id. That
+placement is what makes the drawing readable as a plan: a task never appears
+before something it waits on.
+
+`--levels` groups by dependency depth instead, which is the better read on a large
+graph and answers a different question: what could run at the same time.
+
+```
+level 3  (3 tasks)
+  · M01-004  Auth   after M01-002
+  · M01-005  Handlers   after M01-002, M01-003
+  · M01-006  Rate limit   after M01-003
+```
+
+`--verbose` adds each task's status and acceptance count. `--dot` emits graphviz
+with tasks clustered by milestone, and `--json` gives the levels plus both edge
+directions per task.
 
 ### A status is a value, not a verb
 

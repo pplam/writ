@@ -217,7 +217,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.set_defaults(func=commands.cmd_show)
 
-    p = sub.add_parser("graph", help="print the dependency DAG")
+    p = sub.add_parser(
+        "graph",
+        help="draw the dependency DAG",
+        description=(
+            "Follows dependencies forwards, so the shape of the work is visible: "
+            "what unlocks next, where it forks, what one task is holding up. A "
+            "task reachable by several paths is expanded once and referenced "
+            "with ↩ elsewhere, because it is one piece of work, not several."
+        ),
+    )
+    p.add_argument(
+        "--levels",
+        action="store_true",
+        help="group by dependency depth: what could run at the same time",
+    )
+    p.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="add status and acceptance counts to each node",
+    )
     p.add_argument("--dot", action="store_true", help="emit graphviz dot")
     p.set_defaults(func=commands.cmd_graph)
 
