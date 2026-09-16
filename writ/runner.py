@@ -436,6 +436,17 @@ def prepare(
     resolved = agents.resolve(agent, agent_args, model)
     with state.transaction(root) as data:
         task = get_task(data, task_id)
+        # Refuse to put a second agent on a task that already has a live one.
+        # `writ run` avoids this by selecting on one thread, but two processes
+        # (a `--force` run, or a detached dispatch alongside a run) can still
+        # both get here. This check is inside the lock, so the store settles it
+        # rather than a session file: whoever commits first owns the task.
+        active = _live_run_for(data, task_id)
+        if active is not None:
+            raise WritError(
+                f"{task_id} already has a running agent (run {active}). "
+                f"Wait for it, or stop it with `writ cancel {active}`."
+            )
         if role == "reviewer":
             if task["status"] not in ("awaiting-review", "reviewing") and not force:
                 raise WritError(
@@ -470,6 +481,11 @@ def prepare(
             "finished_at": None,
             "exit_code": None,
             "pid": None,
+            # The process that claimed this task, recorded before any agent
+            # starts. Without it there is a window between claiming and running
+            # in which the run has no live pid and looks abandoned, so a second
+            # process could claim the same task.
+            "owner_pid": os.getpid(),
             "dir": str(directory),
         }
         task.setdefault("runs", []).append(run_id)
@@ -477,6 +493,22 @@ def prepare(
         task["updated_at"] = utcnow()
         refresh_milestones(data)
     return run_id, directory, prompt, resolved
+
+
+def _live_run_for(data: dict[str, Any], task_id: str) -> str | None:
+    """The id of a run on this task whose process is still alive, if any.
+
+    A recorded-but-dead run does not count: that is what `reap` is for, and
+    treating it as live would make a crashed agent block its task forever.
+    """
+    for run_id in reversed(data["tasks"].get(task_id, {}).get("runs", [])):
+        run = data["runs"].get(run_id)
+        if run is None or run["status"] not in ACTIVE_RUN_STATUSES:
+            continue
+        owner = run.get("supervisor_pid") or run.get("pid") or run.get("owner_pid")
+        if process_alive(owner):
+            return run_id
+    return None
 
 
 def execute(root: Path, run_id: str, *, stream: bool = False, prefix: str = "") -> int:
@@ -565,6 +597,11 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
     """
     with state.transaction(root) as data:
         run = data["runs"][run_id]
+        # A cancelled run has already been settled by `cancel`, which killed the
+        # process. Reaching here means this thread lost the race with it, and
+        # rewriting the record would turn a deliberate stop into a failure.
+        if run["status"] == "cancelled":
+            return
         run["status"] = "completed" if code == 0 else "failed"
         run["exit_code"] = code
         run["finished_at"] = utcnow()
@@ -686,7 +723,13 @@ def process_alive(pid: int | None) -> bool:
 
 
 def cancel(root: Path, run_id: str) -> None:
-    """Stop a running agent and mark the run cancelled."""
+    """Stop a running agent and mark the run cancelled.
+
+    Marks the run cancelled *before* killing the process, because the thread
+    inside `execute` will race to record an outcome the moment the process dies.
+    `_finish` declines to touch a run already marked cancelled, so claiming it
+    first is what makes a deliberate stop distinguishable from a failure.
+    """
     with state.transaction(root) as data:
         run = data["runs"].get(run_id)
         if run is None:
@@ -695,39 +738,60 @@ def cancel(root: Path, run_id: str) -> None:
             raise WritError(f"run {run_id} is not active (status: {run['status']})")
         pid = run.get("pid")
         supervisor = run.get("supervisor_pid")
+        run["status"] = "cancelled"
+        run["finished_at"] = utcnow()
+        task = data["tasks"].get(run["task"])
+        if task is not None and task["status"] in INTERRUPTED_STATUS:
+            task["status"] = INTERRUPTED_STATUS[task["status"]]
+            task["updated_at"] = utcnow()
+            add_evidence(
+                task,
+                f"run {run_id} cancelled; returned to {task['status']}",
+                actor="writ",
+            )
+        refresh_milestones(data)
     for candidate in (supervisor, pid):
         if candidate:
             _terminate(candidate)
-    with state.transaction(root) as data:
-        run = data["runs"][run_id]
-        run["status"] = "cancelled"
-        run["finished_at"] = utcnow()
-        run["exit_code"] = run.get("exit_code")
-        task = data["tasks"].get(run["task"])
-        if task is not None and task["status"] == "running":
-            task["status"] = "planned"
-            task["updated_at"] = utcnow()
-            add_evidence(task, f"run {run_id} cancelled")
-        refresh_milestones(data)
+
+
+#: where a task goes when the process working on it dies. An interrupted
+#: implementation returns to the queue; an interrupted review returns to the
+#: queue of things awaiting review, because the work itself still stands and only
+#: the judgement was lost.
+INTERRUPTED_STATUS = {"running": "planned", "reviewing": "awaiting-review"}
 
 
 def reap(root: Path) -> list[str]:
-    """Reconcile runs whose owning process died without recording an outcome."""
+    """Reconcile runs whose owning process died without recording an outcome.
+
+    This is what makes a killed session resumable, so it has to cover both roles.
+    A review interrupted halfway would otherwise leave its task in `reviewing`
+    forever: not running, not awaiting review, and invisible to every queue.
+    """
     reaped: list[str] = []
     with state.transaction(root) as data:
         for run_id, run in data["runs"].items():
             if run["status"] not in ACTIVE_RUN_STATUSES:
                 continue
-            owner = run.get("supervisor_pid") or run.get("pid")
+            owner = (
+                run.get("supervisor_pid")
+                or run.get("pid")
+                or run.get("owner_pid")
+            )
             if process_alive(owner):
                 continue
             run["status"] = "interrupted"
             run["finished_at"] = utcnow()
             task = data["tasks"].get(run["task"])
-            if task is not None and task["status"] == "running":
-                task["status"] = "planned"
+            if task is not None and task["status"] in INTERRUPTED_STATUS:
+                task["status"] = INTERRUPTED_STATUS[task["status"]]
                 task["updated_at"] = utcnow()
-                add_evidence(task, f"run {run_id} was interrupted")
+                add_evidence(
+                    task,
+                    f"run {run_id} was interrupted; returned to {task['status']}",
+                    actor="writ",
+                )
             reaped.append(run_id)
         refresh_milestones(data)
     return reaped

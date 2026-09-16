@@ -176,6 +176,81 @@ def test_reap_reconciles_a_dead_run(planned, writ, project):
     assert writ("cancel")[1].strip() == "no stale runs"
 
 
+def test_reap_returns_an_interrupted_review_to_awaiting_review(planned, writ, project):
+    """A review whose process died left the task in a status no queue looks at:
+    not running, not awaiting review, invisible to every listing.
+    """
+    writ("dispatch", "M01-001", "--agent", ECHO)
+    run_id = next(iter(state.load(project)["runs"]))
+    with state.transaction(project) as data:
+        data["runs"][run_id]["status"] = "running"
+        data["runs"][run_id]["role"] = "reviewer"
+        data["runs"][run_id]["pid"] = 2 ** 22
+        data["runs"][run_id].pop("supervisor_pid", None)
+        data["runs"][run_id].pop("owner_pid", None)
+        data["tasks"]["M01-001"]["status"] = "reviewing"
+
+    writ("cancel")
+    task = state.load(project)["tasks"]["M01-001"]
+    assert task["status"] == "awaiting-review", "the work was thrown away"
+
+
+def test_a_reaped_task_says_where_it_went(planned, writ, project):
+    writ("dispatch", "M01-001", "--agent", ECHO)
+    run_id = next(iter(state.load(project)["runs"]))
+    with state.transaction(project) as data:
+        data["runs"][run_id]["status"] = "running"
+        data["runs"][run_id]["pid"] = 2 ** 22
+        data["runs"][run_id].pop("supervisor_pid", None)
+        data["runs"][run_id].pop("owner_pid", None)
+        data["tasks"]["M01-001"]["status"] = "running"
+    writ("cancel")
+    evidence = state.load(project)["tasks"]["M01-001"]["evidence"]
+    assert any("returned to planned" in item["text"] for item in evidence)
+
+
+def test_cancelling_a_run_is_not_recorded_as_a_failure(planned, writ, project):
+    """A deliberate stop and a failing agent mean different things."""
+    writ("dispatch", "M01-001", "--agent", SLEEP, "--detach")
+    run_id = next(iter(state.load(project)["runs"]))
+    assert wait_for(lambda: state.load(project)["runs"][run_id]["status"] == "running")
+
+    code, _, _ = writ("cancel", run_id)
+    assert code == 0
+    data = state.load(project)
+    assert data["runs"][run_id]["status"] == "cancelled"
+    assert data["tasks"]["M01-001"]["status"] == "planned", "a stop became a failure"
+
+
+def test_a_cancelled_task_can_be_dispatched_again(planned, writ, project):
+    writ("dispatch", "M01-001", "--agent", SLEEP, "--detach")
+    run_id = next(iter(state.load(project)["runs"]))
+    assert wait_for(lambda: state.load(project)["runs"][run_id]["status"] == "running")
+    writ("cancel", run_id)
+    code, _, err = writ("dispatch", "M01-001", "--agent", ECHO)
+    assert code == 0, err
+
+
+def test_a_second_agent_on_a_live_task_is_refused(planned, writ, project):
+    """Two processes can both reach `prepare`; the store has to settle it."""
+    writ("dispatch", "M01-001", "--agent", SLEEP, "--detach")
+    run_id = next(iter(state.load(project)["runs"]))
+    assert wait_for(lambda: state.load(project)["runs"][run_id]["status"] == "running")
+
+    code, _, err = writ("dispatch", "M01-001", "--force", "--agent", ECHO)
+    assert code == 2
+    assert "already has a running agent" in err
+    assert f"writ cancel {run_id}" in err
+    writ("cancel", run_id)
+
+
+def test_the_claim_records_the_claiming_process(planned, writ, project):
+    """Closes the window between claiming a task and the agent having a pid."""
+    writ("dispatch", "M01-001", "--agent", ECHO)
+    run = next(iter(state.load(project)["runs"].values()))
+    assert run["owner_pid"] > 0
+
+
 def test_status_renders_progress(planned, writ):
     code, out, _ = writ("status")
     assert code == 0 and "tasks 0/4" in out
