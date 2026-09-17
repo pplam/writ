@@ -87,6 +87,9 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - http.server's spelling
         path = self.path.split("?", 1)[0]
         clean = path.rstrip("/") or "/"
+        # Whether a status line has gone out, so a late failure knows if a 500 is
+        # still possible. http.server does not track this.
+        self.started = False
         try:
             if clean == "/":
                 self._send(200, "text/html; charset=utf-8", PAGE.encode())
@@ -99,10 +102,25 @@ class _Handler(BaseHTTPRequestHandler):
                 self._api(clean[len("/api/") :])
             else:
                 self._text(404, "not found\n")
-        except BrokenPipeError:
-            pass  # the tab closed mid-response
-        except ConnectionResetError:
-            pass
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the tab closed mid-response; nothing to send and nobody to tell
+        except Exception:
+            # An unexpected fault used to escape here, which closed the socket
+            # with no status line at all: the page showed a bare network error,
+            # indistinguishable from writ having been stopped. Answer with a 500
+            # so the reader knows the server is up and something inside it broke,
+            # then re-raise so the traceback still reaches the terminal.
+            self._fail()
+            raise
+
+    def _fail(self) -> None:
+        """Send a 500, if a response has not already started."""
+        if self.started:
+            return  # mid-body: the status line is long gone, so say nothing more
+        try:
+            self._json(500, {"error": "writ serve hit an internal error; see its terminal"})
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass  # the client is gone too; the terminal traceback is the record
 
     def _api(self, rest: str) -> None:
         parts = [segment for segment in rest.split("/") if segment]
@@ -158,6 +176,7 @@ class _Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------- responses
 
     def _send(self, code: int, content_type: str, body: bytes) -> None:
+        self.started = True
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -189,6 +208,7 @@ class _Handler(BaseHTTPRequestHandler):
         override` in another window, even an editor saving the file. The dashboard
         needs to know nothing about who is working.
         """
+        self.started = True
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-store")
@@ -235,6 +255,50 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *args: Any) -> None:
         """Silence per-request logging: a polling stream would flood the shell."""
 
+    def handle_one_request(self) -> None:
+        """Treat a client vanishing between requests as ordinary.
+
+        `protocol_version` is HTTP/1.1, so a connection is kept alive and the
+        thread parks in `readline()` waiting for the next request on it. Browsers
+        reap idle connections routinely, and some do it with an RST rather than a
+        clean shutdown — Safari and Chrome both do after a few seconds idle, and
+        every navigation and reload leaves connections behind to be collected.
+
+        `socketserver` sends that to `handle_error`, which prints a traceback. So
+        merely leaving the page open produced a twenty-line crash report every
+        few seconds, describing something that had gone entirely correctly. The
+        real cost is not noise: a log that cries wolf on a healthy idle socket is
+        one an operator learns to skip, including on the day it reports a genuine
+        fault.
+        """
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, BrokenPipeError, TimeoutError):
+            # Nothing to answer and nobody to answer to. Closing the connection
+            # is the whole remedy.
+            self.close_connection = True
+
+
+def _server_class() -> type[ThreadingHTTPServer]:
+    """A threading server that does not report a hung-up client as a crash.
+
+    `handle_one_request` covers the common case, but a client can also vanish
+    mid-body, and every such site would otherwise need its own guard. This is the
+    one place they all funnel through, so the classification lives here: a
+    disconnect is routine and silent, and anything else still gets the full
+    traceback it deserves.
+    """
+
+    class Server(ThreadingHTTPServer):
+        closing = False
+
+        def handle_error(self, request: Any, client_address: Any) -> None:
+            if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
+                return  # the far end went away; there is nothing to report
+            super().handle_error(request, client_address)
+
+    return Server
+
 
 def serve(
     root: Path,
@@ -253,7 +317,7 @@ def serve(
 
     handler = type("Handler", (_Handler,), {"root": root})
     try:
-        server = ThreadingHTTPServer((host, port), handler)
+        server = _server_class()((host, port), handler)
     except OSError as exc:
         # A traceback says nothing a reader can act on. Suggest another port only
         # when the port is the problem: on a bad --host that would be confident
@@ -267,7 +331,6 @@ def serve(
             f"cannot serve on {host}:{port}: {exc.strerror or exc}{hint}"
         ) from exc
 
-    server.closing = False
     server.daemon_threads = True  # a held-open stream must not block shutdown
     shown = "localhost" if host in ("127.0.0.1", "::1") else host
     url = f"http://{shown}:{server.server_port}/"

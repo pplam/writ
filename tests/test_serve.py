@@ -8,11 +8,14 @@ UI happens to call.
 
 from __future__ import annotations
 
+import inspect
 import json
+import socket
+import struct
 import threading
+import time
 import urllib.error
 import urllib.request
-from http.server import ThreadingHTTPServer
 
 import pytest
 
@@ -21,13 +24,16 @@ from writ.cli import build_parser
 
 
 @pytest.fixture()
-def served(writ, design, project):
-    """A live server on an ephemeral port, in a thread, torn down after."""
+def served(writ, design, project, capfd):
+    """A live server on an ephemeral port, in a thread, torn down after.
+
+    Built through `server._server_class()` rather than `ThreadingHTTPServer`
+    directly, so tests exercise the error handling the real command installs.
+    """
     writ("init")
     writ("plan", str(design), "--extract")
     handler = type("Handler", (server._Handler,), {"root": project})
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    httpd.closing = False
+    httpd = server._server_class()(("127.0.0.1", 0), handler)
     httpd.daemon_threads = True
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -322,3 +328,128 @@ def test_serving_an_uninitialised_project_fails_at_the_prompt(tmp_path):
     """Better a message now than a page that renders an error per panel."""
     with pytest.raises(state.WritError):
         server.serve(tmp_path / "nothing", open_browser=False)
+
+
+# ------------------------------------------------------- clients that hang up
+
+
+def reset(base: str, request: bytes, *, read: bool, settle: float) -> None:
+    """Send `request`, then abort the connection with an RST rather than a FIN.
+
+    SO_LINGER with a zero timeout is what turns close() into a reset, which is
+    what a browser reaping an idle keep-alive connection actually does, and what
+    a clean shutdown would not reproduce.
+    """
+    port = int(base.rsplit(":", 1)[1])
+    sock = socket.create_connection(("127.0.0.1", port))
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        sock.sendall(request)
+        if read:
+            sock.recv(64)
+        time.sleep(settle)
+    finally:
+        sock.close()
+    time.sleep(settle)
+
+
+@pytest.mark.parametrize(
+    "request_bytes, read, description",
+    [
+        (b"GET /api/snapshot HTTP/1.1\r\nHost: x\r\n\r\n", False, "idle keep-alive"),
+        (b"GET /app.js HTTP/1.1\r\nHost: x\r\n\r\n", True, "mid-body"),
+        (b"GET /events HTTP/1.1\r\nHost: x\r\n\r\n", False, "open event stream"),
+        (b"", False, "connected and said nothing"),
+    ],
+)
+def test_a_client_hanging_up_is_not_reported_as_a_crash(
+    served, capfd, request_bytes, read, description
+):
+    """A disconnect prints nothing.
+
+    Because `protocol_version` is HTTP/1.1 the connection is kept alive and the
+    thread parks in `readline()` waiting for another request. Browsers reap idle
+    connections constantly and some do it with an RST, which `socketserver` sends
+    to `handle_error` — so simply leaving the page open produced a twenty-line
+    traceback every few seconds about something that had gone entirely right.
+
+    Four shapes, because the first fix only covered the first one: between
+    requests, part-way through a body, during a held-open stream, and a client
+    that connects and says nothing at all.
+    """
+    base, _ = served
+    capfd.readouterr()  # discard anything from setup
+    reset(base, request_bytes, read=read, settle=0.35)
+    captured = capfd.readouterr()
+    assert "Traceback" not in captured.err, f"{description}: {captured.err}"
+    assert "ConnectionResetError" not in captured.err
+
+
+def test_the_server_still_answers_after_a_client_aborts(served, capfd):
+    """A reset connection does not take the server with it."""
+    base, _ = served
+    reset(base, b"GET /events HTTP/1.1\r\nHost: x\r\n\r\n", read=False, settle=0.35)
+    status, _, body = get(f"{base}/api/snapshot")
+    assert status == 200
+    assert json.loads(body)["tasks"]
+
+
+def test_a_real_fault_is_still_reported_in_full(served, capfd, monkeypatch):
+    """Only disconnects are silenced.
+
+    The risk in quieting `handle_error` is quieting everything, so this asserts
+    the opposite case directly: an ordinary exception in a handler still gets its
+    traceback and its name. A silent 500 would be far worse than the noise.
+    """
+    base, _ = served
+
+    def broken(root):
+        raise RuntimeError("a real bug, not a disconnect")
+
+    monkeypatch.setattr(server.api, "overview", broken)
+    capfd.readouterr()
+    with pytest.raises(urllib.error.HTTPError):
+        get(f"{base}/api/overview", timeout=5.0)
+    time.sleep(0.3)
+    captured = capfd.readouterr()
+    assert "Traceback" in captured.err
+    assert "a real bug, not a disconnect" in captured.err
+
+
+def test_the_disconnect_check_names_the_errors_rather_than_catching_everything():
+    """`handle_error` filters on exception type, not on a bare except.
+
+    Recorded as a test because "stop printing tracebacks" has an easy wrong
+    implementation that also hides genuine failures, and the difference is one
+    line in a place nobody looks twice at.
+    """
+    source = inspect.getsource(server._server_class)
+    assert "ConnectionError" in source
+    assert "TimeoutError" in source
+    assert "except Exception" not in source
+    assert "except:" not in source
+
+
+def test_an_unexpected_fault_answers_with_a_500_rather_than_dropping_the_socket(
+    served, capfd, monkeypatch
+):
+    """A bug inside a handler is still an HTTP response.
+
+    Found by writing the test above: an unexpected exception escaped `do_GET`
+    with no status line sent, so the connection simply closed. In the browser
+    that is a bare network error — identical to writ having been stopped — which
+    points the reader at the wrong problem entirely.
+    """
+    base, _ = served
+
+    def broken(root):
+        raise RuntimeError("a real bug, not a disconnect")
+
+    monkeypatch.setattr(server.api, "overview", broken)
+    capfd.readouterr()
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        get(f"{base}/api/overview", timeout=5.0)
+    assert caught.value.code == 500
+    assert "internal error" in json.loads(caught.value.read())["error"]
+    time.sleep(0.3)
+    assert "a real bug, not a disconnect" in capfd.readouterr().err
