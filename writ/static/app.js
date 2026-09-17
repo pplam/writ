@@ -1,4 +1,4 @@
-/* built from ui/src (934c1cd87a63) */
+/* built from ui/src (83b7c9590fb2) */
 /*
  * writ dashboard — compiled from ui/src by ui/build.mjs.
  * Do not edit: change the TypeScript and rebuild.
@@ -502,7 +502,7 @@ function liveCard(overview, handlers) {
         : el('p', { class: 'blank' }, 'No agents running.'));
 }
 function liveRow(run, handlers) {
-    const row = el('li', { class: 'run-row live' }, el('span', { class: 'spinner', 'aria-hidden': 'true' }), el('button', { class: 'link', type: 'button' }, run.task), el('span', { class: 'verb' }, run.role === 'reviewer' ? 'review' : 'dispatch'), el('span', { class: 'grow' }), el('span', { class: 'muted mono small clip' }, run.model || run.command), el('span', { class: 'muted tnum', title: run.started_at ?? '' }, duration(run.duration)));
+    const row = el('li', { class: 'run-row live' }, el('span', { class: 'spinner', 'aria-hidden': 'true' }), el('button', { class: 'link', type: 'button', 'data-opens': `task:${run.task}` }, run.task), el('span', { class: 'verb' }, run.role === 'reviewer' ? 'review' : 'dispatch'), el('span', { class: 'grow' }), el('span', { class: 'muted mono small clip' }, run.model || run.command), el('span', { class: 'muted tnum', title: run.started_at ?? '' }, duration(run.duration)));
     row.querySelector('button')?.addEventListener('click', () => handlers.onTask(run.task));
     return row;
 }
@@ -577,6 +577,7 @@ function activityRow(event, handlers) {
     row.setAttribute('title', `${clock(event.at)} · ${event.text}`);
     if (event.run) {
         row.classList.add('clickable');
+        row.setAttribute('data-opens', `run:${event.run}`);
         row.addEventListener('click', () => handlers.onRun(event.run));
     }
     return row;
@@ -618,6 +619,10 @@ function taskRow(task, isSelected, handlers) {
         class: classes('task-row', task.status, isLive(task.status) && 'live', isSelected && 'selected'),
         tabindex: 0,
         role: 'button',
+        // What this row opens. The drawer hands focus back here when dismissed, and
+        // it cannot hold the element itself: opening re-renders the list, so the
+        // node that was clicked is gone by the time the drawer is on screen.
+        'data-opens': `task:${task.id}`,
     }, el('span', { class: 'mark' }, mark(task.status)), code(task.id), el('span', { class: 'title' }, task.title), el('span', { class: 'grow' }), task.blocked_by.length
         ? el('span', { class: 'muted small', title: `waiting on ${task.blocked_by.join(', ')}` }, `waits on ${task.blocked_by.length}`)
         : null, el('span', { class: 'muted mono' }, ratio(task.passed, task.total)), el('span', { class: classes('pill', task.status) }, task.status));
@@ -709,7 +714,10 @@ function runSection(task, handlers) {
         return section('Runs', null, el('p', { class: 'blank' }, 'Never dispatched.'));
     }
     return section('Runs', String(task.run_list.length), el('ul', { class: 'run-list' }, ...[...task.run_list].reverse().map((run) => {
-        const row = el('li', { class: classes('run-row', run.status, isLive(run.status) && 'live', 'clickable') }, el('span', { class: classes('mark', run.status) }, mark(run.status)), el('span', { class: 'verb' }, run.role === 'reviewer' ? 'review' : 'dispatch'), el('span', { class: 'grow' }), run.decision ? el('span', { class: classes('pill', run.decision) }, run.decision) : null, el('span', { class: 'muted mono small clip' }, run.model || run.command), el('span', { class: 'muted small tnum', title: run.started_at ?? '' }, ago(run.started_at)));
+        const row = el('li', {
+            class: classes('run-row', run.status, isLive(run.status) && 'live', 'clickable'),
+            'data-opens': `run:${run.id}`,
+        }, el('span', { class: classes('mark', run.status) }, mark(run.status)), el('span', { class: 'verb' }, run.role === 'reviewer' ? 'review' : 'dispatch'), el('span', { class: 'grow' }), run.decision ? el('span', { class: classes('pill', run.decision) }, run.decision) : null, el('span', { class: 'muted mono small clip' }, run.model || run.command), el('span', { class: 'muted small tnum', title: run.started_at ?? '' }, ago(run.started_at)));
         row.addEventListener('click', () => handlers.onRun(run.id));
         return row;
     })));
@@ -749,6 +757,8 @@ function runRow(run, isSelected, handlers) {
         class: classes('run-row', run.status, isLive(run.status) && 'live', isSelected && 'selected', 'clickable'),
         tabindex: 0,
         role: 'button',
+        // See tasks.ts: the detail this row opens, so focus can come back to it.
+        'data-opens': `run:${run.id}`,
     }, el('span', { class: 'mark' }, mark(run.status)), el('span', { class: classes('verb', run.role) }, run.role === 'reviewer' ? 'review' : 'dispatch'), code(run.task), el('span', { class: 'muted mono small' }, run.model || run.command), el('span', { class: 'grow' }), run.decision ? el('span', { class: classes('pill', run.decision) }, run.decision) : null, run.exit_code !== null && run.exit_code !== 0
         ? el('span', { class: 'pill failed' }, `exit ${run.exit_code}`)
         : null, el('span', { class: 'muted mono small' }, duration(run.duration)), el('span', { class: 'muted small', title: run.started_at ?? run.created_at }, ago(run.started_at ?? run.created_at)));
@@ -938,6 +948,9 @@ function milestoneTaskRow(task, handlers) {
         class: classes('task-row', task.status, 'clickable'),
         tabindex: 0,
         role: 'button',
+        // See tasks.ts: names the detail this row opens, so dismissing the drawer
+        // can return focus to it after the list has been re-rendered.
+        'data-opens': `task:${task.id}`,
     }, el('span', { class: classes('mark', task.status) }, mark(task.status)), code(task.id), el('span', { class: 'title clip' }, task.title), el('span', { class: 'grow' }), task.blocked_by.length
         ? el('span', { class: 'muted small', title: `waiting on ${task.blocked_by.join(', ')}` }, `waits on ${task.blocked_by.length}`)
         : null, el('span', { class: 'muted mono tnum' }, ratio(task.passed, task.total)), el('span', { class: classes('pill', task.status) }, task.status));
@@ -963,6 +976,42 @@ function milestoneTaskRow(task, handlers) {
  * The route lives in the hash so a view is linkable and survives a reload, which
  * matters when the thing you are looking at is a specific run's stderr.
  */
+/**
+ * Whether a click that landed outside the drawer should dismiss it.
+ *
+ * Called with the detail that was open when the click began and the one open
+ * after every other handler has run, which is what makes clicking a second task
+ * row swap the drawer's contents instead of closing and reopening it: that click
+ * changed the key, so it opened a detail rather than dismissing one. Reading the
+ * key twice around the same event is deterministic — capture runs before bubble
+ * on one dispatch — where a timer racing the click would not be.
+ *
+ * Clicking the row that is already open counts as a dismissal, which makes a row
+ * a toggle. That is the reading a reader is most likely to have in mind, and the
+ * alternative is a click that visibly does nothing.
+ */
+function dismissesOnClick(context) {
+    if (context.openKey === null)
+        return false;
+    if (context.insideDrawer)
+        return false;
+    return context.openKey === context.keyAtPress;
+}
+/**
+ * Whether focus leaving the drawer should dismiss it.
+ *
+ * `nowhere` is the case this exists for. The drawer re-fetches and replaces its
+ * contents on every snapshot, so anything focused inside it — a run row reached
+ * by keyboard — is destroyed and focus falls back to the body, firing focusout
+ * with no relatedTarget. Treating that as "focus left" would close the panel by
+ * itself every time an agent reported anything, which is precisely when someone
+ * is watching it. So only a move to a known element outside dismisses.
+ */
+function dismissesOnFocus(context) {
+    if (context.openKey === null)
+        return false;
+    return context.movedTo === 'outside';
+}
 const VIEWS = [
     { name: 'overview', label: 'Overview' },
     { name: 'graph', label: 'Graph' },
@@ -982,6 +1031,8 @@ class App {
     conn = el('div', { class: 'conn', title: 'connection to writ serve' });
     body = el('main', { class: 'body' });
     drawer = el('aside', { class: 'drawer', 'aria-live': 'polite' });
+    /** What was open when the current click began; see `dismissesOnClick`. */
+    keyAtPress = null;
     async start() {
         document.body.append(this.header(), this.body, this.drawer);
         this.store.onSnapshot(() => this.render());
@@ -991,9 +1042,79 @@ class App {
             this.render();
         });
         document.addEventListener('keydown', (event) => this.onKey(event));
+        this.watchDismissal();
         this.route = parseHash(location.hash);
         this.paintConnection('connecting');
         await this.store.start();
+    }
+    /**
+     * Dismiss the drawer when attention moves off it.
+     *
+     * The drawer is a non-modal overlay: the page behind it stays usable, so it is
+     * not a dialog and does not trap focus. What it should do is get out of the way
+     * once you are plainly looking at something else, by pointer or by keyboard,
+     * rather than sitting there until you find Escape or the ×.
+     *
+     * The key is read in the capture phase, before any row's own handler runs, and
+     * compared in the bubble phase after they all have. That is what tells a click
+     * that opened a different task from one that was simply elsewhere.
+     */
+    watchDismissal() {
+        document.addEventListener('click', () => {
+            this.keyAtPress = this.detailKey();
+        }, true);
+        document.addEventListener('click', (event) => {
+            const target = event.target;
+            const insideDrawer = target instanceof Node && this.drawer.contains(target);
+            if (dismissesOnClick({
+                openKey: this.detailKey(),
+                keyAtPress: this.keyAtPress,
+                insideDrawer,
+            })) {
+                this.dismiss();
+            }
+            this.keyAtPress = null;
+        });
+        this.drawer.addEventListener('focusout', (event) => {
+            const next = event.relatedTarget;
+            const movedTo = next === null || next === undefined
+                ? 'nowhere'
+                : next instanceof Node && this.drawer.contains(next)
+                    ? 'inside'
+                    : 'outside';
+            if (dismissesOnFocus({ openKey: this.detailKey(), movedTo })) {
+                // Not `dismiss()`: focus has already gone where the reader sent it, and
+                // pulling it back to the opener would fight them for it.
+                this.go({ view: this.route.view });
+            }
+        });
+    }
+    /** Identifies the open detail, or null when the drawer is closed. */
+    detailKey() {
+        if (this.route.task)
+            return `task:${this.route.task}`;
+        if (this.route.run)
+            return `run:${this.route.run}`;
+        return null;
+    }
+    /**
+     * Close the drawer and hand focus back to the row that opened it.
+     *
+     * Found by `data-opens` rather than remembered as an element: opening the
+     * drawer re-renders the list behind it, so the clicked node is already detached
+     * by the time the panel is on screen. Re-finding it also means focus lands on
+     * the row as it exists now, not on a stale copy.
+     *
+     * Without this, dismissing leaves focus on the body and the next Tab starts at
+     * the top of the page — which for someone who opened the drawer from the
+     * twentieth task row is twenty tabs back to where they were.
+     */
+    dismiss() {
+        const key = this.detailKey();
+        this.go({ view: this.route.view });
+        if (key === null)
+            return;
+        findOpener(key)?.focus();
     }
     header() {
         for (const view of VIEWS) {
@@ -1018,9 +1139,37 @@ class App {
             this.body.replaceChildren(el('p', { class: 'empty' }, 'Loading…'));
             return;
         }
+        // Rendering rebuilds the lists, so a focused row is destroyed and focus falls
+        // to the body. Snapshots arrive every couple of seconds during a run, which is
+        // exactly when someone is watching, so a keyboard reader would lose their
+        // place repeatedly while doing nothing. Noted before, restored after.
+        const focused = this.focusedOpener();
         this.paintCounts(snapshot);
         this.paintView(snapshot);
         this.paintDrawer();
+        this.restoreFocus(focused);
+    }
+    /** The `data-opens` key of the focused row, if a row is what has focus. */
+    focusedOpener() {
+        const active = document.activeElement;
+        if (!(active instanceof HTMLElement))
+            return null;
+        return active.getAttribute('data-opens');
+    }
+    /**
+     * Put focus back on the row it was on, if rendering dropped it.
+     *
+     * Only when focus actually fell to the body: if the reader moved it themselves
+     * — into the drawer, into the search box — that is where it belongs, and pulling
+     * it back would be the page fighting them for it.
+     */
+    restoreFocus(key) {
+        if (key === null)
+            return;
+        const active = document.activeElement;
+        if (active !== null && active !== document.body)
+            return;
+        findOpener(key)?.focus();
     }
     paintCounts(snapshot) {
         const { overview } = snapshot;
@@ -1157,7 +1306,7 @@ class App {
             this.drawer.replaceChildren(el('p', { class: 'muted' }, 'Loading…'));
         }
         const close = el('button', { class: 'close', type: 'button', 'aria-label': 'close' }, '×');
-        close.addEventListener('click', () => this.go({ view: this.route.view }));
+        close.addEventListener('click', () => this.dismiss());
         const handlers = {
             onSelect: (id) => this.go({ view: this.route.view, task: id }),
             onRun: (id) => this.go({ view: this.route.view, run: id }),
@@ -1200,7 +1349,7 @@ class App {
         if (event.target instanceof HTMLInputElement)
             return;
         if (event.key === 'Escape' && (this.route.task || this.route.run)) {
-            this.go({ view: this.route.view });
+            this.dismiss();
             return;
         }
         // Number keys jump between views: quick to reach while watching a run.
@@ -1209,6 +1358,10 @@ class App {
             this.go({ view: VIEWS[index - 1].name });
         }
     }
+}
+/** The row that opens a given detail, as it exists in the DOM right now. */
+function findOpener(key) {
+    return document.querySelector(`[data-opens="${CSS.escape(key)}"]`);
 }
 function parseHash(hash) {
     const clean = hash.replace(/^#\/?/, '');

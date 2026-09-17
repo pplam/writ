@@ -47,6 +47,8 @@ function runRow(run: RunRow, isSelected: boolean, handlers: RunHandlers): HTMLEl
       class: classes('run-row', run.status, isLive(run.status) && 'live', isSelected && 'selected', 'clickable'),
       tabindex: 0,
       role: 'button',
+      // See tasks.ts: the detail this row opens, so focus can come back to it.
+      'data-opens': `run:${run.id}`,
     },
     el('span', { class: 'mark' }, mark(run.status)),
     el('span', { class: classes('verb', run.role) }, run.role === 'reviewer' ? 'review' : 'dispatch'),

@@ -140,7 +140,7 @@ function liveRow(run: RunRow, handlers: OverviewHandlers): HTMLElement {
     'li',
     { class: 'run-row live' },
     el('span', { class: 'spinner', 'aria-hidden': 'true' }),
-    el('button', { class: 'link', type: 'button' }, run.task),
+    el('button', { class: 'link', type: 'button', 'data-opens': `task:${run.task}` }, run.task),
     el('span', { class: 'verb' }, run.role === 'reviewer' ? 'review' : 'dispatch'),
     el('span', { class: 'grow' }),
     el('span', { class: 'muted mono small clip' }, run.model || run.command),
@@ -299,6 +299,7 @@ function activityRow(event: ActivityEvent, handlers: OverviewHandlers): HTMLElem
   row.setAttribute('title', `${clock(event.at)} · ${event.text}`);
   if (event.run) {
     row.classList.add('clickable');
+    row.setAttribute('data-opens', `run:${event.run}`);
     row.addEventListener('click', () => handlers.onRun(event.run as string));
   }
   return row;

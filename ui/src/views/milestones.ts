@@ -87,6 +87,9 @@ function milestoneTaskRow(task: TaskRow, handlers: MilestoneHandlers): HTMLEleme
       class: classes('task-row', task.status, 'clickable'),
       tabindex: 0,
       role: 'button',
+      // See tasks.ts: names the detail this row opens, so dismissing the drawer
+      // can return focus to it after the list has been re-rendered.
+      'data-opens': `task:${task.id}`,
     },
     el('span', { class: classes('mark', task.status) }, mark(task.status)),
     code(task.id),

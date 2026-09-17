@@ -203,3 +203,78 @@ def test_status_weight_puts_work_needing_attention_first():
     )
     assert order[0] in ("running", "awaiting-review", "failed")
     assert order[-1] == "completed"
+
+
+# ------------------------------------------------------------ drawer dismissal
+
+
+def test_a_click_off_the_drawer_dismisses_it():
+    """The whole point: attention moved elsewhere, so the panel gets out of the way."""
+    assert evaluate(
+        "dismissesOnClick({openKey: 'task:M01-001', keyAtPress: 'task:M01-001', "
+        "insideDrawer: false})"
+    ) is True
+
+
+def test_a_click_inside_the_drawer_keeps_it_open():
+    """Reading a run row or selecting text in the panel is not leaving it."""
+    assert evaluate(
+        "dismissesOnClick({openKey: 'task:M01-001', keyAtPress: 'task:M01-001', "
+        "insideDrawer: true})"
+    ) is False
+
+
+def test_opening_a_second_task_swaps_the_panel_rather_than_closing_it():
+    """The click landed outside the drawer, and it opened something.
+
+    Without this the drawer would close on the same click that reopens it: it
+    empties, drops its 'open' class, then slides back with a "Loading…" for the
+    new task. Comparing the open detail before and after the click is what tells
+    the two apart, since both are clicks outside the panel.
+    """
+    assert evaluate(
+        "dismissesOnClick({openKey: 'task:M01-002', keyAtPress: 'task:M01-001', "
+        "insideDrawer: false})"
+    ) is False
+
+
+def test_clicking_the_row_that_is_already_open_toggles_it_shut():
+    """Same key before and after, so nothing was opened: it is a dismissal.
+
+    A click that visibly does nothing is the worse alternative.
+    """
+    assert evaluate(
+        "dismissesOnClick({openKey: 'run:R1', keyAtPress: 'run:R1', insideDrawer: false})"
+    ) is True
+
+
+def test_a_click_with_the_drawer_shut_dismisses_nothing():
+    assert evaluate(
+        "dismissesOnClick({openKey: null, keyAtPress: null, insideDrawer: false})"
+    ) is False
+
+
+def test_focus_moving_out_of_the_drawer_dismisses_it():
+    """Tabbing past the end of the panel is leaving it, the keyboard's version."""
+    assert evaluate(
+        "dismissesOnFocus({openKey: 'task:M01-001', movedTo: 'outside'})"
+    ) is True
+
+
+def test_focus_moving_within_the_drawer_keeps_it_open():
+    assert evaluate(
+        "dismissesOnFocus({openKey: 'task:M01-001', movedTo: 'inside'})"
+    ) is False
+
+
+def test_a_rerender_that_destroys_the_focused_element_does_not_dismiss():
+    """The bug this guard exists for.
+
+    The drawer re-fetches and replaces its contents on every snapshot. Anything
+    focused inside it is destroyed, focus falls to the body, and focusout fires
+    with no relatedTarget. Reading that as "focus left" would close the panel by
+    itself every time an agent reported anything — while someone was watching it.
+    """
+    assert evaluate(
+        "dismissesOnFocus({openKey: 'task:M01-001', movedTo: 'nowhere'})"
+    ) is False

@@ -58,6 +58,10 @@ function taskRow(task: TaskRow, isSelected: boolean, handlers: TaskHandlers): HT
       class: classes('task-row', task.status, isLive(task.status) && 'live', isSelected && 'selected'),
       tabindex: 0,
       role: 'button',
+      // What this row opens. The drawer hands focus back here when dismissed, and
+      // it cannot hold the element itself: opening re-renders the list, so the
+      // node that was clicked is gone by the time the drawer is on screen.
+      'data-opens': `task:${task.id}`,
     },
     el('span', { class: 'mark' }, mark(task.status)),
     code(task.id),
@@ -263,7 +267,10 @@ function runSection(task: Task, handlers: TaskHandlers): HTMLElement {
       ...[...task.run_list].reverse().map((run) => {
         const row = el(
           'li',
-          { class: classes('run-row', run.status, isLive(run.status) && 'live', 'clickable') },
+          {
+            class: classes('run-row', run.status, isLive(run.status) && 'live', 'clickable'),
+            'data-opens': `run:${run.id}`,
+          },
           el('span', { class: classes('mark', run.status) }, mark(run.status)),
           el('span', { class: 'verb' }, run.role === 'reviewer' ? 'review' : 'dispatch'),
           el('span', { class: 'grow' }),
