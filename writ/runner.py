@@ -649,6 +649,19 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
         if task["status"] in ("running", "reviewing"):
             task["status"] = "failed" if code != 0 else "planned"
             task["updated_at"] = utcnow()
+        reason = "exited without writing a usable verdict" + (
+            f" ({note})" if note else ""
+        )
+        # On the run as well as the task. `dispatch` explains this at the time,
+        # but a run read later is the confusing case: exit 0, status completed,
+        # and nothing moved. Without this the record cannot answer why.
+        #
+        # A distinct field, not `verdict_error`: that one means "a verdict was
+        # written and rejected", and the CLI's own reporting keys off it. Here
+        # nothing was written at all, which is a different failure with a
+        # different remedy — so only set it when there is no error to show.
+        if not run.get("verdict_error"):
+            run["no_verdict"] = reason
         add_evidence(
             task,
             f"run {run_id} exited {code} without a usable verdict"

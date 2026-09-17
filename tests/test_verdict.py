@@ -169,6 +169,32 @@ def test_an_exit_code_alone_changes_nothing(planned, writ, project):
     assert all(a["status"] == "pending" for a in task["acceptances"])
 
 
+def test_the_run_record_says_why_nothing_happened(planned, writ, project):
+    """Exit 0, status completed, task unmoved: the run has to explain itself.
+
+    `dispatch` says this on stderr at the time, but that scrolls away. Anything
+    reading the run later — `writ show`, or a dashboard — sees a clean exit and no
+    reason, which is the most confusing state writ can leave a record in.
+    """
+    silent = f"{shlex.quote(sys.executable)} -c 'import sys; sys.stdin.read()'"
+    writ("dispatch", "M01-001", "--agent", silent)
+    run = next(iter(state.load(project)["runs"].values()))
+    assert run["exit_code"] == 0
+    assert "without writing a usable verdict" in run["no_verdict"]
+    # Distinct from verdict_error, which means a verdict was written and rejected.
+    assert not run.get("verdict_error")
+
+
+def test_an_unusable_verdict_is_recorded_differently_from_a_missing_one(
+    planned, writ, project
+):
+    """Two different failures with two different remedies."""
+    writ("dispatch", "M01-001", "--agent", agent_reporting("{not json at all"))
+    run = next(iter(state.load(project)["runs"].values()))
+    assert run["verdict_error"]
+    assert not run.get("no_verdict")
+
+
 def test_a_verdict_on_stdout_is_recovered(planned, writ, project):
     """An agent that cannot write files still gets its report read."""
     writ(
