@@ -1,4 +1,4 @@
-/* built from ui/src (83b7c9590fb2) */
+/* built from ui/src (cb67dd2c1146) */
 /*
  * writ dashboard — compiled from ui/src by ui/build.mjs.
  * Do not edit: change the TypeScript and rebuild.
@@ -1144,10 +1144,46 @@ class App {
         // exactly when someone is watching, so a keyboard reader would lose their
         // place repeatedly while doing nothing. Noted before, restored after.
         const focused = this.focusedOpener();
+        const scrolled = this.scrollOffsets();
         this.paintCounts(snapshot);
         this.paintView(snapshot);
         this.paintDrawer();
         this.restoreFocus(focused);
+        // Last: focusing an element can scroll its container to bring it into view,
+        // so the offset has to be settled after focus has moved, not before.
+        this.restoreScroll(scrolled);
+    }
+    /**
+     * Scroll offsets of the panes that opted in, by `data-scroll-key`.
+     *
+     * Repainting a view builds a fresh holder and swaps it in, and scroll position
+     * lives on the element being thrown away — so the graph jumped back to the far
+     * left every time anything re-rendered, including selecting a node, which is
+     * the one moment you are certainly looking at a node somewhere off to the right.
+     *
+     * Keyed rather than positional because keys are view-specific: switching views
+     * finds no match and starts at the top, which is right, while a repaint of the
+     * same view restores.
+     */
+    scrollOffsets() {
+        const saved = new Map();
+        for (const pane of this.body.querySelectorAll('[data-scroll-key]')) {
+            const key = pane.dataset.scrollKey;
+            if (key)
+                saved.set(key, [pane.scrollLeft, pane.scrollTop]);
+        }
+        return saved;
+    }
+    restoreScroll(saved) {
+        if (!saved.size)
+            return;
+        for (const pane of this.body.querySelectorAll('[data-scroll-key]')) {
+            const key = pane.dataset.scrollKey;
+            const offset = key ? saved.get(key) : undefined;
+            if (!offset)
+                continue;
+            [pane.scrollLeft, pane.scrollTop] = offset;
+        }
     }
     /** The `data-opens` key of the focused row, if a row is what has focus. */
     focusedOpener() {
@@ -1211,7 +1247,7 @@ class App {
                 break;
             }
             case 'graph': {
-                const holder = el('div', { class: 'graph-holder' });
+                const holder = el('div', { class: 'graph-holder', 'data-scroll-key': 'graph' });
                 renderGraph(holder, snapshot.graph, this.route.task ?? null, {
                     onSelect: handlers.onSelect,
                 });

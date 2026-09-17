@@ -56,6 +56,11 @@ def evaluate(expression: str):
     }};
     globalThis.window = {{ addEventListener: noop, setTimeout: noop, clearTimeout: noop }};
     globalThis.location = {{ hash: '' }};
+    // The bundle narrows with `instanceof` before touching focus, so the names have
+    // to exist. Nothing in the stub DOM is an instance of either, which is the
+    // honest answer for a document that is not a document.
+    globalThis.HTMLElement = class {{}};
+    globalThis.Node = class {{}};
     globalThis.EventSource = class {{ constructor() {{}} addEventListener() {{}} close() {{}} }};
     globalThis.fetch = () => Promise.reject(new Error('no network in tests'));
     {inner}
@@ -278,3 +283,101 @@ def test_a_rerender_that_destroys_the_focused_element_does_not_dismiss():
     assert evaluate(
         "dismissesOnFocus({openKey: 'task:M01-001', movedTo: 'nowhere'})"
     ) is False
+
+
+# --------------------------------------------------------------- scroll keeping
+
+
+def scroll_case(before: str, after: str) -> list:
+    """Run a repaint against fake panes and report where they end up scrolled.
+
+    `before` and `after` are pane lists: the panes that existed when the offsets
+    were noted, and the ones that exist after the view was rebuilt. Calls the
+    shipped methods with a stand-in `body`, so this exercises the real lookup and
+    not a restatement of it.
+    """
+    return evaluate(
+        f"""(() => {{
+          const pane = (key, left, top) => ({{
+            dataset: {{ scrollKey: key }}, scrollLeft: left, scrollTop: top,
+          }});
+          const host = (panes) => ({{ body: {{ querySelectorAll: () => panes }} }});
+          const old = {before};
+          const fresh = {after};
+          const saved = App.prototype.scrollOffsets.call(host(old));
+          App.prototype.restoreScroll.call(host(fresh), saved);
+          return fresh.map((p) => [p.dataset.scrollKey, p.scrollLeft, p.scrollTop]);
+        }})()"""
+    )
+
+
+def test_a_repaint_keeps_the_graph_where_it_was_scrolled_to():
+    """The bug: selecting a node sent the graph back to the far left.
+
+    Repainting builds a fresh holder and swaps it in, and scroll position lives on
+    the element being discarded. Clicking a node repaints, so the graph jumped to
+    the left at the one moment you were certainly looking at something off to the
+    right — and every arriving snapshot did it again.
+    """
+    kept = scroll_case("[pane('graph', 900, 0)]", "[pane('graph', 0, 0)]")
+    assert kept == [["graph", 900, 0]]
+
+
+def test_leaving_the_view_and_coming_back_starts_at_the_beginning():
+    """Keys are view-specific, so a different view finds no offset to restore.
+
+    Returning to a view is not the same as never having left it: starting at the
+    top is what a reader expects, and restoring a position from before would be
+    the page remembering something they did not ask it to.
+    """
+    kept = scroll_case("[pane('graph', 900, 0)]", "[pane('runs', 0, 0)]")
+    assert kept == [["runs", 0, 0]]
+
+
+def test_both_axes_are_kept():
+    """The graph scrolls sideways, but a tall one scrolls down too."""
+    kept = scroll_case("[pane('graph', 640, 220)]", "[pane('graph', 0, 0)]")
+    assert kept == [["graph", 640, 220]]
+
+
+def test_panes_without_a_key_are_left_alone():
+    """Opting in matters: a pane with no key is one nothing claimed to manage."""
+    kept = evaluate(
+        """(() => {
+          const panes = [{ dataset: {}, scrollLeft: 0, scrollTop: 0 }];
+          const host = { body: { querySelectorAll: () => panes } };
+          const saved = App.prototype.scrollOffsets.call(host);
+          return [saved.size, panes[0].scrollLeft];
+        })()"""
+    )
+    assert kept == [0, 0]
+
+
+def test_a_render_is_what_keeps_the_scroll_position():
+    """That `render` calls the restore, not just that the restore works.
+
+    Written after noticing the tests above pass with the call to `restoreScroll`
+    deleted from `render`: they reach the methods directly, so they pin the lookup
+    and say nothing about the wiring — and the wiring was the bug. This drives
+    `render` with a stand-in pane and asserts the offset survives the repaint.
+    """
+    kept = evaluate(
+        """(() => {
+          const pane = { dataset: { scrollKey: 'graph' }, scrollLeft: 900, scrollTop: 0 };
+          const app = Object.create(App.prototype);
+          // Repainting is what loses the offset in the browser, because the holder
+          // is replaced. Standing in for that: the pane is zeroed mid-render, the
+          // same damage, so only a restore afterwards can put it back.
+          const zero = () => { pane.scrollLeft = 0; pane.scrollTop = 0; };
+          Object.assign(app, {
+            store: { current: { graph: {}, overview: { counts: {} } } },
+            route: { view: 'graph' },
+            nav: { querySelectorAll: () => [] },
+            body: { querySelectorAll: () => [pane] },
+            paintCounts: zero, paintView: zero, paintDrawer: zero,
+          });
+          App.prototype.render.call(app);
+          return pane.scrollLeft;
+        })()"""
+    )
+    assert kept == 900
