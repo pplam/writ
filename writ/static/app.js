@@ -1,4 +1,4 @@
-/* built from ui/src (65e05caa8a3c) */
+/* built from ui/src (4559c2e3a73a) */
 /*
  * writ dashboard — compiled from ui/src by ui/build.mjs.
  * Do not edit: change the TypeScript and rebuild.
@@ -632,10 +632,15 @@ function taskRow(task, isSelected, handlers) {
     return row;
 }
 function renderTaskDetail(host, task, handlers) {
-    replace(host, el('header', { class: 'detail-head' }, el('div', { class: 'detail-title' }, el('span', { class: classes('mark', task.status) }, mark(task.status)), code(task.id), el('span', { class: classes('pill', task.status) }, task.status)), el('h2', {}, task.title)), metaRow(task), acceptanceSection(task), task.notes ? section('Notes', el('p', { class: 'prose' }, task.notes)) : null, dependencySection(task), guardrailSection(task), runSection(task, handlers), evidenceSection(task));
+    replace(host, el('header', { class: 'detail-head' }, el('div', { class: 'detail-title' }, el('span', { class: classes('mark', task.status) }, mark(task.status)), code(task.id), el('span', { class: classes('pill', task.status) }, task.status)), el('h2', {}, task.title)), metaRow(task), acceptanceSection(task), task.notes ? section('Notes', null, el('p', { class: 'prose' }, task.notes)) : null, dependencySection(task), guardrailSection(task), runSection(task, handlers), evidenceSection(task));
 }
-function section(title, ...body) {
-    return el('section', { class: 'detail-section' }, el('h3', {}, title), ...body);
+/**
+ * A titled section. The optional note is a count or ratio: it belongs to the
+ * title but is not part of its name, so it is a separate quieter element rather
+ * than punctuation inside the string.
+ */
+function section(title, note, ...body) {
+    return el('section', { class: 'detail-section' }, el('h3', {}, title, note ? el('span', { class: 'h3-note' }, note) : null), ...body);
 }
 /**
  * Where this task came from. Rendered as discrete labelled items: these used to
@@ -667,9 +672,9 @@ function basename(path) {
 }
 function acceptanceSection(task) {
     if (!task.acceptances.length) {
-        return section('Acceptance', el('p', { class: 'blank' }, 'No criteria recorded.'));
+        return section('Acceptance', null, el('p', { class: 'blank' }, 'No criteria recorded.'));
     }
-    return section(`Acceptance · ${ratio(task.passed, task.total)} passed`, el('ol', { class: 'criteria' }, ...task.acceptances.map(criterion)));
+    return section('Acceptance', `${ratio(task.passed, task.total)} passed`, el('ol', { class: 'criteria' }, ...task.acceptances.map(criterion)));
 }
 function criterion(item) {
     return el('li', { class: classes('criterion', item.status) }, el('div', { class: 'criterion-head' }, 
@@ -686,13 +691,13 @@ function guardrailSection(task) {
     if (!task.allowed.length && !task.forbidden.length)
         return null;
     const rail = (kind, heading, paths) => el('div', { class: classes('rail', kind) }, el('h4', {}, heading), el('ul', {}, ...paths.map((p) => el('li', { class: 'mono' }, p))));
-    return section('Guardrails', el('div', { class: 'rails' }, task.allowed.length ? rail('allowed', 'may touch', task.allowed) : null, task.forbidden.length ? rail('forbidden', 'must not touch', task.forbidden) : null));
+    return section('Guardrails', null, el('div', { class: 'rails' }, task.allowed.length ? rail('allowed', 'may touch', task.allowed) : null, task.forbidden.length ? rail('forbidden', 'must not touch', task.forbidden) : null));
 }
 function dependencySection(task) {
     if (!task.depends_on.length && !task.blocks.length && !task.unknown_deps.length)
         return null;
     const group = (heading, ids, kind) => el('div', { class: 'dep-group' }, el('h4', { class: classes(kind) }, heading), el('div', { class: 'dep-line' }, ...ids.map((id) => code(id))));
-    return section('Dependencies', el('div', { class: 'deps' }, task.depends_on.length ? group('runs after', task.depends_on) : null, task.blocked_by.length ? group('still waiting on', task.blocked_by, 'warn') : null, task.blocks.length ? group('blocks', task.blocks) : null, 
+    return section('Dependencies', null, el('div', { class: 'deps' }, task.depends_on.length ? group('runs after', task.depends_on) : null, task.blocked_by.length ? group('still waiting on', task.blocked_by, 'warn') : null, task.blocks.length ? group('blocks', task.blocks) : null, 
     // A dangling id means this task can never become ready. Say so here rather
     // than letting it sit in the list looking merely slow.
     task.unknown_deps.length
@@ -701,9 +706,9 @@ function dependencySection(task) {
 }
 function runSection(task, handlers) {
     if (!task.run_list.length) {
-        return section('Runs', el('p', { class: 'blank' }, 'Never dispatched.'));
+        return section('Runs', null, el('p', { class: 'blank' }, 'Never dispatched.'));
     }
-    return section(`Runs · ${task.run_list.length}`, el('ul', { class: 'run-list' }, ...[...task.run_list].reverse().map((run) => {
+    return section('Runs', String(task.run_list.length), el('ul', { class: 'run-list' }, ...[...task.run_list].reverse().map((run) => {
         const row = el('li', { class: classes('run-row', run.status, isLive(run.status) && 'live', 'clickable') }, el('span', { class: classes('mark', run.status) }, mark(run.status)), el('span', { class: 'verb' }, run.role === 'reviewer' ? 'review' : 'dispatch'), el('span', { class: 'grow' }), run.decision ? el('span', { class: classes('pill', run.decision) }, run.decision) : null, el('span', { class: 'muted mono small clip' }, run.model || run.command), el('span', { class: 'muted small tnum', title: run.started_at ?? '' }, ago(run.started_at)));
         row.addEventListener('click', () => handlers.onRun(run.id));
         return row;
@@ -712,7 +717,7 @@ function runSection(task, handlers) {
 function evidenceSection(task) {
     if (!task.evidence.length)
         return null;
-    return section('History', el('ol', { class: 'history' }, ...[...task.evidence].reverse().map((item) => el('li', {}, el('span', { class: 'actor' }, item.actor), el('span', { class: 'history-text' }, item.text), el('span', { class: 'grow' }), el('span', { class: 'muted small tnum', title: item.at }, ago(item.at))))));
+    return section('History', null, el('ol', { class: 'history' }, ...[...task.evidence].reverse().map((item) => el('li', {}, el('span', { class: 'actor' }, item.actor), el('span', { class: 'history-text' }, item.text), el('span', { class: 'grow' }), el('span', { class: 'muted small tnum', title: item.at }, ago(item.at))))));
 }
 
 // ---- views/runs.js ----

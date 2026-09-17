@@ -1,4 +1,4 @@
-/* built from ui/src (65e05caa8a3c) */
+/* built from ui/src (4559c2e3a73a) */
 /*
  * One stylesheet, no framework.
  *
@@ -607,9 +607,43 @@ code, .mono, pre { font-family: var(--mono); }
  * title pushed the status pill onto its own line and left it looking unrelated
  * to the task above it.
  */
-.detail-head { padding-right: 34px; margin-bottom: 10px; }
-.detail-title { display: flex; align-items: center; gap: 9px; margin-bottom: 5px; }
-.detail-head h2 { margin: 0; font-size: 17px; font-weight: 600; line-height: 1.3; }
+/*
+ * The row itself spaces its children, because the run drawer puts the mark, id
+ * and pill directly in here while the task drawer nests them in .detail-title.
+ * Without this the run header rendered as "+M02-002-20260917T103559completed",
+ * the mark and pill fused to the id.
+ */
+.detail-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 9px;
+  padding-right: 34px;
+  margin-bottom: 10px;
+}
+
+/* A nested title row is one child of the header, so it owns the whole line. */
+.detail-title { flex: 1 1 100%; display: flex; align-items: center; gap: 9px; margin-bottom: 5px; }
+
+.detail-head h2 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 650;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+}
+
+/*
+ * A run is identified by a long opaque id, so it is set in mono at a size that
+ * still reads as the title of the panel rather than as a field value.
+ */
+.detail-head > code {
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--ink);
+  background: none;
+  padding: 0;
+}
 
 /*
  * Labelled pairs. These were bare spans in a flex row, so with a gap alone the
@@ -630,18 +664,59 @@ code, .mono, pre { font-family: var(--mono); }
 .meta-label { color: var(--faint); text-transform: uppercase; font-size: 11px; letter-spacing: 0.05em; }
 .meta-value { color: var(--dim); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-.detail-section { margin-bottom: 22px; }
+/*
+ * Three heading roles, three distinct treatments.
+ *
+ * They were nearly identical before: a card label at 12px uppercase grey, a
+ * detail section at 11.5px uppercase grey, and a subgroup at 12px sentence-case
+ * grey. So a panel showed five interchangeable grey labels with no sense of
+ * where one section ended, and — worse — a subgroup heading was *larger* than
+ * the section containing it, inverting the hierarchy it was meant to express.
+ *
+ * Now: a section title is dark, sized above its content, and separated by a
+ * rule; a subgroup is small, uppercase and quiet, clearly subordinate. Size,
+ * weight, colour and case all move together rather than one at a time, because
+ * a half-step in one dimension is what made these blur together.
+ */
+.detail-section { margin-bottom: 26px; }
 
 .detail-section h3 {
-  margin: 0 0 8px;
-  font-size: 11.5px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--dim);
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: -0.005em;
+  color: var(--ink);
 }
 
-.detail-section h4 { margin: 8px 0 3px; font-size: 12px; font-weight: 600; color: var(--dim); }
+/* The count after a section name is a detail of it, not part of the name. */
+.detail-section h3 .h3-note {
+  font-weight: 500;
+  font-size: 12px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+
+/*
+ * One selector list rather than three copies: these are the same role in three
+ * containers, and when they were written out separately they had already drifted
+ * apart by a few tenths of a pixel each.
+ */
+.detail-section h4,
+.decision .field h4,
+.decision .ruling h4 {
+  margin: 0 0 4px;
+  font-size: 10.5px;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--faint);
+}
 
 .criterion {
   border: 1px solid var(--line);
@@ -731,9 +806,19 @@ pre.command {
 .decision.active { border-left: 2.5px solid var(--i-completed); }
 .decision.rejected { opacity: 0.72; }
 .decision header { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
-.decision h3 { margin: 0; font-size: 14px; font-weight: 600; }
-.decision .field { margin-top: 8px; }
-.decision .ruling { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+
+/*
+ * A decision's h3 is a name, not a section label: it is the one line that says
+ * what the fork was, so it is the largest thing in the card. Deliberately not
+ * the .detail-section h3 treatment, which labels a region of a panel.
+ */
+.decision h3 { margin: 0; font-size: 14.5px; font-weight: 650; letter-spacing: -0.005em; }
+
+.decision .field { margin-top: 10px; }
+.decision .ruling { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+
+/* "To rule on this" is an instruction, not a field name, but the same tier. */
+.decision .ruling h4 { margin-bottom: 5px; }
 
 /*
  * A grid so the bar and count keep one column across every card. As flex-wrap
@@ -748,12 +833,14 @@ pre.command {
   margin-bottom: 10px;
 }
 
+/* A milestone name is a name, like a decision's: same tier, same treatment. */
 .milestone-card h2 {
   display: block;
   margin: 0;
   font-size: 14.5px;
+  font-weight: 650;
   text-transform: none;
-  letter-spacing: normal;
+  letter-spacing: -0.005em;
   color: var(--ink);
 }
 

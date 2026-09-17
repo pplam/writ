@@ -101,7 +101,7 @@ export function renderTaskDetail(
     ),
     metaRow(task),
     acceptanceSection(task),
-    task.notes ? section('Notes', el('p', { class: 'prose' }, task.notes)) : null,
+    task.notes ? section('Notes', null, el('p', { class: 'prose' }, task.notes)) : null,
     dependencySection(task),
     guardrailSection(task),
     runSection(task, handlers),
@@ -109,8 +109,22 @@ export function renderTaskDetail(
   );
 }
 
-function section(title: string, ...body: (Node | null | false)[]): HTMLElement {
-  return el('section', { class: 'detail-section' }, el('h3', {}, title), ...body);
+/**
+ * A titled section. The optional note is a count or ratio: it belongs to the
+ * title but is not part of its name, so it is a separate quieter element rather
+ * than punctuation inside the string.
+ */
+function section(
+  title: string,
+  note: string | null,
+  ...body: (Node | null | false)[]
+): HTMLElement {
+  return el(
+    'section',
+    { class: 'detail-section' },
+    el('h3', {}, title, note ? el('span', { class: 'h3-note' }, note) : null),
+    ...body,
+  );
 }
 
 /**
@@ -148,10 +162,11 @@ function basename(path: string): string {
 
 function acceptanceSection(task: Task): HTMLElement {
   if (!task.acceptances.length) {
-    return section('Acceptance', el('p', { class: 'blank' }, 'No criteria recorded.'));
+    return section('Acceptance', null, el('p', { class: 'blank' }, 'No criteria recorded.'));
   }
   return section(
-    `Acceptance · ${ratio(task.passed, task.total)} passed`,
+    'Acceptance',
+    `${ratio(task.passed, task.total)} passed`,
     el('ol', { class: 'criteria' }, ...task.acceptances.map(criterion)),
   );
 }
@@ -198,6 +213,7 @@ function guardrailSection(task: Task): HTMLElement | null {
     );
   return section(
     'Guardrails',
+    null,
     el(
       'div',
       { class: 'rails' },
@@ -218,6 +234,7 @@ function dependencySection(task: Task): HTMLElement | null {
     );
   return section(
     'Dependencies',
+    null,
     el(
       'div',
       { class: 'deps' },
@@ -235,10 +252,11 @@ function dependencySection(task: Task): HTMLElement | null {
 
 function runSection(task: Task, handlers: TaskHandlers): HTMLElement {
   if (!task.run_list.length) {
-    return section('Runs', el('p', { class: 'blank' }, 'Never dispatched.'));
+    return section('Runs', null, el('p', { class: 'blank' }, 'Never dispatched.'));
   }
   return section(
-    `Runs · ${task.run_list.length}`,
+    'Runs',
+    String(task.run_list.length),
     el(
       'ul',
       { class: 'run-list' },
@@ -264,6 +282,7 @@ function evidenceSection(task: Task): HTMLElement | null {
   if (!task.evidence.length) return null;
   return section(
     'History',
+    null,
     el(
       'ol',
       { class: 'history' },

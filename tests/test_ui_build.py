@@ -192,3 +192,115 @@ def test_every_palette_colour_is_opaque(scheme):
     """
     for name, colour in _palettes()[scheme].items():
         assert len(colour.lstrip("#")) in (3, 6), f"{scheme}: {name} = {colour}"
+
+
+def _blocks(css: str) -> list[tuple[str, str]]:
+    """(selector list, declarations) for each rule, with comments stripped.
+
+    Comments are removed first because several carry braces in prose, which is
+    enough to make a naive selector pattern swallow the rule that follows.
+    """
+    bare = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    return [(m.group(1).strip(), m.group(2)) for m in re.finditer(r"([^{}]+)\{([^{}]*)\}", bare)]
+
+
+def _rule(selector: str) -> dict[str, str]:
+    """The declarations of the first rule whose selector list contains one exactly."""
+    css = (STATIC / "style.css").read_text()
+    for block in _blocks(css):
+        selectors = [s.strip() for s in block[0].split(",")]
+        if selector in selectors:
+            return dict(
+                (k.strip(), v.strip())
+                for k, _, v in (d.partition(":") for d in block[1].split(";"))
+                if k.strip()
+            )
+    raise AssertionError(f"no rule for {selector!r}")
+
+
+def test_a_subsection_heading_is_smaller_than_the_section_it_sits_in():
+    """The heading scale runs downward.
+
+    It did not: a detail section was 11.5px and its own subgroups were 12px, so
+    "may touch" was set larger than the "Guardrails" heading above it. Nothing
+    about reading the stylesheet makes that obvious, since the two rules sit on
+    adjacent lines and neither number looks wrong on its own.
+    """
+    section = float(_rule(".detail-section h3")["font-size"].rstrip("px"))
+    subsection = float(_rule(".detail-section h4")["font-size"].rstrip("px"))
+    assert subsection < section, f"h4 is {subsection}px inside an h3 of {section}px"
+
+
+def test_the_three_heading_tiers_are_told_apart_by_more_than_size():
+    """A panel title, a section title and a subgroup label differ on several axes.
+
+    All three were within half a pixel of each other, uppercase, and the same
+    grey, so a task panel showed five interchangeable labels and no sense of
+    where one section ended. Size alone is not enough separation at these sizes.
+    """
+    section = _rule(".detail-section h3")
+    subsection = _rule(".detail-section h4")
+
+    # The section title is the darker of the two, and is not shouted in caps.
+    assert section["color"] == "var(--ink)"
+    assert "text-transform" not in section
+    # The subgroup is quiet, small and uppercase: clearly subordinate.
+    assert subsection["color"] == "var(--faint)"
+    assert subsection["text-transform"] == "uppercase"
+    # And a section is separated by a rule, not just by space.
+    assert "border-bottom" in section
+
+
+def test_a_count_beside_a_section_title_is_not_part_of_the_name():
+    """Counts are a separate quieter element.
+
+    "Acceptance · 3/3 passed" as one string makes the tally compete with the
+    word that says what the section is, and it inherits the title's weight.
+    """
+    assert ".h3-note" in (STATIC / "style.css").read_text()
+    bundle = (STATIC / "app.js").read_text()
+    assert "'h3-note'" in bundle or '"h3-note"' in bundle
+    note = _rule(".detail-section h3 .h3-note")
+    section = _rule(".detail-section h3")
+    assert float(note["font-size"].rstrip("px")) < float(section["font-size"].rstrip("px"))
+    assert note["color"] == "var(--faint)"
+
+
+def test_the_two_kinds_of_name_agree_with_each_other():
+    """A milestone name and a decision name are the same tier, so same treatment.
+
+    They had drifted to the same size at different weights.
+    """
+    milestone = _rule(".milestone-card h2")
+    decision = _rule(".decision h3")
+    assert milestone["font-size"] == decision["font-size"]
+    assert milestone["font-weight"] == decision["font-weight"]
+
+
+def test_the_subordinate_label_is_defined_once():
+    """One selector list, not a copy per container.
+
+    Three containers grew their own copy of this label and had already drifted
+    apart by a few tenths of a pixel before they were merged.
+    """
+    css = (STATIC / "style.css").read_text()
+    defining = [
+        selectors
+        for selectors, body in _blocks(css)
+        if "text-transform: uppercase" in body and "font-size: 10.5px" in body
+    ]
+    assert len(defining) == 1, f"defined in {len(defining)} places: {defining}"
+    assert ".decision .field h4" in defining[0]
+    assert ".decision .ruling h4" in defining[0]
+
+
+def test_a_detail_header_spaces_its_own_children():
+    """The header row is a flex row with a gap.
+
+    The run drawer puts the status mark, id and pill straight into the header
+    while the task drawer nests them a level down. Without a gap here the run
+    header rendered as "+M02-002-20260917T103559completed".
+    """
+    head = _rule(".detail-head")
+    assert head["display"] == "flex"
+    assert head["gap"] != "0"
