@@ -70,9 +70,15 @@ Rules for the verdict:
    a command and its result is evidence; "implemented" and "works" are not.
 3. Mark a criterion `failed` if you could not meet it and `pending` if you could
    not check it. Both are acceptable outcomes and are more useful than a guess.
-4. `outcome` must be `complete` only when every criterion is `passed`.
-5. Do not claim `passed` on the strength of code you wrote but did not run.
-6. Report honestly. A verdict is checked by a reviewer that did not write your
+4. `outcome` must be `complete` only when every criterion is `passed`. Writ
+   lowers a `complete` that its own criteria contradict, so heading a report
+   `complete` over an unmet bar gains nothing and only obscures what you did.
+5. If a criterion cannot be met from inside this task's allowed files — a bar
+   that depends on another task's code, or on something you are forbidden to
+   touch — mark it `pending`, say so in `blocked_on`, and use outcome `blocked`.
+   That is the honest report for it, and it is not counted against your work.
+6. Do not claim `passed` on the strength of code you wrote but did not run.
+7. Report honestly. A verdict is checked by a reviewer that did not write your
    code, and a false pass is worse than an admitted failure."""
 
 DECISION_RULES = """\
@@ -185,6 +191,8 @@ class Verdict:
     role: str = "agent"
     #: set for reviewer verdicts
     decision: str | None = None
+    #: set when the headline claim contradicted the criteria and writ lowered it
+    downgraded: str | None = None
 
     @property
     def passed(self) -> list[int]:
@@ -288,14 +296,12 @@ def parse(text: str, *, role: str = "agent", where: str = "verdict") -> Verdict:
 
     if role == "reviewer":
         decision = _one_of(raw.get("decision"), DECISIONS, "decision", where)
+        downgraded = None
         if decision == "accept":
             unmet = [c.number for c in criteria if c.status != "passed"]
             if unmet:
-                listed = ", ".join(str(n) for n in unmet)
-                raise WritError(
-                    f"{where}: decision is 'accept' but criteria {listed} "
-                    "are not passed"
-                )
+                decision = "reject"
+                downgraded = _mismatch(where, "decision", "accept", "reject", unmet)
         return Verdict(
             outcome="complete" if decision == "accept" else "incomplete",
             summary=summary,
@@ -304,17 +310,17 @@ def parse(text: str, *, role: str = "agent", where: str = "verdict") -> Verdict:
             notes=notes,
             role="reviewer",
             decision=decision,
+            downgraded=downgraded,
         )
 
     outcome = _one_of(raw.get("outcome"), OUTCOMES, "outcome", where)
     blocked_on = _text(raw.get("blocked_on")) or None
+    downgraded = None
     if outcome == "complete":
         unmet = [c.number for c in criteria if c.status != "passed"]
         if unmet:
-            listed = ", ".join(str(n) for n in unmet)
-            raise WritError(
-                f"{where}: outcome is 'complete' but criteria {listed} are not passed"
-            )
+            outcome = "incomplete"
+            downgraded = _mismatch(where, "outcome", "complete", "incomplete", unmet)
     if outcome == "blocked" and not blocked_on:
         raise WritError(f"{where}: outcome is 'blocked' but blocked_on is empty")
     return Verdict(
@@ -325,6 +331,30 @@ def parse(text: str, *, role: str = "agent", where: str = "verdict") -> Verdict:
         blocked_on=blocked_on,
         notes=notes,
         role="agent",
+        downgraded=downgraded,
+    )
+
+
+def _mismatch(
+    where: str, field_name: str, claimed: str, applied: str, unmet: list[int]
+) -> str:
+    """Describe a headline claim that its own criteria contradict.
+
+    Writ used to reject the whole verdict here. That is the safe direction on the
+    claim and the wrong one on everything else: the per-criterion reports are the
+    substance, they each carry their own evidence, and throwing them away leaves a
+    task that was largely done looking untouched — with the reason living only in
+    a run record, where the next agent will not see it.
+
+    So the contradiction is resolved in the criteria's favour, which can only ever
+    lower the claim. `complete` with an unmet criterion means `incomplete`, and an
+    `accept` with one means `reject`. Nothing is credited that the agent did not
+    itself mark passed, and the mismatch is reported rather than quietly fixed.
+    """
+    listed = ", ".join(str(n) for n in unmet)
+    return (
+        f"{where}: {field_name} was {claimed!r} but criteria {listed} are not "
+        f"passed, so writ recorded {applied!r}"
     )
 
 
@@ -487,6 +517,11 @@ def apply(
         "at": utcnow(),
     }
     add_evidence(task, _evidence_line(verdict, actor), actor=actor)
+    if verdict.downgraded:
+        # On the task, not only the run: the next agent to pick this up reads the
+        # task's evidence, and "you claimed done, your own criteria said
+        # otherwise" is the single most useful thing it can be told.
+        add_evidence(task, verdict.downgraded, actor="writ")
     if verdict.notes:
         add_evidence(task, f"notes: {verdict.notes}", actor=actor)
     if verdict.blocked_on:

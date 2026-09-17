@@ -127,7 +127,8 @@ function verdictSection(run: Run): HTMLElement | null {
 }
 
 function problemSection(run: Run): HTMLElement | null {
-  if (!run.verdict_error && !run.no_verdict && !run.note) return null;
+  if (!run.verdict_error && !run.no_verdict && !run.note && !run.verdict_downgraded)
+    return null;
   return el(
     'section',
     { class: 'detail-section problem' },
@@ -143,7 +144,27 @@ function problemSection(run: Run): HTMLElement | null {
             'the task was returned to the queue rather than judged',
         )
       : null,
+    // A silent run is not an agent that skipped its report, and telling the two
+    // apart is the difference between re-reading a transcript that says nothing
+    // and going to look at the agent's own configuration.
+    run.no_verdict && run.no_output
+      ? el(
+          'p',
+          { class: 'muted' },
+          'The transcript is empty, so start with the invocation rather than the ' +
+            'prompt: check the model id, that the agent is authenticated for ' +
+            'that provider, and that its quota is not exhausted. Running ',
+          el('code', {}, run.command),
+          ' by hand usually says which.',
+        )
+      : null,
     run.verdict_error ? el('p', { class: 'error' }, run.verdict_error) : null,
+    // Not an error: the verdict was applied, with the claim lowered to match the
+    // criteria under it. Shown here because a task that reads "failed" against a
+    // summary claiming success is otherwise unexplained.
+    run.verdict_downgraded
+      ? el('p', { class: 'muted' }, run.verdict_downgraded)
+      : null,
     run.note ? el('p', { class: 'muted' }, run.note) : null,
   );
 }

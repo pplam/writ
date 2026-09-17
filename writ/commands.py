@@ -624,6 +624,10 @@ def _render_task(data: dict[str, Any], task: dict[str, Any]) -> str:
             )
             if run.get("verdict_error"):
                 lines.append(f"      unusable verdict: {run['verdict_error']}")
+            elif run.get("no_verdict"):
+                lines.append(f"      no verdict: {run['no_verdict']}")
+            if run.get("verdict_downgraded"):
+                lines.append(f"      downgraded: {run['verdict_downgraded']}")
     if task.get("evidence"):
         lines.append("\nevidence:")
         for entry in task["evidence"]:
@@ -1194,8 +1198,14 @@ def _run_agent_on_task(args, *, role: str, task_id: str, extra: list[str]) -> in
     if not args.quiet:
         print("" + "─" * 62)
     print(f"run {run_id} finished with exit code {code}")
-    if code == 124 and not runner.produced_output(directory):
-        print(agents.hang_hint(resolved), file=sys.stderr)
+    if not runner.produced_output(directory):
+        if code == 124:
+            print(agents.hang_hint(resolved), file=sys.stderr)
+        else:
+            # An agent that exits on its own without a word is the case that
+            # otherwise reads as "it worked but did not report". Say so here,
+            # where the invocation is still on screen.
+            print(agents.silent_exit_hint(resolved, code), file=sys.stderr)
     _report_verdict(root, run_id, task_id, directory, role)
     return code
 
@@ -1208,9 +1218,11 @@ def _report_verdict(
     The status change is the interesting part of a run, so it is reported
     explicitly rather than left for the user to go and look up.
     """
-    status, error = runner.verdict_summary(root, run_id)
+    status, error, downgraded = runner.verdict_summary(root, run_id)
     if error:
         print(f"warning: {error}", file=sys.stderr)
+    if downgraded:
+        print(f"warning: {downgraded}", file=sys.stderr)
     if status is None:
         print(verdict.missing_message(task_id, directory, role), file=sys.stderr)
         return

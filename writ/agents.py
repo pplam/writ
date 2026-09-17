@@ -160,6 +160,33 @@ def resolve(
     return ResolvedAgent(command=command, profile=profile, name=name)
 
 
+def silent_exit_hint(resolved: ResolvedAgent, code: int) -> str:
+    """Guidance for a run that exited on its own having written nothing.
+
+    Distinct from `hang_hint`, which is about a run that had to be killed. An
+    agent that exits promptly and prints nothing at all usually never reached a
+    model: an unknown model id, a provider it is not authenticated for, or an
+    exhausted quota. Several agent CLIs report exactly that as exit 0 with an
+    empty stdout, which reads on the dashboard as "the agent worked and forgot
+    to report" — the opposite of what happened, and a much worse thing to go
+    looking for.
+    """
+    lines = [
+        f"{resolved.name} exited {code} without printing anything, so it "
+        "probably never ran: no output means no model call, not a missing "
+        "report.",
+        f"  it was invoked as `{resolved.display}`",
+    ]
+    if resolved.profile is not None and resolved.profile.model_flag:
+        lines.append(
+            f"  check the model id and that {resolved.name} is authenticated "
+            "for that provider, then run the same command by hand"
+        )
+    else:
+        lines.append("  run the same command by hand to see what it reports")
+    return "\n".join(lines)
+
+
 def hang_hint(resolved: ResolvedAgent) -> str:
     """Guidance for a run that was killed without producing output."""
     if resolved.profile is None:

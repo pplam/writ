@@ -185,6 +185,73 @@ def test_the_run_record_says_why_nothing_happened(planned, writ, project):
     assert not run.get("verdict_error")
 
 
+def test_an_agent_that_printed_nothing_is_not_blamed_for_a_missing_report(
+    planned, writ, project
+):
+    """Empty transcript, exit 0: the invocation failed, it did not skip its report.
+
+    This is what a wrong model id or an unauthenticated provider looks like from
+    writ's side — several agent CLIs report both as exit 0 with no output. Read
+    as "no verdict" alone it sends the operator to a transcript that says
+    nothing, so the record has to distinguish the two.
+    """
+    code, _, err = writ("dispatch", "M01-001", "--agent", "true")
+    assert code == 0
+    run = next(iter(state.load(project)["runs"].values()))
+    assert run["no_output"] is True
+    assert "never reached a model" in run["no_verdict"]
+    # and at the time, where the invocation is still on screen
+    assert "never ran" in err
+
+
+def test_an_agent_that_spoke_but_did_not_report_is_not_called_silent(
+    planned, writ, project
+):
+    """The other half of the distinction: output, but no verdict."""
+    talker = f"{shlex.quote(sys.executable)} -c 'import sys; sys.stdin.read(); print(\"done\")'"
+    writ("dispatch", "M01-001", "--agent", talker)
+    run = next(iter(state.load(project)["runs"].values()))
+    assert not run.get("no_output")
+    assert "never reached a model" not in run["no_verdict"]
+
+
+def test_a_contradicted_claim_keeps_the_evidence_under_it(planned, writ, project):
+    """The failure this replaced: honest per-criterion work thrown away.
+
+    An agent that meets three of four bars, says so criterion by criterion with
+    evidence, and then heads the report `complete` has made one field wrong and
+    three right. Discarding the verdict lost all three, reset the task to
+    `planned`, and left the next agent to rediscover the same work.
+    """
+    payload = json.dumps(
+        {
+            "outcome": "complete",
+            "summary": "implemented the store",
+            "criteria": [
+                {"number": 1, "status": "passed", "evidence": "pytest tests/a.py"},
+                {"number": 2, "status": "pending", "evidence": "a sibling task fails"},
+            ],
+        }
+    )
+    code, _, err = writ("dispatch", "M01-001", "--agent", agent_reporting(payload))
+    assert code == 0
+    task = state.load(project)["tasks"]["M01-001"]
+    # the claim was lowered, so the task is failed rather than awaiting review
+    assert task["status"] == "failed"
+    # and the evidence for the bar that was met survived
+    assert task["acceptances"][0]["status"] == "passed"
+    assert task["acceptances"][0]["evidence"] == "pytest tests/a.py"
+    assert task["acceptances"][1]["status"] == "pending"
+    # the next agent on this task reads the task, so the mismatch is recorded there
+    assert any("writ recorded 'incomplete'" in e["text"] for e in task["evidence"])
+    assert "criteria 2 are not passed" in err
+    run = next(iter(state.load(project)["runs"].values()))
+    # applied, not rejected: this is not the unusable-verdict path
+    assert not run.get("verdict_error")
+    assert run["resulting_status"] == "failed"
+    assert "writ recorded 'incomplete'" in run["verdict_downgraded"]
+
+
 def test_an_unusable_verdict_is_recorded_differently_from_a_missing_one(
     planned, writ, project
 ):
@@ -300,7 +367,13 @@ def test_passing_a_criterion_requires_evidence():
         verdict.parse(payload)
 
 
-def test_claiming_complete_with_unmet_criteria_is_rejected():
+def test_claiming_complete_with_unmet_criteria_is_lowered_not_discarded():
+    """The criteria win, because they are the part carrying evidence.
+
+    Rejecting the whole verdict here used to throw away three honest
+    per-criterion reports over one wrong summary field, leaving a task that was
+    mostly done looking untouched.
+    """
     payload = json.dumps(
         {
             "outcome": "complete",
@@ -310,19 +383,38 @@ def test_claiming_complete_with_unmet_criteria_is_rejected():
             ],
         }
     )
-    with pytest.raises(WritError, match="outcome is 'complete' but criteria 2"):
-        verdict.parse(payload)
+    parsed = verdict.parse(payload)
+    assert parsed.outcome == "incomplete"
+    assert parsed.downgraded and "criteria 2 are not passed" in parsed.downgraded
+    # nothing the agent did not itself mark passed is credited
+    assert parsed.passed == [1]
+    assert parsed.unmet == [2]
 
 
-def test_accepting_a_review_with_unmet_criteria_is_rejected():
+def test_accepting_a_review_with_unmet_criteria_becomes_a_rejection():
+    """Lowering an accept to a reject is the conservative direction."""
     payload = json.dumps(
         {
             "decision": "accept",
             "criteria": [{"number": 1, "status": "pending", "evidence": "unsure"}],
         }
     )
-    with pytest.raises(WritError, match="decision is 'accept' but criteria 1"):
-        verdict.parse(payload, role="reviewer")
+    parsed = verdict.parse(payload, role="reviewer")
+    assert parsed.decision == "reject"
+    assert parsed.outcome == "incomplete"
+    assert "criteria 1 are not passed" in parsed.downgraded
+
+
+def test_a_claim_that_matches_its_criteria_is_not_downgraded():
+    payload = json.dumps(
+        {
+            "outcome": "complete",
+            "criteria": [{"number": 1, "status": "passed", "evidence": "ran it"}],
+        }
+    )
+    parsed = verdict.parse(payload)
+    assert parsed.outcome == "complete"
+    assert parsed.downgraded is None
 
 
 def test_blocked_requires_saying_what_blocked_it():

@@ -114,6 +114,10 @@ export interface RunRow {
   verdict_error: string;
   /** Set when the agent wrote no verdict at all, which exit 0 does not reveal. */
   no_verdict: string;
+  /** True when it also printed nothing, meaning it likely never ran at all. */
+  no_output: boolean;
+  /** Set when writ lowered a headline claim its own criteria contradicted. */
+  verdict_downgraded: string;
   decision: string;
   summary: string;
   unmet: number[];

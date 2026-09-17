@@ -80,6 +80,11 @@ Rules:
 - Each task states 2 to 6 acceptance criteria. Every criterion must be checkable:
   name the command, the observable behavior, or the artifact it produces.
   "Works correctly" and "code is clean" are not criteria.
+- A criterion must be meetable by this task alone. Do not set a bar that depends
+  on work outside its `allowed` list: on a fenced task, "the whole suite passes"
+  is not such a bar, because tasks run in parallel and a sibling's half-finished
+  module fails it for reasons this agent may not touch. Scope it to what the task
+  owns — name the test file or the command that exercises this change.
 - Prefer bars the document already states, in its own wording. Add your own only
   where the document is silent, and keep them consistent with it. Do not invent
   requirements the document does not support.

@@ -636,6 +636,11 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
                     "unmet": reported.unmet,
                     "decisions": [p.title for p in reported.decisions],
                 }
+                if reported.downgraded:
+                    # A claim writ lowered is not an unusable verdict: it was
+                    # applied, just not as claimed. Kept in its own field so
+                    # neither reads as the other.
+                    run["verdict_downgraded"] = reported.downgraded
                 status = verdict.apply(data, task, reported, actor=actor)
                 run["resulting_status"] = status
                 refresh_milestones(data)
@@ -652,6 +657,23 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
         reason = "exited without writing a usable verdict" + (
             f" ({note})" if note else ""
         )
+        # An agent that printed nothing did not "forget to report" — it almost
+        # certainly never ran. Recorded as a separate field so the run says which
+        # of the two happened; the reason string is the operator-facing sentence
+        # and carries it too, because that is what the dashboard shows.
+        #
+        # Not for a timeout (124) or a run that already carries a note: a killed
+        # agent is a hang, not a failed invocation, and a note already says what
+        # went wrong. Guessing over either would replace a true explanation with
+        # a plausible wrong one.
+        silent = code != 124 and not note and not produced_output(directory)
+        if silent:
+            run["no_output"] = True
+            reason += (
+                " — and printed no output at all, so it most likely never "
+                "reached a model (unknown model id, missing provider "
+                "credentials, or exhausted quota)"
+            )
         # On the run as well as the task. `dispatch` explains this at the time,
         # but a run read later is the confusing case: exit 0, status completed,
         # and nothing moved. Without this the record cannot answer why.
@@ -665,6 +687,7 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
         add_evidence(
             task,
             f"run {run_id} exited {code} without a usable verdict"
+            + (" and without any output" if silent else "")
             + (f" ({note})" if note else ""),
             actor="writ",
         )
@@ -681,11 +704,21 @@ def _actor(run: dict[str, Any]) -> str:
     return f"{role}({name})"
 
 
-def verdict_summary(root: Path, run_id: str) -> tuple[str | None, str | None]:
-    """The status a run produced and any verdict error, for the CLI to report."""
+def verdict_summary(
+    root: Path, run_id: str
+) -> tuple[str | None, str | None, str | None]:
+    """The status a run produced, any verdict error, and any downgrade.
+
+    Three values because they are three different things to report: what writ
+    did, a verdict it could not use, and a claim it had to lower.
+    """
     data = state.load(root)
     run = data["runs"].get(run_id) or {}
-    return run.get("resulting_status"), run.get("verdict_error")
+    return (
+        run.get("resulting_status"),
+        run.get("verdict_error"),
+        run.get("verdict_downgraded"),
+    )
 
 
 def detach(root: Path, run_id: str) -> int:

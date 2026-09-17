@@ -340,6 +340,9 @@ def test_a_run_that_wrote_no_verdict_says_so_on_the_record(writ, design, project
     detail = api.run(data, project, run_id)
     assert detail["exit_code"] == 0
     assert "without writing a usable verdict" in detail["no_verdict"]
+    # `true` says nothing, which is a failed invocation rather than an agent that
+    # worked and skipped its report. The page needs the two apart.
+    assert detail["no_output"] is True
     # Distinct from a verdict that was written and rejected.
     assert detail["verdict_error"] == ""
     assert state.load(project)["tasks"]["M01-001"]["status"] == "planned"

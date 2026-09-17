@@ -284,6 +284,13 @@ def _run_row(run: dict[str, Any]) -> dict[str, Any]:
         # Distinct from verdict_error: nothing was written, rather than something
         # unusable. The confusing case on a page, because exit 0 looks fine.
         "no_verdict": run.get("no_verdict") or "",
+        # ...and within that, whether the agent said anything at all. A silent
+        # exit is a failed invocation, not a skipped report, and the two have
+        # completely different remedies.
+        "no_output": bool(run.get("no_output")),
+        # A claim writ lowered to match the criteria. Not an error: the verdict
+        # was applied, just not as headlined.
+        "verdict_downgraded": run.get("verdict_downgraded") or "",
         "decision": reported.get("decision") or reported.get("outcome") or "",
         "summary": reported.get("summary") or "",
         "unmet": reported.get("unmet", []),

@@ -279,6 +279,21 @@ def test_dispatch_timeout_explains_a_likely_interactive_agent(planned, writ):
     assert "interactive session" in err
 
 
+def test_a_killed_agent_is_not_reported_as_one_that_never_started(
+    planned, writ, project
+):
+    """A hang and a failed invocation both leave an empty transcript.
+
+    They have opposite remedies — raise the timeout, or fix the model and
+    credentials — so the silent-exit explanation must not claim a killed agent
+    never ran.
+    """
+    writ("dispatch", "M01-001", "--agent", SLEEP, "--timeout", "1")
+    run = next(iter(state.load(project)["runs"].values()))
+    assert not run.get("no_output")
+    assert "never reached a model" not in (run.get("no_verdict") or "")
+
+
 def test_dispatch_mirrors_agent_output_live(planned, writ):
     """A long implementation run must look alive, not hung."""
     chatty = (

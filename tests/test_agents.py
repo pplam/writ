@@ -130,6 +130,26 @@ def test_hang_hint_for_a_known_agent_blames_something_else():
     assert "pi -p" in hint
 
 
+def test_a_silent_exit_is_blamed_on_the_invocation_not_the_report():
+    """An agent CLI that cannot reach its model exits 0 and says nothing.
+
+    Writ's own reading of that run is "no verdict", which sends the operator to
+    the transcript. The transcript is empty, so the hint has to redirect them to
+    the model and the credentials instead.
+    """
+    hint = agents.silent_exit_hint(agents.resolve("pi", model="vendor/some-model"), 0)
+    assert "never ran" in hint
+    assert "pi -p --model vendor/some-model" in hint
+    assert "authenticated" in hint
+
+
+def test_the_silent_exit_hint_omits_model_advice_for_an_agent_without_one():
+    """No model flag means writ cannot suggest checking one."""
+    hint = agents.silent_exit_hint(agents.resolve("amp"), 0)
+    assert "by hand" in hint
+    assert "authenticated" not in hint
+
+
 # --------------------------------------------------------------------------
 # the agents command
 

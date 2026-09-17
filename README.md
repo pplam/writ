@@ -449,12 +449,37 @@ exited without writing a usable verdict — so its acceptance criteria were left
 untouched, and the task was returned to the queue rather than judged
 ```
 
+When the transcript is empty too, writ says so rather than sending you to read
+nothing. An agent CLI that cannot reach its model often reports that as exit 0
+with no output, so a silent run is a failed invocation, not a skipped report:
+
+```
+PROBLEM
+exited without writing a usable verdict — and printed no output at all, so it
+most likely never reached a model (unknown model id, missing provider
+credentials, or exhausted quota)
+```
+
 A verdict that was written but rejected says which field was wrong:
 
 ```
 PROBLEM
 .writ/runs/M01-002-.../verdict.json: outcome is 'blocked' but blocked_on is empty
 ```
+
+A headline claim the criteria under it contradict is lowered rather than thrown
+away. An agent that meets three bars of four, says which with evidence, and then
+heads its report `complete` got one field wrong and three right; writ records
+`incomplete`, keeps the evidence for the three, and says what it did:
+
+```
+PROBLEM
+outcome was 'complete' but criteria 4 are not passed, so writ recorded 'incomplete'
+```
+
+Nothing the agent did not itself mark `passed` is ever credited, so the
+adjustment only lowers a claim. It is on the task's own log too, because the next
+agent to pick the task up is the one that needs to know.
 
 ### The graph, live
 
