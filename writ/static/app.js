@@ -1,4 +1,4 @@
-/* built from ui/src (9a4e352c695e) */
+/* built from ui/src (65e05caa8a3c) */
 /*
  * writ dashboard — compiled from ui/src by ui/build.mjs.
  * Do not edit: change the TypeScript and rebuild.
@@ -456,76 +456,125 @@ function fitTitles(host) {
 /**
  * The overview: where the project stands, what is happening now, what it cost.
  *
+ * Laid out as two regions rather than a bag of equal cards, because the cards
+ * are not equal shapes. Progress, live agents, decisions and throughput are
+ * fixed-height summaries; milestones and activity are lists that grow with the
+ * project. Flowing all six through one `auto-fit` grid gave the timeline a
+ * third of the width and made it eight hundred pixels tall while two thirds of
+ * the row sat empty. So: a summary band across the top, then a two-column split
+ * with the lists side by side.
+ *
  * Ordered by what a reader needs first. Live agents come before totals because
  * during a run that is the only volatile thing on the page; proposed decisions
  * come next because they are the one class of work no `writ run` will ever
  * clear, so a project can sit there quietly blocked on a human.
  */
+const STATUS_ORDER = [
+    'running',
+    'reviewing',
+    'awaiting-review',
+    'ready',
+    'planned',
+    'blocked',
+    'failed',
+    'cancelled',
+    'completed',
+];
 function renderOverview(host, snapshot, handlers) {
     const { overview } = snapshot;
-    replace(host, progressCard(overview), liveCard(overview, handlers), decisionsCard(overview, handlers), throughputCard(overview), milestonesCard(overview), activityCard(snapshot.activity, handlers));
+    replace(host, el('div', { class: 'ov-band' }, progressCard(overview), liveCard(overview, handlers), attentionCard(overview, handlers)), el('div', { class: 'ov-split' }, el('div', { class: 'ov-column' }, milestonesCard(overview, handlers), throughputCard(overview)), activityCard(snapshot.activity, handlers)));
 }
 function card(title, ...body) {
     return el('section', { class: 'card' }, el('h2', {}, title), ...body);
 }
+/** A card whose heading carries a count, so the title is not a lie when empty. */
+function countedCard(title, count, ...body) {
+    return el('section', { class: 'card' }, el('h2', {}, title, count ? el('span', { class: 'h2-count' }, String(count)) : null), ...body);
+}
 function progressCard(overview) {
     const done = percent(overview.completed, overview.tasks);
-    const order = [
-        'running',
-        'reviewing',
-        'awaiting-review',
-        'ready',
-        'planned',
-        'blocked',
-        'failed',
-        'cancelled',
-        'completed',
-    ];
-    return card('Progress', el('div', { class: 'headline' }, el('span', { class: 'big' }, `${done}%`), el('span', { class: 'muted' }, `${overview.completed} of ${plural(overview.tasks, 'task')} complete`)), el('div', { class: 'meter' }, el('div', { class: 'meter-fill', style: `width:${done}%` })), el('ul', { class: 'chips' }, ...order
-        .filter((status) => overview.counts[status])
-        .map((status) => el('li', { class: classes('chip', status) }, el('span', { class: 'chip-mark' }, mark(status)), String(overview.counts[status]), el('span', { class: 'chip-label' }, status)))));
+    return el('section', { class: 'card ov-progress' }, el('h2', {}, 'Progress'), el('div', { class: 'headline' }, el('span', { class: 'big' }, `${done}%`), el('span', { class: 'muted' }, `${overview.completed} of ${plural(overview.tasks, 'task')} complete`)), el('div', { class: 'meter' }, el('div', { class: 'meter-fill', style: `width:${done}%` })), el('ul', { class: 'chips' }, ...STATUS_ORDER.filter((status) => overview.counts[status]).map((status) => el('li', { class: classes('chip', status) }, el('span', { class: 'chip-mark' }, mark(status)), el('b', {}, String(overview.counts[status])), el('span', { class: 'chip-label' }, status)))));
 }
 function liveCard(overview, handlers) {
     const rows = overview.active_runs;
-    return card(rows.length ? `Working now (${rows.length})` : 'Working now', rows.length
+    return countedCard('Working now', rows.length, rows.length
         ? el('ul', { class: 'run-list' }, ...rows.map((run) => liveRow(run, handlers)))
-        : el('p', { class: 'muted' }, 'No agents running.'));
+        : el('p', { class: 'blank' }, 'No agents running.'));
 }
 function liveRow(run, handlers) {
-    const verb = run.role === 'reviewer' ? 'review' : 'dispatch';
-    const row = el('li', { class: 'run-row live' }, el('span', { class: 'spinner', 'aria-hidden': 'true' }), el('button', { class: 'link', type: 'button' }, run.task), el('span', { class: 'verb' }, verb), el('span', { class: 'muted mono' }, run.model || run.command), el('span', { class: 'grow' }), el('span', { class: 'muted', title: run.started_at ?? '' }, duration(run.duration)));
+    const row = el('li', { class: 'run-row live' }, el('span', { class: 'spinner', 'aria-hidden': 'true' }), el('button', { class: 'link', type: 'button' }, run.task), el('span', { class: 'verb' }, run.role === 'reviewer' ? 'review' : 'dispatch'), el('span', { class: 'grow' }), el('span', { class: 'muted mono small clip' }, run.model || run.command), el('span', { class: 'muted tnum', title: run.started_at ?? '' }, duration(run.duration)));
     row.querySelector('button')?.addEventListener('click', () => handlers.onTask(run.task));
     return row;
 }
-function decisionsCard(overview, handlers) {
-    const count = overview.proposed_decisions;
-    if (!count) {
-        return card('Decisions', el('p', { class: 'muted' }, 'Nothing waiting on a ruling.'));
+/**
+ * What is waiting on a human. Proposed decisions and failures both qualify:
+ * neither will clear on its own, and both are easy to miss while a run is
+ * printing progress.
+ */
+function attentionCard(overview, handlers) {
+    const proposals = overview.proposed_decisions;
+    const failed = overview.counts.failed ?? 0;
+    const review = overview.counts['awaiting-review'] ?? 0;
+    if (!proposals && !failed && !review) {
+        return card('Waiting on you', el('p', { class: 'blank' }, 'Nothing needs a human.'));
     }
-    const button = el('button', { class: 'link', type: 'button' }, `${plural(count, 'decision')} waiting on you`);
-    button.addEventListener('click', () => handlers.onGoto('decisions'));
-    return card('Decisions', el('p', { class: 'warn' }, button), el('p', { class: 'muted small' }, 'Proposals stay inert until confirmed, so no run will clear them.'));
+    const link = (label, view, kind) => {
+        const button = el('button', { class: classes('need', kind), type: 'button' }, label);
+        button.addEventListener('click', () => handlers.onGoto(view));
+        return button;
+    };
+    return countedCard('Waiting on you', proposals + failed, el('div', { class: 'needs' }, proposals
+        ? link(`${plural(proposals, 'decision')} to rule on`, 'decisions', 'review')
+        : null, failed ? link(`${plural(failed, 'task')} failed`, 'tasks', 'bad') : null, 
+    // Not a human's job, but worth distinguishing from idle: a run will pick
+    // these up, so they are listed without the urgent styling.
+    review ? link(`${review} awaiting review`, 'tasks', 'calm') : null), proposals
+        ? el('p', { class: 'muted small' }, 'Proposals stay inert until confirmed, so no run will clear them.')
+        : null);
 }
 function throughputCard(overview) {
     const t = overview.throughput;
     const stat = (label, value, hint) => el('div', { class: 'stat' }, el('span', { class: 'stat-value' }, value), el('span', { class: 'stat-label' }, label), hint ? el('span', { class: 'stat-hint' }, hint) : null);
-    return card('Agent work', el('div', { class: 'stats' }, stat('agent runs', String(t.runs)), stat('time in agents', duration(t.agent_seconds)), stat('median run', duration(t.median_seconds)), stat('reviews', String(t.reviews), t.reviews ? `${t.rejected} rejected` : undefined), stat('failed runs', String(t.failures))));
+    return card('Agent work', el('div', { class: 'stats' }, stat('runs', String(t.runs)), stat('in agents', duration(t.agent_seconds)), stat('median run', duration(t.median_seconds)), stat('reviews', String(t.reviews), t.reviews ? `${t.rejected} rejected` : undefined), stat('failed', String(t.failures))));
 }
-function milestonesCard(overview) {
-    return card('Milestones', overview.milestones.length
-        ? el('ul', { class: 'milestone-list' }, ...overview.milestones.map((m) => {
-            const done = percent(m.done, m.total);
-            return el('li', { class: 'milestone' }, el('span', { class: 'mark' }, mark(m.status)), code(m.id), el('span', { class: 'title' }, m.title), el('span', { class: 'grow' }), el('span', { class: 'muted mono' }, ratio(m.done, m.total)), el('div', { class: 'meter thin' }, el('div', { class: 'meter-fill', style: `width:${done}%` })));
-        }))
-        : el('p', { class: 'muted' }, 'No milestones.'));
+function milestonesCard(overview, handlers) {
+    const button = el('button', { class: 'link small', type: 'button' }, 'all milestones');
+    button.addEventListener('click', () => handlers.onGoto('milestones'));
+    return el('section', { class: 'card' }, el('h2', {}, 'Milestones', el('span', { class: 'grow' }), button), overview.milestones.length
+        ? el('ul', { class: 'milestone-list' }, ...overview.milestones.map((m) => milestoneRow(m, handlers)))
+        : el('p', { class: 'blank' }, 'No milestones.'));
+}
+/**
+ * A milestone as a grid row, not a flex line. The parts have wildly different
+ * widths — a two-word title next to a long one — and flex-wrap turned that into
+ * a ragged block per milestone. A grid keeps id, bar and count in a column.
+ */
+function milestoneRow(m, handlers) {
+    const done = percent(m.done, m.total);
+    const row = el('li', { class: classes('milestone', m.status, 'clickable'), tabindex: 0, role: 'button' }, el('span', { class: classes('mark', m.status) }, mark(m.status)), code(m.id), el('span', { class: 'title clip' }, m.title), el('div', { class: 'meter thin' }, el('div', { class: 'meter-fill', style: `width:${done}%` })), el('span', { class: 'muted mono tnum' }, ratio(m.done, m.total)));
+    const open = () => handlers.onGoto('milestones');
+    row.addEventListener('click', open);
+    row.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            open();
+        }
+    });
+    return row;
 }
 function activityCard(events, handlers) {
-    return card('Recent activity', events.length
-        ? el('ol', { class: 'activity' }, ...events.slice(0, 14).map((e) => activityRow(e, handlers)))
-        : el('p', { class: 'muted' }, 'Nothing has happened yet.'));
+    return el('section', { class: 'card ov-activity' }, el('h2', {}, 'Recent activity'), events.length
+        ? el('ol', { class: 'activity' }, ...events.slice(0, 24).map((e) => activityRow(e, handlers)))
+        : el('p', { class: 'blank' }, 'Nothing has happened yet.'));
 }
+/**
+ * Two lines, not one. The event text and its summary were competing for a
+ * single ellipsised row, which cut both; the summary is the agent's own sentence
+ * about what it did, so it gets its own line under the event.
+ */
 function activityRow(event, handlers) {
-    const row = el('li', { class: classes('event', event.kind, isLive(event.status) && 'live') }, el('span', { class: 'mark' }, mark(event.status)), el('span', { class: 'when', title: event.at }, clock(event.at)), el('span', { class: 'what' }, event.text), event.summary ? el('span', { class: 'muted small' }, event.summary) : null, el('span', { class: 'grow' }), el('span', { class: 'muted small' }, ago(event.at)));
+    const row = el('li', { class: classes('event', event.kind, isLive(event.status) && 'live') }, el('span', { class: classes('mark', event.status) }, mark(event.status)), el('div', { class: 'event-body' }, el('div', { class: 'event-line' }, el('span', { class: 'what' }, event.text), el('span', { class: 'grow' }), el('span', { class: 'when muted', title: event.at }, ago(event.at))), event.summary ? el('p', { class: 'event-summary' }, event.summary) : null));
+    row.setAttribute('title', `${clock(event.at)} · ${event.text}`);
     if (event.run) {
         row.classList.add('clickable');
         row.addEventListener('click', () => handlers.onRun(event.run));
@@ -583,64 +632,79 @@ function taskRow(task, isSelected, handlers) {
     return row;
 }
 function renderTaskDetail(host, task, handlers) {
-    replace(host, el('header', { class: 'detail-head' }, el('span', { class: classes('mark', task.status) }, mark(task.status)), code(task.id), el('h2', {}, task.title), el('span', { class: classes('pill', task.status) }, task.status)), metaRow(task), acceptanceSection(task), task.notes ? section('Notes', el('p', { class: 'prose' }, task.notes)) : null, guardrailSection(task), dependencySection(task), runSection(task, handlers), evidenceSection(task));
+    replace(host, el('header', { class: 'detail-head' }, el('div', { class: 'detail-title' }, el('span', { class: classes('mark', task.status) }, mark(task.status)), code(task.id), el('span', { class: classes('pill', task.status) }, task.status)), el('h2', {}, task.title)), metaRow(task), acceptanceSection(task), task.notes ? section('Notes', el('p', { class: 'prose' }, task.notes)) : null, dependencySection(task), guardrailSection(task), runSection(task, handlers), evidenceSection(task));
 }
 function section(title, ...body) {
     return el('section', { class: 'detail-section' }, el('h3', {}, title), ...body);
 }
+/**
+ * Where this task came from. Rendered as discrete labelled items: these used to
+ * be bare spans separated only by a flex gap, so a milestone id ran straight
+ * into a design section and then into a file path with nothing to show where
+ * one ended and the next began.
+ */
 function metaRow(task) {
+    const item = (label, value, mono = false) => el('div', { class: 'meta-item' }, el('span', { class: 'meta-label' }, label), typeof value === 'string'
+        ? el('span', { class: classes('meta-value', mono && 'mono') }, value)
+        : el('span', { class: 'meta-value' }, value));
     const bits = [];
     if (task.milestone)
-        bits.push(el('span', {}, 'milestone ', code(task.milestone)));
+        bits.push(item('milestone', code(task.milestone)));
     if (task.design_section)
-        bits.push(el('span', {}, `§ ${task.design_section}`));
+        bits.push(item('section', task.design_section));
     if (task.design_doc)
-        bits.push(el('span', { class: 'mono small' }, task.design_doc));
-    bits.push(el('span', { title: task.updated_at }, `updated ${ago(task.updated_at)}`));
-    return el('div', { class: 'meta-row' }, ...bits);
+        bits.push(item('design', basename(task.design_doc), true));
+    bits.push(item('updated', ago(task.updated_at)));
+    const row = el('div', { class: 'meta-row' }, ...bits);
+    if (task.design_doc)
+        row.setAttribute('title', task.design_doc);
+    return row;
+}
+/** The path is usually long and usually irrelevant past the filename. */
+function basename(path) {
+    const parts = path.split('/');
+    return parts[parts.length - 1] || path;
 }
 function acceptanceSection(task) {
     if (!task.acceptances.length) {
-        return section('Acceptance', el('p', { class: 'muted' }, 'No criteria recorded.'));
+        return section('Acceptance', el('p', { class: 'blank' }, 'No criteria recorded.'));
     }
-    return section(`Acceptance (${ratio(task.passed, task.total)})`, el('ol', { class: 'criteria' }, ...task.acceptances.map(criterion)));
+    return section(`Acceptance · ${ratio(task.passed, task.total)} passed`, el('ol', { class: 'criteria' }, ...task.acceptances.map(criterion)));
 }
 function criterion(item) {
-    return el('li', { class: classes('criterion', item.status) }, el('div', { class: 'criterion-head' }, el('span', { class: 'mark' }, item.status === 'passed' ? '+' : item.status === 'failed' ? '×' : '·'), el('span', { class: 'criterion-text' }, item.text), el('span', { class: classes('pill', item.status) }, item.status)), 
+    return el('li', { class: classes('criterion', item.status) }, el('div', { class: 'criterion-head' }, 
+    // ASCII, matching the terminal's marks rather than inventing typographic
+    // ones for this one spot.
+    el('span', { class: classes('mark', item.status) }, item.status === 'passed' ? '+' : item.status === 'failed' ? 'x' : '·'), el('span', { class: 'criterion-text' }, item.text), el('span', { class: classes('pill', item.status) }, item.status)), 
     // Evidence is the point of a criterion: a claim with nothing behind it is
     // exactly what the reviewer is there to catch, so it is shown, not hidden.
-    item.evidence ? el('p', { class: 'evidence' }, item.evidence) : null, item.by ? el('p', { class: 'muted small', title: item.at }, `${item.by} · ${ago(item.at)}`) : null);
+    item.evidence ? el('p', { class: 'evidence' }, item.evidence) : null, item.by
+        ? el('p', { class: 'criterion-by muted small', title: item.at }, el('span', { class: 'actor' }, item.by), el('span', {}, ago(item.at)))
+        : null);
 }
 function guardrailSection(task) {
     if (!task.allowed.length && !task.forbidden.length)
         return null;
-    return section('Guardrails', task.allowed.length
-        ? el('div', { class: 'rail allowed' }, el('h4', {}, 'may touch'), el('ul', {}, ...task.allowed.map((p) => el('li', { class: 'mono' }, p))))
-        : null, task.forbidden.length
-        ? el('div', { class: 'rail forbidden' }, el('h4', {}, 'must not touch'), el('ul', {}, ...task.forbidden.map((p) => el('li', { class: 'mono' }, p))))
-        : null);
+    const rail = (kind, heading, paths) => el('div', { class: classes('rail', kind) }, el('h4', {}, heading), el('ul', {}, ...paths.map((p) => el('li', { class: 'mono' }, p))));
+    return section('Guardrails', el('div', { class: 'rails' }, task.allowed.length ? rail('allowed', 'may touch', task.allowed) : null, task.forbidden.length ? rail('forbidden', 'must not touch', task.forbidden) : null));
 }
 function dependencySection(task) {
     if (!task.depends_on.length && !task.blocks.length && !task.unknown_deps.length)
         return null;
-    const list = (ids) => el('div', { class: 'dep-line' }, ...ids.map((id) => code(id)));
-    return section('Dependencies', task.depends_on.length
-        ? el('div', {}, el('h4', {}, 'after'), list(task.depends_on))
-        : null, task.blocked_by.length
-        ? el('div', {}, el('h4', { class: 'warn' }, 'still waiting on'), list(task.blocked_by))
-        : null, task.blocks.length ? el('div', {}, el('h4', {}, 'blocks'), list(task.blocks)) : null, 
+    const group = (heading, ids, kind) => el('div', { class: 'dep-group' }, el('h4', { class: classes(kind) }, heading), el('div', { class: 'dep-line' }, ...ids.map((id) => code(id))));
+    return section('Dependencies', el('div', { class: 'deps' }, task.depends_on.length ? group('runs after', task.depends_on) : null, task.blocked_by.length ? group('still waiting on', task.blocked_by, 'warn') : null, task.blocks.length ? group('blocks', task.blocks) : null, 
     // A dangling id means this task can never become ready. Say so here rather
     // than letting it sit in the list looking merely slow.
     task.unknown_deps.length
-        ? el('div', {}, el('h4', { class: 'error' }, 'missing, so this can never become ready'), list(task.unknown_deps))
-        : null);
+        ? group('missing, so this can never become ready', task.unknown_deps, 'error')
+        : null));
 }
 function runSection(task, handlers) {
     if (!task.run_list.length) {
-        return section('Runs', el('p', { class: 'muted' }, 'Never dispatched.'));
+        return section('Runs', el('p', { class: 'blank' }, 'Never dispatched.'));
     }
-    return section(`Runs (${task.run_list.length})`, el('ul', { class: 'run-list' }, ...[...task.run_list].reverse().map((run) => {
-        const row = el('li', { class: classes('run-row', run.status, isLive(run.status) && 'live', 'clickable') }, el('span', { class: 'mark' }, mark(run.status)), el('span', { class: 'verb' }, run.role === 'reviewer' ? 'review' : 'dispatch'), code(run.id), el('span', { class: 'muted mono small' }, run.model || run.command), el('span', { class: 'grow' }), run.decision ? el('span', { class: classes('pill', run.decision) }, run.decision) : null, el('span', { class: 'muted small', title: run.started_at ?? '' }, ago(run.started_at)));
+    return section(`Runs · ${task.run_list.length}`, el('ul', { class: 'run-list' }, ...[...task.run_list].reverse().map((run) => {
+        const row = el('li', { class: classes('run-row', run.status, isLive(run.status) && 'live', 'clickable') }, el('span', { class: classes('mark', run.status) }, mark(run.status)), el('span', { class: 'verb' }, run.role === 'reviewer' ? 'review' : 'dispatch'), el('span', { class: 'grow' }), run.decision ? el('span', { class: classes('pill', run.decision) }, run.decision) : null, el('span', { class: 'muted mono small clip' }, run.model || run.command), el('span', { class: 'muted small tnum', title: run.started_at ?? '' }, ago(run.started_at)));
         row.addEventListener('click', () => handlers.onRun(run.id));
         return row;
     })));
@@ -648,7 +712,7 @@ function runSection(task, handlers) {
 function evidenceSection(task) {
     if (!task.evidence.length)
         return null;
-    return section('History', el('ol', { class: 'history' }, ...[...task.evidence].reverse().map((item) => el('li', {}, el('span', { class: 'muted small', title: item.at }, ago(item.at)), el('span', { class: 'actor' }, item.actor), el('span', {}, item.text)))));
+    return section('History', el('ol', { class: 'history' }, ...[...task.evidence].reverse().map((item) => el('li', {}, el('span', { class: 'actor' }, item.actor), el('span', { class: 'history-text' }, item.text), el('span', { class: 'grow' }), el('span', { class: 'muted small tnum', title: item.at }, ago(item.at))))));
 }
 
 // ---- views/runs.js ----
@@ -814,35 +878,49 @@ function ruling(decision) {
  *
  * A milestone is how the design document was divided, so this is the view that
  * answers "how far through the plan are we" rather than "what is running". Tasks
- * are shown in id order here, not sorted by status, because within a milestone
- * the numbering is the intended sequence.
+ * are shown in id order, not sorted by status, because within a milestone the
+ * numbering is the intended sequence — and a milestone whose tasks jumped around
+ * as agents worked would be unreadable as a plan.
+ *
+ * The header is a grid rather than a wrapping flex line. Everything after the
+ * title used to wrap under it at narrow widths, so the count and the status
+ * pill ended up in a second row that looked like content.
  */
 function renderMilestones(host, milestones, tasks, handlers) {
     if (!milestones.length) {
         host.replaceChildren(el('p', { class: 'empty' }, 'No milestones yet.'));
         return;
     }
-    host.replaceChildren(...milestones.map((milestone) => {
-        const own = tasks
-            .filter((task) => task.milestone === milestone.id)
-            .sort((a, b) => a.id.localeCompare(b.id));
-        const done = percent(milestone.done, milestone.total);
-        return el('section', { class: classes('card milestone-card', milestone.status) }, el('header', { class: 'milestone-head' }, el('span', { class: 'mark' }, mark(milestone.status)), code(milestone.id), el('h2', {}, milestone.title), el('span', { class: classes('pill', milestone.status) }, milestone.status), el('span', { class: 'grow' }), el('span', { class: 'muted mono' }, ratio(milestone.done, milestone.total))), el('div', { class: 'meter' }, el('div', { class: 'meter-fill', style: `width:${done}%` })), el('ul', { class: 'task-list compact' }, ...own.map((task) => {
-            const row = el('li', {
-                class: classes('task-row', task.status, 'clickable'),
-                tabindex: 0,
-                role: 'button',
-            }, el('span', { class: 'mark' }, mark(task.status)), code(task.id), el('span', { class: 'title' }, task.title), el('span', { class: 'grow' }), el('span', { class: 'muted mono' }, ratio(task.passed, task.total)), el('span', { class: classes('pill', task.status) }, task.status));
-            row.addEventListener('click', () => handlers.onTask(task.id));
-            row.addEventListener('keydown', (event) => {
-                if (event.key === 'Enter' || event.key === ' ') {
-                    event.preventDefault();
-                    handlers.onTask(task.id);
-                }
-            });
-            return row;
-        })));
-    }));
+    host.replaceChildren(...milestones.map((milestone) => milestoneCard(milestone, tasks, handlers)));
+}
+function milestoneCard(milestone, tasks, handlers) {
+    const own = tasks
+        .filter((task) => task.milestone === milestone.id)
+        .sort((a, b) => a.id.localeCompare(b.id));
+    const done = percent(milestone.done, milestone.total);
+    const left = milestone.total - milestone.done;
+    return el('section', { class: classes('card milestone-card', milestone.status) }, el('header', { class: 'milestone-head' }, el('span', { class: classes('mark', milestone.status) }, mark(milestone.status)), code(milestone.id), el('h2', { class: 'clip' }, milestone.title), el('span', { class: classes('pill', milestone.status) }, milestone.status), el('div', { class: 'milestone-progress' }, el('div', { class: 'meter thin' }, el('div', { class: 'meter-fill', style: `width:${done}%` })), el('span', { class: 'muted mono tnum' }, `${ratio(milestone.done, milestone.total)}`))), own.length
+        ? el('ul', { class: 'task-list compact' }, ...own.map((task) => milestoneTaskRow(task, handlers)))
+        : el('p', { class: 'blank' }, 'No tasks in this milestone.'), left
+        ? el('p', { class: 'milestone-foot muted small' }, `${plural(left, 'task')} left`)
+        : null);
+}
+function milestoneTaskRow(task, handlers) {
+    const row = el('li', {
+        class: classes('task-row', task.status, 'clickable'),
+        tabindex: 0,
+        role: 'button',
+    }, el('span', { class: classes('mark', task.status) }, mark(task.status)), code(task.id), el('span', { class: 'title clip' }, task.title), el('span', { class: 'grow' }), task.blocked_by.length
+        ? el('span', { class: 'muted small', title: `waiting on ${task.blocked_by.join(', ')}` }, `waits on ${task.blocked_by.length}`)
+        : null, el('span', { class: 'muted mono tnum' }, ratio(task.passed, task.total)), el('span', { class: classes('pill', task.status) }, task.status));
+    row.addEventListener('click', () => handlers.onTask(task.id));
+    row.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            handlers.onTask(task.id);
+        }
+    });
+    return row;
 }
 
 // ---- app.js ----
@@ -948,9 +1026,11 @@ class App {
         };
         switch (this.route.view) {
             case 'overview': {
-                const grid = el('div', { class: 'grid' });
-                renderOverview(grid, snapshot, handlers);
-                this.body.replaceChildren(grid);
+                // Not `.grid`: the overview lays out its own regions, and an auto-fit
+                // grid here would treat those regions as cards and column them.
+                const holder = el('div', { class: 'overview' });
+                renderOverview(holder, snapshot, handlers);
+                this.body.replaceChildren(holder);
                 break;
             }
             case 'graph': {

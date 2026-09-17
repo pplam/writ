@@ -158,9 +158,11 @@ class App {
 
     switch (this.route.view) {
       case 'overview': {
-        const grid = el('div', { class: 'grid' });
-        renderOverview(grid, snapshot, handlers);
-        this.body.replaceChildren(grid);
+        // Not `.grid`: the overview lays out its own regions, and an auto-fit
+        // grid here would treat those regions as cards and column them.
+        const holder = el('div', { class: 'overview' });
+        renderOverview(holder, snapshot, handlers);
+        this.body.replaceChildren(holder);
         break;
       }
       case 'graph': {

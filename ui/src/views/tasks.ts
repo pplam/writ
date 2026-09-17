@@ -90,16 +90,20 @@ export function renderTaskDetail(
     el(
       'header',
       { class: 'detail-head' },
-      el('span', { class: classes('mark', task.status) }, mark(task.status)),
-      code(task.id),
+      el(
+        'div',
+        { class: 'detail-title' },
+        el('span', { class: classes('mark', task.status) }, mark(task.status)),
+        code(task.id),
+        el('span', { class: classes('pill', task.status) }, task.status),
+      ),
       el('h2', {}, task.title),
-      el('span', { class: classes('pill', task.status) }, task.status),
     ),
     metaRow(task),
     acceptanceSection(task),
     task.notes ? section('Notes', el('p', { class: 'prose' }, task.notes)) : null,
-    guardrailSection(task),
     dependencySection(task),
+    guardrailSection(task),
     runSection(task, handlers),
     evidenceSection(task),
   );
@@ -109,21 +113,45 @@ function section(title: string, ...body: (Node | null | false)[]): HTMLElement {
   return el('section', { class: 'detail-section' }, el('h3', {}, title), ...body);
 }
 
+/**
+ * Where this task came from. Rendered as discrete labelled items: these used to
+ * be bare spans separated only by a flex gap, so a milestone id ran straight
+ * into a design section and then into a file path with nothing to show where
+ * one ended and the next began.
+ */
 function metaRow(task: Task): HTMLElement {
+  const item = (label: string, value: Node | string, mono = false) =>
+    el(
+      'div',
+      { class: 'meta-item' },
+      el('span', { class: 'meta-label' }, label),
+      typeof value === 'string'
+        ? el('span', { class: classes('meta-value', mono && 'mono') }, value)
+        : el('span', { class: 'meta-value' }, value),
+    );
+
   const bits: HTMLElement[] = [];
-  if (task.milestone) bits.push(el('span', {}, 'milestone ', code(task.milestone)));
-  if (task.design_section) bits.push(el('span', {}, `§ ${task.design_section}`));
-  if (task.design_doc) bits.push(el('span', { class: 'mono small' }, task.design_doc));
-  bits.push(el('span', { title: task.updated_at }, `updated ${ago(task.updated_at)}`));
-  return el('div', { class: 'meta-row' }, ...bits);
+  if (task.milestone) bits.push(item('milestone', code(task.milestone)));
+  if (task.design_section) bits.push(item('section', task.design_section));
+  if (task.design_doc) bits.push(item('design', basename(task.design_doc), true));
+  bits.push(item('updated', ago(task.updated_at)));
+  const row = el('div', { class: 'meta-row' }, ...bits);
+  if (task.design_doc) row.setAttribute('title', task.design_doc);
+  return row;
+}
+
+/** The path is usually long and usually irrelevant past the filename. */
+function basename(path: string): string {
+  const parts = path.split('/');
+  return parts[parts.length - 1] || path;
 }
 
 function acceptanceSection(task: Task): HTMLElement {
   if (!task.acceptances.length) {
-    return section('Acceptance', el('p', { class: 'muted' }, 'No criteria recorded.'));
+    return section('Acceptance', el('p', { class: 'blank' }, 'No criteria recorded.'));
   }
   return section(
-    `Acceptance (${ratio(task.passed, task.total)})`,
+    `Acceptance · ${ratio(task.passed, task.total)} passed`,
     el('ol', { class: 'criteria' }, ...task.acceptances.map(criterion)),
   );
 }
@@ -135,64 +163,82 @@ function criterion(item: Acceptance): HTMLElement {
     el(
       'div',
       { class: 'criterion-head' },
-      el('span', { class: 'mark' }, item.status === 'passed' ? '+' : item.status === 'failed' ? '×' : '·'),
+      // ASCII, matching the terminal's marks rather than inventing typographic
+      // ones for this one spot.
+      el(
+        'span',
+        { class: classes('mark', item.status) },
+        item.status === 'passed' ? '+' : item.status === 'failed' ? 'x' : '·',
+      ),
       el('span', { class: 'criterion-text' }, item.text),
       el('span', { class: classes('pill', item.status) }, item.status),
     ),
     // Evidence is the point of a criterion: a claim with nothing behind it is
     // exactly what the reviewer is there to catch, so it is shown, not hidden.
     item.evidence ? el('p', { class: 'evidence' }, item.evidence) : null,
-    item.by ? el('p', { class: 'muted small', title: item.at }, `${item.by} · ${ago(item.at)}`) : null,
-  );
-}
-
-function guardrailSection(task: Task): HTMLElement | null {
-  if (!task.allowed.length && !task.forbidden.length) return null;
-  return section(
-    'Guardrails',
-    task.allowed.length
-      ? el('div', { class: 'rail allowed' }, el('h4', {}, 'may touch'),
-          el('ul', {}, ...task.allowed.map((p) => el('li', { class: 'mono' }, p))))
-      : null,
-    task.forbidden.length
-      ? el('div', { class: 'rail forbidden' }, el('h4', {}, 'must not touch'),
-          el('ul', {}, ...task.forbidden.map((p) => el('li', { class: 'mono' }, p))))
-      : null,
-  );
-}
-
-function dependencySection(task: Task): HTMLElement | null {
-  if (!task.depends_on.length && !task.blocks.length && !task.unknown_deps.length) return null;
-  const list = (ids: string[]) =>
-    el('div', { class: 'dep-line' }, ...ids.map((id) => code(id)));
-  return section(
-    'Dependencies',
-    task.depends_on.length
-      ? el('div', {}, el('h4', {}, 'after'), list(task.depends_on))
-      : null,
-    task.blocked_by.length
-      ? el('div', {}, el('h4', { class: 'warn' }, 'still waiting on'), list(task.blocked_by))
-      : null,
-    task.blocks.length ? el('div', {}, el('h4', {}, 'blocks'), list(task.blocks)) : null,
-    // A dangling id means this task can never become ready. Say so here rather
-    // than letting it sit in the list looking merely slow.
-    task.unknown_deps.length
+    item.by
       ? el(
-          'div',
-          {},
-          el('h4', { class: 'error' }, 'missing, so this can never become ready'),
-          list(task.unknown_deps),
+          'p',
+          { class: 'criterion-by muted small', title: item.at },
+          el('span', { class: 'actor' }, item.by),
+          el('span', {}, ago(item.at)),
         )
       : null,
   );
 }
 
+function guardrailSection(task: Task): HTMLElement | null {
+  if (!task.allowed.length && !task.forbidden.length) return null;
+  const rail = (kind: string, heading: string, paths: string[]) =>
+    el(
+      'div',
+      { class: classes('rail', kind) },
+      el('h4', {}, heading),
+      el('ul', {}, ...paths.map((p) => el('li', { class: 'mono' }, p))),
+    );
+  return section(
+    'Guardrails',
+    el(
+      'div',
+      { class: 'rails' },
+      task.allowed.length ? rail('allowed', 'may touch', task.allowed) : null,
+      task.forbidden.length ? rail('forbidden', 'must not touch', task.forbidden) : null,
+    ),
+  );
+}
+
+function dependencySection(task: Task): HTMLElement | null {
+  if (!task.depends_on.length && !task.blocks.length && !task.unknown_deps.length) return null;
+  const group = (heading: string, ids: string[], kind?: string) =>
+    el(
+      'div',
+      { class: 'dep-group' },
+      el('h4', { class: classes(kind) }, heading),
+      el('div', { class: 'dep-line' }, ...ids.map((id) => code(id))),
+    );
+  return section(
+    'Dependencies',
+    el(
+      'div',
+      { class: 'deps' },
+      task.depends_on.length ? group('runs after', task.depends_on) : null,
+      task.blocked_by.length ? group('still waiting on', task.blocked_by, 'warn') : null,
+      task.blocks.length ? group('blocks', task.blocks) : null,
+      // A dangling id means this task can never become ready. Say so here rather
+      // than letting it sit in the list looking merely slow.
+      task.unknown_deps.length
+        ? group('missing, so this can never become ready', task.unknown_deps, 'error')
+        : null,
+    ),
+  );
+}
+
 function runSection(task: Task, handlers: TaskHandlers): HTMLElement {
   if (!task.run_list.length) {
-    return section('Runs', el('p', { class: 'muted' }, 'Never dispatched.'));
+    return section('Runs', el('p', { class: 'blank' }, 'Never dispatched.'));
   }
   return section(
-    `Runs (${task.run_list.length})`,
+    `Runs · ${task.run_list.length}`,
     el(
       'ul',
       { class: 'run-list' },
@@ -200,13 +246,12 @@ function runSection(task: Task, handlers: TaskHandlers): HTMLElement {
         const row = el(
           'li',
           { class: classes('run-row', run.status, isLive(run.status) && 'live', 'clickable') },
-          el('span', { class: 'mark' }, mark(run.status)),
+          el('span', { class: classes('mark', run.status) }, mark(run.status)),
           el('span', { class: 'verb' }, run.role === 'reviewer' ? 'review' : 'dispatch'),
-          code(run.id),
-          el('span', { class: 'muted mono small' }, run.model || run.command),
           el('span', { class: 'grow' }),
           run.decision ? el('span', { class: classes('pill', run.decision) }, run.decision) : null,
-          el('span', { class: 'muted small', title: run.started_at ?? '' }, ago(run.started_at)),
+          el('span', { class: 'muted mono small clip' }, run.model || run.command),
+          el('span', { class: 'muted small tnum', title: run.started_at ?? '' }, ago(run.started_at)),
         );
         row.addEventListener('click', () => handlers.onRun(run.id));
         return row;
@@ -226,9 +271,10 @@ function evidenceSection(task: Task): HTMLElement | null {
         el(
           'li',
           {},
-          el('span', { class: 'muted small', title: item.at }, ago(item.at)),
           el('span', { class: 'actor' }, item.actor),
-          el('span', {}, item.text),
+          el('span', { class: 'history-text' }, item.text),
+          el('span', { class: 'grow' }),
+          el('span', { class: 'muted small tnum', title: item.at }, ago(item.at)),
         ),
       ),
     ),

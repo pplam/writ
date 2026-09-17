@@ -1,4 +1,4 @@
-/* built from ui/src (9a4e352c695e) */
+/* built from ui/src (65e05caa8a3c) */
 /*
  * One stylesheet, no framework.
  *
@@ -48,7 +48,8 @@
     --dim: #a8a8a4;
     /* 8-digit hex here once, which made dark-mode faint text 25% opaque and
      * invisible. These two are checked against 4.5:1 on --panel and --sunken,
-     * measured rather than eyeballed. */
+     * measured rather than eyeballed: they carry the labels that say what a
+     * number means, and the status chips. */
     --faint: #91918c;
     --line: #303338;
     --edge: #43464c;
@@ -177,7 +178,13 @@ code, .mono, pre { font-family: var(--mono); }
 
 /* ------------------------------------------------------------- layout */
 
+/*
+ * A max width, because these are lists of short rows: at 2000px a task title
+ * sits alone at the left with an id and a pill a metre away at the right, and
+ * the eye cannot connect them.
+ */
 .body { flex: 1 1 auto; overflow: auto; padding: 18px; }
+.body > * { max-width: 1500px; margin-inline: auto; }
 
 .toolbar {
   display: flex;
@@ -226,6 +233,42 @@ code, .mono, pre { font-family: var(--mono); }
 
 .grid.one { grid-template-columns: 1fr; }
 
+/*
+ * Overview regions.
+ *
+ * The cards are not interchangeable shapes: three are fixed-height summaries,
+ * two are lists that grow with the project. One auto-fit grid gave the activity
+ * timeline a 341px column and made it 900px tall with empty space beside it.
+ */
+.overview { display: block; }
+
+.ov-band {
+  display: grid;
+  grid-template-columns: minmax(280px, 1.1fr) minmax(300px, 1.3fr) minmax(240px, 1fr);
+  gap: 14px;
+  align-items: start;
+  margin-bottom: 14px;
+}
+
+.ov-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.ov-column { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.ov-activity { min-width: 0; }
+
+@media (max-width: 1100px) {
+  .ov-band { grid-template-columns: 1fr 1fr; }
+  .ov-split { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 720px) {
+  .ov-band { grid-template-columns: 1fr; }
+}
+
 .card {
   background: var(--panel);
   border: 1px solid var(--line);
@@ -236,6 +279,9 @@ code, .mono, pre { font-family: var(--mono); }
 .card.urgent { border-color: var(--i-review); }
 
 .card h2 {
+  display: flex;
+  align-items: center;
+  gap: 7px;
   margin: 0 0 10px;
   font-size: 12px;
   font-weight: 600;
@@ -243,6 +289,27 @@ code, .mono, pre { font-family: var(--mono); }
   letter-spacing: 0.06em;
   color: var(--dim);
 }
+
+.h2-count {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+  color: var(--ink);
+  background: var(--sunken);
+  border-radius: 20px;
+  padding: 0 6px;
+  font-size: 11px;
+}
+
+/*
+ * "No agents running" is a fact, not missing data. Distinct from .empty, which
+ * fills a whole view; this sits inside a card and should not shout.
+ */
+.blank { color: var(--faint); margin: 2px 0; font-size: 13px; }
+
+/* Truncation is opt-in: every flex child that holds prose needs both of these
+ * plus min-width, and forgetting one silently produces an overflowing row. */
+.clip { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tnum { font-variant-numeric: tabular-nums; }
 
 .empty { color: var(--dim); padding: 36px 4px; text-align: center; }
 .muted { color: var(--dim); }
@@ -285,16 +352,49 @@ code, .mono, pre { font-family: var(--mono); }
 /* On a tinted chip, not on the panel: --dim is tuned for the latter and drops
  * under 4.5:1 against the status washes. */
 .chip-label { color: var(--ink); opacity: 0.72; }
+.chip b { font-variant-numeric: tabular-nums; font-weight: 600; }
 .chip.running, .chip.reviewing { background: var(--s-running); }
 .chip.completed { background: var(--s-completed); }
 .chip.failed, .chip.blocked { background: var(--s-failed); }
 .chip.awaiting-review { background: var(--s-review); }
 
-.stats { display: flex; flex-wrap: wrap; gap: 18px; }
-.stat { display: flex; flex-direction: column; }
-.stat-value { font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; }
-.stat-label { font-size: 12px; color: var(--dim); }
-.stat-hint { font-size: 11.5px; color: var(--faint); }
+/*
+ * A grid, not a wrapping flex row: five stats of different value widths wrapped
+ * into a ragged two-and-a-half-line block that read as unrelated numbers.
+ */
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(84px, 1fr));
+  gap: 12px 14px;
+}
+
+.stat { display: flex; flex-direction: column; min-width: 0; }
+.stat-value { font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.15; }
+.stat-label { font-size: 11.5px; color: var(--dim); white-space: nowrap; }
+.stat-hint { font-size: 11px; color: var(--faint); }
+
+/* What is waiting on a human, as stacked buttons rather than a sentence. */
+.needs { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; }
+
+.need {
+  appearance: none;
+  border: 1px solid var(--line);
+  background: var(--sunken);
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  padding: 5px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  width: 100%;
+}
+
+.need:hover { border-color: var(--edge); }
+.need:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.need.review { border-left: 2.5px solid var(--i-review); }
+.need.bad { border-left: 2.5px solid var(--i-failed); }
+.need.calm { border-left: 2.5px solid var(--edge); color: var(--dim); }
 
 /* ------------------------------------------------------------- lists */
 
@@ -368,12 +468,69 @@ code, .mono, pre { font-family: var(--mono); }
 
 @keyframes spin { to { transform: rotate(360deg); } }
 
-.milestone { flex-wrap: wrap; padding: 7px 2px; }
-.activity .when { font-family: var(--mono); font-size: 12px; color: var(--faint); }
-.activity .what { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/*
+ * A milestone summary row is a grid, not flex-wrap. The pieces have very
+ * different widths and wrapping put the meter on its own line under a short
+ * title but not a long one, so no two rows agreed on where anything was.
+ */
+.milestone {
+  display: grid;
+  grid-template-columns: 1ch auto minmax(0, 1fr) 72px 3.5em;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 6px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+}
 
-.history li, .activity li { display: flex; gap: 9px; align-items: baseline; padding: 4px 2px; font-size: 13px; }
-.history .actor { font-family: var(--mono); font-size: 12px; color: var(--dim); }
+.milestone-list > li + li { margin-top: 1px; }
+.milestone:hover { border-color: var(--line); background: var(--sunken); }
+.milestone:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.milestone .meter.thin { margin: 0; flex-basis: auto; }
+.milestone .mono { text-align: right; font-size: 12px; }
+
+/*
+ * An activity row is two lines: the event, then the agent's own summary of what
+ * it did. Both used to compete for one ellipsised line, which cut the summary
+ * to nothing on any realistic width.
+ */
+.activity > li {
+  display: flex;
+  gap: 9px;
+  align-items: baseline;
+  padding: 6px 4px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  font-size: 13px;
+}
+
+.activity > li + li { border-top: 1px solid var(--line); border-radius: 0; }
+.activity > li.clickable:hover { background: var(--sunken); border-color: var(--line); }
+.event-body { flex: 1 1 auto; min-width: 0; }
+.event-line { display: flex; align-items: baseline; gap: 9px; }
+.activity .what { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.activity .when { font-size: 12px; color: var(--faint); white-space: nowrap; }
+
+.event-summary {
+  margin: 2px 0 0;
+  font-size: 12.5px;
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history li {
+  display: flex;
+  gap: 9px;
+  align-items: baseline;
+  padding: 5px 2px;
+  font-size: 13px;
+}
+
+.history li + li { border-top: 1px solid var(--line); }
+.history .actor { font-family: var(--mono); font-size: 11.5px; color: var(--dim); flex: 0 0 auto; }
+.history-text { flex: 1 1 auto; min-width: 0; }
 
 /* ------------------------------------------------------------- graph */
 
@@ -445,19 +602,35 @@ code, .mono, pre { font-family: var(--mono); }
 
 .detail { padding: 16px 18px 40px; }
 
-.detail-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; padding-right: 34px; }
-.detail-head h2 { margin: 0; font-size: 16px; font-weight: 600; }
+/*
+ * Id, status and title on separate lines. Sharing one wrapping row meant a long
+ * title pushed the status pill onto its own line and left it looking unrelated
+ * to the task above it.
+ */
+.detail-head { padding-right: 34px; margin-bottom: 10px; }
+.detail-title { display: flex; align-items: center; gap: 9px; margin-bottom: 5px; }
+.detail-head h2 { margin: 0; font-size: 17px; font-weight: 600; line-height: 1.3; }
 
+/*
+ * Labelled pairs. These were bare spans in a flex row, so with a gap alone the
+ * text ran together: "milestone M02§ Replication/tmp/design.mdupdated a minute
+ * ago" was one unbroken string on screen.
+ */
 .meta-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 12px;
-  margin: 8px 0 14px;
+  gap: 6px 18px;
+  margin: 0 0 18px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
   font-size: 12.5px;
-  color: var(--dim);
 }
 
-.detail-section { margin-bottom: 20px; }
+.meta-item { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.meta-label { color: var(--faint); text-transform: uppercase; font-size: 11px; letter-spacing: 0.05em; }
+.meta-value { color: var(--dim); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.detail-section { margin-bottom: 22px; }
 
 .detail-section h3 {
   margin: 0 0 8px;
@@ -492,8 +665,20 @@ code, .mono, pre { font-family: var(--mono); }
   white-space: pre-wrap;
 }
 
-.rail ul { margin: 2px 0 0; padding-left: 18px; font-size: 12.5px; }
+.criterion-by { display: flex; gap: 7px; margin: 6px 0 0; }
+.criterion.passed .mark { color: var(--i-completed); }
+.criterion.failed .mark { color: var(--i-failed); }
+
+/* Side by side: the two rails are a contrast, and stacked they read as a list. */
+.rails { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+.rail { background: var(--sunken); border-radius: 6px; padding: 8px 10px; }
+.rail h4 { margin: 0 0 4px; }
+.rail ul { margin: 0; padding-left: 16px; font-size: 12.5px; }
+.rail.allowed h4 { color: var(--i-completed); }
 .rail.forbidden h4 { color: var(--i-failed); }
+
+.deps { display: flex; flex-direction: column; gap: 10px; }
+.dep-group h4 { margin: 0 0 4px; }
 .dep-line { display: flex; flex-wrap: wrap; gap: 5px; }
 
 .verdict-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
@@ -550,8 +735,40 @@ pre.command {
 .decision .field { margin-top: 8px; }
 .decision .ruling { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
 
-.milestone-card .milestone-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin-bottom: 8px; }
-.milestone-card h2 { margin: 0; font-size: 14px; text-transform: none; letter-spacing: normal; color: var(--ink); }
+/*
+ * A grid so the bar and count keep one column across every card. As flex-wrap
+ * they dropped to a second row on any card with a long title, which read as
+ * content rather than as a header.
+ */
+.milestone-card .milestone-head {
+  display: grid;
+  grid-template-columns: 1ch auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.milestone-card h2 {
+  display: block;
+  margin: 0;
+  font-size: 14.5px;
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--ink);
+}
+
+.milestone-card .milestone-head .pill { margin-left: 4px; }
+.milestone-progress { display: flex; align-items: center; gap: 9px; margin-left: 8px; }
+.milestone-progress .meter.thin { width: 90px; margin: 0; flex-basis: auto; }
+.milestone-progress .mono { font-size: 12px; }
+.milestone-card .task-list { margin-top: 2px; }
+.milestone-foot { margin: 8px 0 0; }
+
+@media (max-width: 720px) {
+  .milestone-card .milestone-head { grid-template-columns: 1ch auto minmax(0, 1fr); }
+  .milestone-card .milestone-head .pill,
+  .milestone-progress { grid-column: 2 / -1; }
+}
 
 .link {
   appearance: none;
