@@ -12,6 +12,7 @@ from typing import Any
 
 from . import (
     agents,
+    dashboard,
     decisions,
     orchestrator,
     planner,
@@ -773,6 +774,16 @@ def cmd_graph(args) -> None:
     data = state.load(args.root)
     check_dag(data)
     tasks = data["tasks"]
+    if getattr(args, "serve", False):
+        # Checked before serving so a cyclic graph fails at the prompt rather
+        # than as a broken page.
+        dashboard.serve(
+            args.root,
+            host=args.host,
+            port=args.port,
+            open_browser=not args.no_open,
+        )
+        return
     if args.dot:
         _graph_dot(data, tasks)
         return

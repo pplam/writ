@@ -276,7 +276,7 @@ operates on.
 | `writ status [--watch] [--interval S] [--until-idle]` | progress, ready work, live runs |
 | `writ list [tasks\|milestones\|runs\|decisions] [--status S] [--milestone M] [--task T] [--ready] [--awaiting-review] [--proposed] [--active] [--limit N]` | any collection |
 | `writ show <id> [--verbose] [--prompt]` | any single thing |
-| `writ graph [--levels] [--verbose] [--dot]` | the dependency DAG |
+| `writ graph [--levels] [--verbose] [--dot] [--serve]` | the dependency DAG |
 | `writ logs <run-id\|task-id> [--follow] [--stderr] [--tail N]` | agent output |
 
 **Change**
@@ -389,6 +389,46 @@ For a graph too wide for a page, `-Grankdir=TB` stacks it vertically, and
 ```bash
 writ graph --dot | unflatten -l3 | dot -Tsvg -o graph.svg
 ```
+
+### Watching it live
+
+A rendered graph is a snapshot: by the time you have read it, a long run has
+moved on. `--serve` puts the same graph in a browser and follows the store:
+
+```bash
+writ graph --serve                      # opens a browser on localhost:8731
+writ graph --serve --no-open            # just print the url
+writ graph --serve --port 9000
+```
+
+Leave it open in one window and `writ run` in another. Nodes change colour as
+agents work, live ones pulse, edges firm up as dependencies complete, and the
+header counts move. Nothing needs reloading.
+
+It is laid out by dependency depth, left to right, so a column is work that could
+run at once and the picture shows the parallelism the DAG allows. Each node
+carries its id, title, status and acceptance count, with a bar for criteria
+passed. Hover for the full title and both edge directions. Dashed edges are
+dependencies still outstanding; solid ones are satisfied.
+
+The page follows `state.json` rather than any particular writer, so everything
+shows up: `writ run`, a hand-run `writ dispatch`, or a `writ override` typed in a
+third window. Decisions an agent proposed are listed too, since those wait on a
+human and no run will clear them.
+
+Three things it deliberately is not:
+
+- **Not a control panel.** It is read-only. There is no endpoint that changes
+  anything, so a tab left open in a forgotten window cannot dispatch, cancel, or
+  override. Driving the project stays in the terminal, where the flags and the
+  reasons are.
+- **Not a dependency.** No framework, no bundle, no CDN. It is `http.server`,
+  hand-written SVG, and server-sent events, so writ still installs with nothing.
+  The page works offline.
+- **Not exposed.** It binds to `127.0.0.1`, because the page has no
+  authentication and does not need any while only this machine can reach it.
+  `--host 0.0.0.0` works and prints a warning: anyone who can route to the port
+  can then read your task titles and decision text.
 
 ### A status is a value, not a verb
 
