@@ -84,3 +84,111 @@ def test_the_page_never_builds_dom_from_a_string():
     body = (STATIC / "app.js").read_text()
     for forbidden in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"):
         assert forbidden not in body, forbidden
+
+
+def test_no_style_attribute_survives_the_content_security_policy():
+    """A style *attribute* is inline style, and the server's CSP forbids it.
+
+    This is the bug this test exists for: `setAttribute('style', 'width:33%')`
+    is dropped silently by the browser — no error, no console warning, the
+    element simply renders unstyled. Every progress meter on the page rendered
+    full regardless of actual progress, which is worse than rendering nothing,
+    because a full bar is a plausible reading.
+
+    Assigning through the CSSOM (`el.style.cssText = ...`) is not inline style
+    as far as CSP is concerned, so the fix keeps the policy rather than relaxing
+    it to 'unsafe-inline'. Enforced against the compiled bundle so a new view
+    cannot reintroduce it.
+    """
+    body = (STATIC / "app.js").read_text()
+    offenders = re.findall(r"setAttribute\(\s*['\"]style['\"]", body)
+    assert offenders == [], (
+        "setAttribute('style', ...) is dropped by our own CSP; "
+        "assign el.style.cssText instead"
+    )
+    # The one permitted route, still present: the meters depend on it.
+    assert "style.cssText" in body
+
+
+def test_the_policy_the_bundle_is_written_against_is_the_one_served():
+    """The two halves of that bug have to stay in agreement.
+
+    If the CSP ever gains 'unsafe-inline', the test above becomes pointless
+    ceremony; if style-src is dropped entirely, the stylesheet stops loading.
+    Either change should land deliberately, not as a side effect.
+    """
+    from writ import server
+
+    policy = server.PAGE  # the page itself carries no inline style either
+    assert "style=" not in policy
+
+    source = (Path(server.__file__)).read_text()
+    assert "style-src 'self'" in source
+    assert "unsafe-inline" not in source
+
+
+def _luminance(hex_colour: str) -> float:
+    """Relative luminance per WCAG 2.1."""
+    value = hex_colour.lstrip("#")
+    parts = [int(value[i : i + 2], 16) / 255 for i in (0, 2, 4)]
+    channels = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in parts]
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+
+def _contrast(a: str, b: str) -> float:
+    first, second = _luminance(a), _luminance(b)
+    lighter, darker = max(first, second), min(first, second)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def _palette(block: str) -> dict[str, str]:
+    return dict(re.findall(r"(--[\w-]+):\s*(#[0-9a-fA-F]{3,8});", block))
+
+
+def _palettes() -> dict[str, dict[str, str]]:
+    """The light and dark custom-property blocks, as name -> colour."""
+    css = (STATIC / "style.css").read_text()
+    dark_at = css.index("prefers-color-scheme: dark")
+    return {"light": _palette(css[:dark_at]), "dark": _palette(css[dark_at:])}
+
+
+@pytest.mark.parametrize("scheme", ["light", "dark"])
+def test_the_text_tones_are_legible_on_the_surfaces_they_sit_on(scheme):
+    """Text colours meet WCAG AA against panel and sunken, in both schemes.
+
+    Measured rather than eyeballed, because eyeballing got this wrong twice: the
+    dark palette carried `--faint: #75757040`, an 8-digit hex among 6-digit ones,
+    which made the smallest labels 25% opaque and effectively invisible; and the
+    light `--faint` was picked to look right on a white card and came out at
+    2.8:1. These tones carry the labels that say what a number means, so they
+    are the last thing that should be hard to read.
+    """
+    palette = _palettes()[scheme]
+    for surface in ("--panel", "--sunken"):
+        for tone in ("--ink", "--dim", "--faint"):
+            ratio = _contrast(palette[tone], palette[surface])
+            assert ratio >= 4.5, f"{scheme}: {tone} on {surface} is {ratio:.2f}:1"
+
+
+@pytest.mark.parametrize("scheme", ["light", "dark"])
+def test_the_status_colours_are_legible_on_their_own_washes(scheme):
+    """Each status ink against its matching background wash.
+
+    A pill pairs `--i-failed` with `--s-failed`, which is a different question
+    from either against the panel, and the review pair was the one that failed.
+    """
+    palette = _palettes()[scheme]
+    for status in ("running", "review", "completed", "failed"):
+        ratio = _contrast(palette[f"--i-{status}"], palette[f"--s-{status}"])
+        assert ratio >= 4.5, f"{scheme}: --i-{status} on --s-{status} is {ratio:.2f}:1"
+
+
+@pytest.mark.parametrize("scheme", ["light", "dark"])
+def test_every_palette_colour_is_opaque(scheme):
+    """No alpha channel in the palette.
+
+    The dark `--faint` regression was a single stray byte on the end of a hex
+    literal, which no amount of reading catches but this does.
+    """
+    for name, colour in _palettes()[scheme].items():
+        assert len(colour.lstrip("#")) in (3, 6), f"{scheme}: {name} = {colour}"

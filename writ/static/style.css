@@ -1,4 +1,4 @@
-/* built from ui/src (c1f7052a5e9a) */
+/* built from ui/src (9a4e352c695e) */
 /*
  * One stylesheet, no framework.
  *
@@ -13,8 +13,10 @@
   --panel: #ffffff;
   --sunken: #f5f5f4;
   --ink: #1a1a19;
-  --dim: #6f6f6b;
-  --faint: #9a9a95;
+  --dim: #61615d;
+  /* Both measured against --panel and --sunken at 4.5:1, not picked by eye:
+   * these carry the labels that say what a number means. */
+  --faint: #6e6e69;
   --line: #e3e3e0;
   --edge: #cfcfca;
   --accent: #2f6f4f;
@@ -28,7 +30,7 @@
   --s-cancelled: #ededea;
 
   --i-running: #2f5f96;
-  --i-review: #8a6a1c;
+  --i-review: #7d5f14;
   --i-completed: #2c6b45;
   --i-failed: #a93a3a;
 
@@ -43,8 +45,11 @@
     --panel: #1d1f22;
     --sunken: #232529;
     --ink: #e7e7e5;
-    --dim: #9d9d99;
-    --faint: #75757040;
+    --dim: #a8a8a4;
+    /* 8-digit hex here once, which made dark-mode faint text 25% opaque and
+     * invisible. These two are checked against 4.5:1 on --panel and --sunken,
+     * measured rather than eyeballed. */
+    --faint: #91918c;
     --line: #303338;
     --edge: #43464c;
     --accent: #6bbd8e;
@@ -277,7 +282,9 @@ code, .mono, pre { font-family: var(--mono); }
 }
 
 .chip-mark { font-family: var(--mono); color: var(--dim); }
-.chip-label { color: var(--dim); }
+/* On a tinted chip, not on the panel: --dim is tuned for the latter and drops
+ * under 4.5:1 against the status washes. */
+.chip-label { color: var(--ink); opacity: 0.72; }
 .chip.running, .chip.reviewing { background: var(--s-running); }
 .chip.completed { background: var(--s-completed); }
 .chip.failed, .chip.blocked { background: var(--s-failed); }

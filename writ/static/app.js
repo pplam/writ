@@ -1,4 +1,4 @@
-/* built from ui/src (c1f7052a5e9a) */
+/* built from ui/src (9a4e352c695e) */
 /*
  * writ dashboard — compiled from ui/src by ui/build.mjs.
  * Do not edit: change the TypeScript and rebuild.
@@ -45,6 +45,16 @@ function apply(node, attrs) {
     for (const [key, value] of Object.entries(attrs)) {
         if (value === undefined || value === false)
             continue;
+        // `style` has to go through the CSSOM, not setAttribute. Our own CSP sets
+        // style-src 'self' without 'unsafe-inline', which makes the browser drop a
+        // style *attribute* silently — no error, no console warning, the element
+        // just renders unstyled. Every progress meter rendered full for exactly
+        // that reason. Assigning cssText is not inline style as far as CSP is
+        // concerned, so it survives, and we keep the policy.
+        if (key === 'style' && node instanceof HTMLElement) {
+            node.style.cssText = String(value);
+            continue;
+        }
         node.setAttribute(key, String(value));
     }
 }
