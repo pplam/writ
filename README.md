@@ -445,6 +445,184 @@ writ run --parallel 3 \
 `--reviewer` defaults to `--agent`, which is convenient and weaker: a model
 checking its own work agrees with itself more than it should.
 
+### How a task reaches an agent
+
+One task, one step at a time. `writ run` does exactly this, repeatedly:
+
+```
+     the store                        the agent process
+  .writ/state.json
+         │
+   1. select    ── the graph says M01-002 is ready
+         │
+   2. claim     ── status: planned -> running, owner_pid recorded
+         │          (from here the task is no longer selectable)
+         │
+   3. prompt    ── runs/M01-002-…/prompt.txt
+         │                    │
+         │                    └── on stdin ──>  claude -p
+         │                                        │  │
+         │            stdout.log, stderr.log  <────┘  │
+         │            (to disk, not your terminal)     │
+         │                                              │
+   4. verdict   <── runs/M01-002-…/verdict.json  <─────┘
+         │
+   5. apply     ── criteria marked from the verdict,
+         │          status: running -> awaiting-review
+         ▼
+```
+
+Step 2 is what makes concurrency safe. The claim is a write inside the same
+advisory lock as every other write, so a task stops being selectable *before* its
+agent starts rather than after. Two schedulers cannot both pick it up, and
+neither can a `writ dispatch` running alongside.
+
+Step 4 is what makes progress real. The task's status comes from the file the
+agent wrote, not from its exit code — a process can exit 0 having done nothing.
+No verdict means no criterion moves, and writ says so.
+
+A review is the same five steps with a different prompt and a different landing
+place: `awaiting-review -> reviewing`, then `completed` or `failed`. That is the
+only transition that produces `completed`, which is why the loop must run both
+phases.
+
+### How the DAG advances
+
+Nothing walks the graph. Each completion changes one task's status, and `ready`
+is recomputed from the DAG every time the scheduler looks:
+
+```
+              ready = planned AND every dependency completed
+```
+
+So the frontier moves as a consequence of work finishing, not because anything
+tracks position. Take this graph:
+
+```
+> M01-001  Foundations
+├─ · M01-002  Schema
+│  ├─ · M01-004  Store
+│  │  └─ ↩ M01-006
+│  └─ ↩ M01-005
+└─ · M01-003  Config
+   └─ · M01-005  Handlers
+      └─ · M01-006  Wire up
+
+6 tasks, 4 deep, up to 2 in parallel
+```
+
+Watch what is selectable as completions accumulate:
+
+| completed so far | ready next | why |
+|---|---|---|
+| — | `M01-001` | nothing else has its deps met |
+| `M01-001` | `M01-002`, `M01-003` | both depend only on `M01-001` |
+| … `+ M01-002` | `M01-003`, `M01-004` | `M01-004` opens; `M01-005` still waits on `M01-003` |
+| … `+ M01-003` | `M01-004`, `M01-005` | `M01-005` joins both branches |
+| … `+ M01-004`, `M01-005` | `M01-006` | the final join |
+
+That table is `writ list --ready` at each point, and you can watch it move with
+`writ status --watch` from another terminal while a run is going.
+
+`awaiting-review` is deliberately not enough to open the next task. If it were,
+an agent's own claim about its work would unblock the tasks built on top of it,
+and a rejected verdict would mean unwinding work that had already started from a
+false premise.
+
+### How parallelism actually plays out
+
+The graph above, run with `--parallel 2`, produces this — real output, not a
+sketch:
+
+```
+running up to 2 agents at a time
+logs: .writ/runs
+─────────────────────────────────────────────────────────────
+dispatch M01-001  ->  claude -p
+         ? M01-001  awaiting-review
+review   M01-001  ->  codex exec -
+         + M01-001  completed
+dispatch M01-002  ->  claude -p
+dispatch M01-003  ->  claude -p
+         ? M01-003  awaiting-review
+review   M01-003  ->  codex exec -
+         ? M01-002  awaiting-review
+review   M01-002  ->  codex exec -
+         + M01-003  completed
+         + M01-002  completed
+dispatch M01-004  ->  claude -p
+dispatch M01-005  ->  claude -p
+         ? M01-005  awaiting-review
+review   M01-005  ->  codex exec -
+         ? M01-004  awaiting-review
+review   M01-004  ->  codex exec -
+         + M01-005  completed
+         + M01-004  completed
+dispatch M01-006  ->  claude -p
+         ? M01-006  awaiting-review
+review   M01-006  ->  codex exec -
+         + M01-006  completed
+─────────────────────────────────────────────────────────────
+ran 12 agents over 6 tasks in 5s
+completed 6, failed 0
+project 6/6 tasks complete
+```
+
+Three marks: `?` reported and awaiting review, `+` completed, `x` failed.
+
+The timeline underneath it, from the recorded start and finish of each run:
+
+```
+  +0s  M01-001 dispatch ██
+  +0s  M01-001 review   ████
+  +1s  M01-002 dispatch     ████      two at once: both deps met, and
+  +1s  M01-003 dispatch     ████      neither depends on the other
+  +2s  M01-002 review           ██
+  +2s  M01-003 review           ██
+  +2s  M01-004 dispatch         ████
+  +2s  M01-005 dispatch         ████
+  +3s  M01-004 review               ████
+  +3s  M01-005 review               ████
+  +4s  M01-006 dispatch                 ██   the join: waited for both
+  +4s  M01-006 review                   ████
+```
+
+The waves are the graph's width, not a batching strategy. The scheduler never
+waits for a round to end: it refills the moment a slot frees. Give the same
+graph agents that take unequal time and the phases stop lining up:
+
+```
+dispatch M01-002  ->  claude -p          (slow)
+dispatch M01-003  ->  claude -p          (fast)
+         ? M01-003  awaiting-review      M01-002 is still working
+review   M01-003  ->  codex exec -
+         + M01-003  completed
+dispatch M01-004  ->  claude -p          its slot freed, so it starts now
+         ? M01-002  awaiting-review
+review   M01-002  ->  codex exec -
+```
+
+A review of one task and a dispatch of another run side by side. `--parallel N`
+is a budget of concurrent agents, not a batch size, and it is spent on whatever
+is most useful at that moment — a pending review first, then new work.
+`--parallel 4` on this graph still peaks at 2, because that is as wide as the
+graph gets.
+
+Inside one process it works like this:
+
+```
+  scheduler thread                    worker pool (--parallel N)
+  ────────────────                    ────────────────────────
+  while a slot is free:
+      select + claim  ───submit───>  run the agent, apply its verdict
+  wait for any to finish  <───────  report the outcome
+  repeat
+```
+
+One thread selects and claims; workers only run agents and record verdicts. Two
+threads both asking "what is ready?" could answer with the same task, so the
+question is only ever asked in one place.
+
 ### Preview before spending
 
 `--dry-run` walks the graph in memory and prints the invocations it would make:
