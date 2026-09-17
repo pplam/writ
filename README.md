@@ -540,29 +540,29 @@ running up to 2 agents at a time
 logs: .writ/runs
 ─────────────────────────────────────────────────────────────
 dispatch M01-001  ->  claude -p
-         ? M01-001  awaiting-review
+         ? M01-001  awaiting-review  1/1
 review   M01-001  ->  codex exec -
-         + M01-001  completed
+         + M01-001  completed  1/1
 dispatch M01-002  ->  claude -p
 dispatch M01-003  ->  claude -p
-         ? M01-003  awaiting-review
+         ? M01-003  awaiting-review  1/1
 review   M01-003  ->  codex exec -
-         ? M01-002  awaiting-review
+         ? M01-002  awaiting-review  1/1
 review   M01-002  ->  codex exec -
-         + M01-003  completed
-         + M01-002  completed
+         + M01-003  completed  1/1
+         + M01-002  completed  1/1
 dispatch M01-004  ->  claude -p
 dispatch M01-005  ->  claude -p
-         ? M01-005  awaiting-review
+         ? M01-005  awaiting-review  1/1
 review   M01-005  ->  codex exec -
-         ? M01-004  awaiting-review
+         ? M01-004  awaiting-review  1/1
 review   M01-004  ->  codex exec -
-         + M01-005  completed
-         + M01-004  completed
+         + M01-005  completed  1/1
+         + M01-004  completed  1/1
 dispatch M01-006  ->  claude -p
-         ? M01-006  awaiting-review
+         ? M01-006  awaiting-review  1/1
 review   M01-006  ->  codex exec -
-         + M01-006  completed
+         + M01-006  completed  1/1
 ─────────────────────────────────────────────────────────────
 ran 12 agents over 6 tasks in 5s
 completed 6, failed 0
@@ -623,6 +623,59 @@ Inside one process it works like this:
 One thread selects and claims; workers only run agents and record verdicts. Two
 threads both asking "what is ready?" could answer with the same task, so the
 question is only ever asked in one place.
+
+### Reading the progress log
+
+The log is one line per event, not a transcript. Several agents talking at once
+is unreadable, so `writ run` reports transitions instead — what started, what it
+produced, and what that changed:
+
+```
+dispatch M01-002  ->  claude -p                 an agent started
+         ? M01-002  awaiting-review  3/3        it reported, three bars passed
+review   M01-002  ->  codex exec -              a reviewer started
+         x M01-002  failed  0/3  unmet 1, 2, 3  it rejected all three
+           the retry path is untested           the reviewer's own words
+```
+
+Flush-left lines are agents starting; indented lines are the store changing. The
+counts are acceptance criteria, so `0/3  unmet 1, 2, 3` names which bars are
+still open without needing `writ show`.
+
+A failure carries the agent's one-line reason, because that is the line you
+actually read when something goes wrong. A pass does not — there it would be
+noise. Proposed decisions are reported as they happen, since they are a side
+effect worth noticing:
+
+```
+         ? M01-001  awaiting-review  3/3
+           proposed 2 decisions: Frames are length-prefixed; Timeouts are per-request
+```
+
+Problems that are not verdicts appear the same way — a timeout as `(exit 124)`, a
+crash as its exit code, an unusable verdict with the parse error that rejected it:
+
+```
+         x M01-001  failed  0/3  (exit 124)
+         · M01-001  planned  3/3  (…/verdict.json: decision must be one of accept, reject (got None))
+```
+
+The second is worth reading twice. A reviewer wrote something writ could not
+parse, so no criterion moved and the task went back to `planned` — it kept the
+three bars the implementer had already earned rather than losing them to a
+reviewer's malformed file.
+
+`--quiet` drops the started lines and keeps the transitions. `--json` emits the
+same events as objects, each carrying `status`, `criteria`, `unmet`, `summary`,
+and `decisions`, so a wrapper does not have to parse the text.
+
+Full agent output is always on disk, whatever the log shows:
+
+```bash
+writ logs M01-002                      # what that agent actually printed
+writ logs M01-002 --stderr
+writ show M01-002 --verbose            # the verdict, per criterion, with evidence
+```
 
 ### Which ready task goes first
 

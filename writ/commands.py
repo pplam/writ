@@ -1511,6 +1511,12 @@ def _nothing_to_run(data) -> str:
     return "nothing is ready to dispatch or awaiting review"
 
 
+def _first_line(text: str, limit: int = 96) -> str:
+    """The agent's summary as one line, since the log is one line per event."""
+    line = " ".join(text.split())
+    return line if len(line) <= limit else line[: limit - 1] + "…"
+
+
 class _RunReporter:
     """Turns scheduler events into a readable progress log.
 
@@ -1554,11 +1560,44 @@ class _RunReporter:
         return None
 
     def _finished(self, payload: dict[str, Any]) -> str:
+        """One line per transition: the mark, the new status, and the reason.
+
+        A bare `x M01-002  failed` sends the reader to `writ show` to find out
+        why, which is the wrong default for the one line they will actually see.
+        The agent already wrote a one-line account; use it.
+        """
         status = payload["status"] or "unknown"
-        mark = render.mark(status)
-        detail = f"{mark} {payload['task']}  {status}"
+        parts = [f"{render.mark(status)} {payload['task']}  {status}"]
+
+        counts = payload.get("criteria")
+        if counts and counts.get("total"):
+            parts.append(f"{counts['passed']}/{counts['total']}")
+
+        unmet = payload.get("unmet")
+        if unmet:
+            parts.append(
+                "unmet " + ", ".join(str(number) for number in unmet)
+            )
+
+        line = "  ".join(parts)
         if payload["error"]:
-            detail += f"  ({payload['error']})"
+            line += f"  ({payload['error']})"
         elif payload["exit_code"] not in (0, None):
-            detail += f"  (exit {payload['exit_code']})"
-        return f"         {detail}"
+            line += f"  (exit {payload['exit_code']})"
+
+        detail = []
+        reason = payload.get("summary")
+        if reason and status in ("failed", "blocked"):
+            detail.append(_first_line(reason))
+        proposed = payload.get("decisions")
+        if proposed:
+            detail.append(
+                f"proposed {len(proposed)} decision"
+                + ("s" if len(proposed) > 1 else "")
+                + ": "
+                + "; ".join(proposed[:2])
+                + (" …" if len(proposed) > 2 else "")
+            )
+        out = [f"         {line}"]
+        out += [f"           {item}" for item in detail]
+        return "\n".join(out)

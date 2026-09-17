@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import agents, runner, state
-from .model import effective_status
+from .model import acceptance_summary, effective_status
 from .state import WritError, utcnow
 
 #: how long a worker may hold the scheduler open after a stop is requested
@@ -70,6 +70,13 @@ class Outcome:
     exit_code: int | None = None
     status: str | None = None  # the task's status afterwards
     error: str | None = None
+    #: the agent's own one-line account of what it did or refused to accept.
+    #: Carried through so a failure explains itself in the log rather than
+    #: sending the reader to `writ show` to find out why.
+    summary: str = ""
+    unmet: list[int] = field(default_factory=list)
+    criteria: dict[str, int] | None = None
+    decisions: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -465,12 +472,17 @@ def _execute(root: Path, job: Job, run_id: str) -> Outcome:
     data = state.load(root)
     task = data["tasks"].get(job.task_id, {})
     run = data["runs"].get(run_id, {})
+    reported = run.get("verdict") or {}
     return Outcome(
         job=job,
         run_id=run_id,
         exit_code=code,
         status=task.get("status"),
         error=run.get("verdict_error"),
+        summary=reported.get("summary", ""),
+        unmet=list(reported.get("unmet", [])),
+        criteria=acceptance_summary(task) if task else None,
+        decisions=list(reported.get("decisions", [])),
     )
 
 
@@ -509,6 +521,10 @@ def _finished_payload(outcome: Outcome) -> dict[str, Any]:
         "exit_code": outcome.exit_code,
         "status": outcome.status,
         "error": outcome.error,
+        "summary": outcome.summary,
+        "unmet": outcome.unmet,
+        "criteria": outcome.criteria,
+        "decisions": outcome.decisions,
     }
 
 
@@ -620,6 +636,19 @@ def summary(data: dict[str, Any], session: Session) -> list[str]:
     if blocked:
         lines.append(
             f"blocked by failed work: {', '.join(blocked)}"
+        )
+    # Proposals are inert until a human rules on them, so a run that produced
+    # some has left work that no later `writ run` will pick up. Say so, or the
+    # records sit unread.
+    proposed = [
+        item["id"]
+        for item in data.get("decisions", [])
+        if item["status"] == "proposed"
+    ]
+    if proposed:
+        lines.append(
+            f"decisions proposed: {', '.join(proposed)}"
+            "   (writ list decisions --proposed)"
         )
     return lines
 

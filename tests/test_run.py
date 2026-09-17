@@ -91,6 +91,32 @@ open(path, "w").write(json.dumps({
 }))
 """
 
+#: an implementer that also proposes decisions, to exercise the log's reporting
+PROPOSER = """
+import json, os, re, sys
+prompt = sys.stdin.read()
+path = re.search(r'^  (\\S*verdict\\.json)$', prompt, re.M).group(1)
+total = int(re.search(r'has (\\d+) acceptance criteri', prompt).group(1))
+open(path, "w").write(json.dumps({
+    "outcome": "complete",
+    "summary": "built it",
+    "criteria": [
+        {"number": i, "status": "passed", "evidence": "ran: pytest -q -> ok"}
+        for i in range(1, total + 1)
+    ],
+    "decisions": [
+        {"title": "Frames are length-prefixed",
+         "context": "The design does not say how messages are delimited.",
+         "decision": "A four-byte big-endian length precedes each payload.",
+         "consequences": "A later reader must agree or it desynchronises."},
+        {"title": "Timeouts are per-request",
+         "context": "Only a total budget was specified.",
+         "decision": "Each retry gets the full timeout, not a share of one budget.",
+         "consequences": "Worst-case latency is retries times timeout."},
+    ],
+}))
+"""
+
 SLEEPER = """
 import sys, time
 sys.stdin.read()
@@ -935,3 +961,127 @@ def test_a_chosen_order_actually_runs(planned, writ, project):
     assert code == 0, err
     data = state.load(project)
     assert all(t["status"] == "completed" for t in data["tasks"].values())
+
+
+# --------------------------------------------------------------------------
+# the progress log
+
+
+def transitions(out):
+    """Just the indented status lines, without the `-> <command>` echoes.
+
+    The fake agents here are `python -c '<source>'`, so their source appears in
+    the started line and would match almost any assertion about content.
+    """
+    return [
+        line for line in out.splitlines()
+        if line.startswith("         ") or line.startswith("           ")
+    ]
+
+
+def test_the_log_reports_each_transition(planned, writ):
+    _, out, _ = writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
+                     "--reviewer", agent(REVIEWER))
+    assert "? M01-001  awaiting-review" in out
+    assert "+ M01-001  completed" in out
+
+
+def test_the_log_names_the_agent_it_started(planned, writ):
+    _, out, _ = writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
+                     "--reviewer", agent(REVIEWER))
+    assert "dispatch M01-001  ->" in out
+    assert "review   M01-001  ->" in out
+
+
+def test_the_log_counts_criteria_as_they_pass(planned, writ):
+    """M01-001 has three bars; a bare status would not show that."""
+    _, out, _ = writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
+                     "--reviewer", agent(REVIEWER))
+    assert "3/3" in out
+
+
+def test_a_failure_says_why_in_the_log(planned, writ):
+    """Otherwise the one line a reader sees sends them to `writ show`."""
+    _, out, _ = writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
+                     "--reviewer", agent(REJECTOR))
+    assert "x M01-001  failed" in out
+    assert "unmet 1, 2, 3" in out
+    assert "not convinced" in out, "the reviewer's own reason was dropped"
+
+
+def test_a_pass_does_not_repeat_the_summary(planned, writ):
+    """The reason matters when something went wrong; otherwise it is noise."""
+    _, out, _ = writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
+                     "--reviewer", agent(REVIEWER))
+    assert "verified independently" not in "\n".join(transitions(out))
+
+
+def test_proposed_decisions_appear_as_they_happen(planned, writ):
+    _, out, _ = writ("run", "--max-tasks", "1", "--agent",
+                     agent(PROPOSER), "--reviewer", agent(REVIEWER))
+    assert "proposed 2 decisions" in out
+    assert "Frames are length-prefixed" in out
+
+
+def test_the_summary_points_at_proposals_left_unresolved(planned, writ):
+    """They are inert until a human rules, and no later run will pick them up."""
+    _, out, _ = writ("run", "--max-tasks", "1", "--agent", agent(PROPOSER),
+                     "--reviewer", agent(REVIEWER))
+    assert "decisions proposed: D-0001, D-0002" in out
+    assert "writ list decisions --proposed" in out
+
+
+def test_a_run_without_proposals_says_nothing_about_them(planned, writ):
+    _, out, _ = writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
+                     "--reviewer", agent(REVIEWER))
+    assert "decisions proposed" not in out
+
+
+def test_a_timeout_is_reported_with_its_exit_code(planned, writ):
+    _, out, _ = writ("run", "--max-tasks", "1", "--timeout", "1",
+                     "--agent", agent(SLEEPER), "--reviewer", agent(REVIEWER))
+    assert "(exit 124)" in out
+
+
+def test_a_crashing_agent_is_reported_with_its_exit_code(planned, writ):
+    crash = f"{shlex.quote(sys.executable)} -c 'import sys; sys.exit(3)'"
+    _, out, _ = writ("run", "--max-tasks", "1", "--agent", crash)
+    assert "(exit 3)" in out
+
+
+def test_an_unusable_verdict_is_reported_on_the_line(planned, writ):
+    _, out, _ = writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
+                     "--reviewer", agent(IMPLEMENTER))
+    assert "decision must be one of" in out
+
+
+def test_quiet_keeps_the_transitions_and_drops_the_starts(planned, writ):
+    _, out, _ = writ("run", "--quiet", "--max-tasks", "1", "--agent",
+                     agent(IMPLEMENTER), "--reviewer", agent(REVIEWER))
+    assert "dispatch M01-001" not in out
+    assert "+ M01-001  completed" in out
+
+
+def test_a_long_summary_is_trimmed_to_one_line(planned, writ):
+    """The log is one line per event; a paragraph would break that."""
+    wordy = REJECTOR.replace(
+        '"summary": "not convinced"',
+        '"summary": "' + "a very long explanation " * 20 + '"',
+    )
+    _, out, _ = writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
+                     "--reviewer", agent(wordy))
+    reason = [line for line in transitions(out) if "a very long" in line]
+    assert len(reason) == 1, reason
+    assert len(reason[0]) < 120
+    assert reason[0].rstrip().endswith("…")
+
+
+def test_the_json_stream_carries_the_same_facts(planned, writ):
+    _, out, _ = writ("--json", "run", "--max-tasks", "1", "--agent",
+                     agent(PROPOSER), "--reviewer", agent(REJECTOR))
+    events = [json.loads(chunk) for chunk in _json_objects(out)]
+    finished = [e for e in events if e["event"] == "finished"]
+    assert any(e["decisions"] for e in finished)
+    assert any(e["summary"] for e in finished)
+    assert any(e["unmet"] for e in finished)
+    assert any(e["criteria"] for e in finished)

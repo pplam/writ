@@ -631,6 +631,7 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
                 run["verdict"] = {
                     "outcome": reported.outcome,
                     "decision": reported.decision,
+                    "summary": reported.summary,
                     "passed": reported.passed,
                     "unmet": reported.unmet,
                     "decisions": [p.title for p in reported.decisions],
