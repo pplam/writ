@@ -17,7 +17,15 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["writ"]
+# writ.static holds no Python, but setuptools treats every directory as a
+# package, so it is listed to avoid an ambiguous-configuration warning.
+packages = ["writ", "writ.static"]
+
+[tool.setuptools.package-data]
+# The compiled dashboard. Stated explicitly because setuptools ships only .py
+# files by default, and `writ serve` refuses to start without these — a wheel
+# that silently omitted them would install fine and fail on first use.
+"writ.static" = ["*.js", "*.css"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -29,7 +29,7 @@ import argparse
 import sys
 
 from . import commands
-from .dashboard import DEFAULT_PORT
+from .server import DEFAULT_PORT
 from .decisions import SETTABLE_DECISION_STATUSES
 from .model import JUDGED_STATUSES, SETTABLE_STATUSES
 from .orchestrator import DEFAULT_ORDER, ORDERS
@@ -235,9 +235,8 @@ def build_parser() -> argparse.ArgumentParser:
             "what unlocks next, where it forks, what one task is holding up. A "
             "task reachable by several paths is expanded once and referenced "
             "with ↩ elsewhere, because it is one piece of work, not several.\n\n"
-            "--serve renders the same graph in a browser and follows the store, "
-            "so a long run can be watched instead of re-read. It is read-only: "
-            "the page shows the project, it cannot drive it."
+            "For a live view of the same graph alongside runs, prompts and logs, "
+            "use `writ serve`."
         ),
     )
     p.add_argument(
@@ -252,28 +251,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="add status and acceptance counts to each node",
     )
     p.add_argument("--dot", action="store_true", help="emit graphviz dot")
-    p.add_argument(
-        "--serve",
-        action="store_true",
-        help="open a live dashboard in a browser and follow the run",
+    p.set_defaults(func=commands.cmd_graph)
+
+    p = sub.add_parser(
+        "serve",
+        help="a live web view of the whole project",
+        description=(
+            "Serves everything writ knows — the graph, milestones, task detail, "
+            "run history, the exact prompt each agent was given, its output, and "
+            "the verdict it wrote — and follows the store, so a long run can be "
+            "watched instead of repeatedly re-read.\n\n"
+            "It is read-only. No route changes anything, so the page cannot "
+            "dispatch, cancel, override, or rule on a decision; driving the "
+            "project stays in the terminal where the flags and the reasons are. "
+            "It binds to this machine only, because the page has no "
+            "authentication and does not need any while nothing else can reach it."
+        ),
     )
     p.add_argument(
         "--port",
         type=int,
         default=DEFAULT_PORT,
-        help=f"port for --serve (default {DEFAULT_PORT})",
+        help=f"port to listen on (default {DEFAULT_PORT})",
     )
     p.add_argument(
         "--host",
         default="127.0.0.1",
-        help="interface for --serve (default 127.0.0.1, this machine only)",
+        help="interface to bind (default 127.0.0.1, this machine only)",
     )
     p.add_argument(
         "--no-open",
         action="store_true",
-        help="with --serve, print the url instead of opening a browser",
+        help="print the url instead of opening a browser",
     )
-    p.set_defaults(func=commands.cmd_graph)
+    p.set_defaults(func=commands.cmd_serve)
 
     p = sub.add_parser("logs", help="print or follow a run's output")
     p.add_argument("id", help="run id, or a task id for its latest run")

@@ -7,3 +7,8 @@ build/
 .writ/
 .pytest_cache/
 .pi/
+
+# UI build intermediates. writ/static/ is the committed output and IS tracked:
+# installing writ must not require node.
+ui/build/
+ui/node_modules/

@@ -259,7 +259,7 @@ writ override M01-002 failed --reason "criterion 2 regressed" --accept 2=failed
 
 ## Commands
 
-Fifteen commands, organized by what you are doing rather than what type it
+Sixteen commands, organized by what you are doing rather than what type it
 operates on.
 
 **Set up**
@@ -276,7 +276,8 @@ operates on.
 | `writ status [--watch] [--interval S] [--until-idle]` | progress, ready work, live runs |
 | `writ list [tasks\|milestones\|runs\|decisions] [--status S] [--milestone M] [--task T] [--ready] [--awaiting-review] [--proposed] [--active] [--limit N]` | any collection |
 | `writ show <id> [--verbose] [--prompt]` | any single thing |
-| `writ graph [--levels] [--verbose] [--dot] [--serve]` | the dependency DAG |
+| `writ graph [--levels] [--verbose] [--dot]` | the dependency DAG |
+| `writ serve [--port N] [--host H] [--no-open]` | a live web view of the whole project |
 | `writ logs <run-id\|task-id> [--follow] [--stderr] [--tail N]` | agent output |
 
 **Change**
@@ -390,45 +391,110 @@ For a graph too wide for a page, `-Grankdir=TB` stacks it vertically, and
 writ graph --dot | unflatten -l3 | dot -Tsvg -o graph.svg
 ```
 
-### Watching it live
+## Watching it work
 
-A rendered graph is a snapshot: by the time you have read it, a long run has
-moved on. `--serve` puts the same graph in a browser and follows the store:
+A command answers one question. That is right for driving work and wrong for
+watching it: during a long run the questions come faster than you can type them,
+and they are about relationships — which task is this run for, what was that agent
+actually told, which criterion did the reviewer reject.
+
+`writ serve` puts all of it on one page and follows the store:
 
 ```bash
-writ graph --serve                      # opens a browser on localhost:8731
-writ graph --serve --no-open            # just print the url
-writ graph --serve --port 9000
+writ serve                    # opens a browser on localhost:8731
+writ serve --no-open          # just print the url
+writ serve --port 9000
 ```
 
-Leave it open in one window and `writ run` in another. Nodes change colour as
-agents work, live ones pulse, edges firm up as dependencies complete, and the
-header counts move. Nothing needs reloading.
+```
+writ serve on http://localhost:8731/
+read-only; following .writ/state.json  (^C to stop)
+```
 
-It is laid out by dependency depth, left to right, so a column is work that could
-run at once and the picture shows the parallelism the DAG allows. Each node
-carries its id, title, status and acceptance count, with a bar for criteria
-passed. Hover for the full title and both edge directions. Dashed edges are
-dependencies still outstanding; solid ones are satisfied.
+Leave it open in one window and `writ run` in another. Nothing needs reloading:
+statuses change as agents work, live ones pulse, and the header counts move.
 
-The page follows `state.json` rather than any particular writer, so everything
-shows up: `writ run`, a hand-run `writ dispatch`, or a `writ override` typed in a
-third window. Decisions an agent proposed are listed too, since those wait on a
-human and no run will clear them.
+Six views, reachable by number key:
 
-Three things it deliberately is not:
+| View | What it answers |
+| --- | --- |
+| Overview | where the project stands, what is running, what waits on you |
+| Graph | the shape of the work and what could run at once |
+| Tasks | every task, filterable, with full detail on click |
+| Milestones | progress against the plan's own structure |
+| Runs | every agent invocation, newest first |
+| Decisions | forks an agent hit that a human has not settled |
 
-- **Not a control panel.** It is read-only. There is no endpoint that changes
-  anything, so a tab left open in a forgotten window cannot dispatch, cancel, or
-  override. Driving the project stays in the terminal, where the flags and the
-  reasons are.
-- **Not a dependency.** No framework, no bundle, no CDN. It is `http.server`,
-  hand-written SVG, and server-sent events, so writ still installs with nothing.
-  The page works offline.
-- **Not exposed.** It binds to `127.0.0.1`, because the page has no
-  authentication and does not need any while only this machine can reach it.
-  `--host 0.0.0.0` works and prints a warning: anyone who can route to the port
-  can then read your task titles and decision text.
+### What an agent was actually told
+
+The observability payoff is the run panel. A run holds three things that exist on
+disk and are otherwise a `cat` away at best:
+
+- **the prompt** — exactly what the agent was given, which is how you find out why
+  it did something strange
+- **stdout and stderr** — what it printed while working
+- **the verdict** — what it claimed, criterion by criterion, with its evidence
+
+Click any run to get all four as tabs, with the prompt first, because the usual
+question about a surprising run is what it was told. A task's panel shows the same
+from the other direction: each acceptance criterion with the evidence an agent
+gave for it, who judged it, and the runs that touched it.
+
+Failures explain themselves. The most confusing thing writ can do is exit 0 and
+move nothing, which happens when an agent never writes its verdict:
+
+```
+PROBLEM
+exited without writing a usable verdict — so its acceptance criteria were left
+untouched, and the task was returned to the queue rather than judged
+```
+
+A verdict that was written but rejected says which field was wrong:
+
+```
+PROBLEM
+.writ/runs/M01-002-.../verdict.json: outcome is 'blocked' but blocked_on is empty
+```
+
+### The graph, live
+
+The graph view is laid out by dependency depth, left to right, so a column is work
+that could run at once and the picture shows the parallelism the DAG allows. Each
+node carries its id, title, status and acceptance count, with a bar for criteria
+passed. Dashed edges are dependencies still outstanding; solid green ones are
+satisfied. Hover for the full title and both edge directions.
+
+A dependency naming a task that does not exist is called out rather than rendered
+as a task that merely looks slow:
+
+```
+depends on M99-999, which does not exist — this task cannot become ready
+```
+
+### Three things it is not
+
+- **Not a control panel.** It is read-only, and not by convention: there is no
+  route that writes. A tab left open in a forgotten window cannot dispatch,
+  cancel, override, or rule on a decision, which is also why it needs no auth
+  token, no CSRF defence and no confirmations. Driving the project stays in the
+  terminal, where the flags and the reasons are. Decisions are the clearest case:
+  the page shows you the proposal and the command to rule on it, because a ruling
+  should be typed deliberately with a reason attached.
+- **Not a dependency.** `pip install writ` still pulls in nothing. The page is one
+  compiled script and one stylesheet, served by `http.server` over server-sent
+  events, and it works offline. The UI is written in TypeScript under `ui/src` and
+  compiled to `writ/static` by `node ui/build.mjs`; that output is committed, and
+  a test fails if it drifts from the source. Node is a contributor's tool, never a
+  user's.
+- **Not exposed.** It binds `127.0.0.1`, because the page has no authentication and
+  does not need any while only this machine can reach it. `--host 0.0.0.0` works
+  and warns: anyone who can route to the port can then read your design, task
+  titles, agent prompts and logs.
+
+A hidden tab stops following and says `paused (tab hidden)`, catching up when you
+come back. Not an optimisation — a browser allows about six connections per
+origin, and a held-open stream uses one, so a handful of forgotten writ tabs would
+otherwise starve the next one you opened.
 
 ### A status is a value, not a verb
 

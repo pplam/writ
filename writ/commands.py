@@ -12,13 +12,13 @@ from typing import Any
 
 from . import (
     agents,
-    dashboard,
     decisions,
     orchestrator,
     planner,
     planning,
     render,
     runner,
+    server,
     state,
     verdict,
 )
@@ -774,16 +774,6 @@ def cmd_graph(args) -> None:
     data = state.load(args.root)
     check_dag(data)
     tasks = data["tasks"]
-    if getattr(args, "serve", False):
-        # Checked before serving so a cyclic graph fails at the prompt rather
-        # than as a broken page.
-        dashboard.serve(
-            args.root,
-            host=args.host,
-            port=args.port,
-            open_browser=not args.no_open,
-        )
-        return
     if args.dot:
         _graph_dot(data, tasks)
         return
@@ -1298,6 +1288,22 @@ def cmd_agents(args) -> None:
 def cmd_supervise(args) -> int:
     """Internal: owns a detached run until the agent exits."""
     return runner.execute(Path(args.root), args.run_id)
+
+
+def cmd_serve(args) -> None:
+    """Serve the read-only dashboard.
+
+    A separate command rather than a flag on `graph`: it is not another rendering
+    of the DAG, it is every view writ has — runs, prompts, logs, verdicts,
+    decisions — and naming it after one of them would undersell it.
+    """
+    check_dag(state.load(args.root))  # fail at the prompt, not as a broken page
+    server.serve(
+        args.root,
+        host=args.host,
+        port=args.port,
+        open_browser=not args.no_open,
+    )
 
 
 def cmd_logs(args) -> None:
