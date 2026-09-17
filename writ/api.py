@@ -291,6 +291,10 @@ def _run_row(run: dict[str, Any]) -> dict[str, Any]:
         # A claim writ lowered to match the criteria. Not an error: the verdict
         # was applied, just not as headlined.
         "verdict_downgraded": run.get("verdict_downgraded") or "",
+        # Where a verdict was read from, when the agent did not use the path it
+        # was given. Not an error — the report was used — but worth seeing, since
+        # an agent that does this once will do it again.
+        "verdict_misplaced": run.get("verdict_misplaced") or "",
         "decision": reported.get("decision") or reported.get("outcome") or "",
         "summary": reported.get("summary") or "",
         "unmet": reported.get("unmet", []),

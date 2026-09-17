@@ -703,14 +703,23 @@ def test_a_review_that_cannot_start_is_not_retried_forever(planned, writ, projec
     assert len([r for r in data["runs"].values() if r["role"] == "reviewer"]) == 0
 
 
-def test_a_silent_review_returns_the_task_to_the_queue(planned, writ, project):
-    """An agent that exits 0 with no verdict judged nothing, so nothing moves."""
+def test_a_silent_review_leaves_the_task_awaiting_review(planned, writ, project):
+    """An agent that exits 0 with no verdict judged nothing, so nothing moves.
+
+    Specifically it does not move to `planned`. A lost review costs the judgement,
+    not the implementation: the code still stands and its criteria are still
+    marked passed, so sending the task back to `planned` would describe finished
+    work as not yet started, and drop it out of the review queue entirely. This is
+    the same distinction `reap` draws for an interrupted reviewer.
+    """
     code, _, _ = writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
                       "--reviewer", "true")
     assert code == 0
     data = state.load(project)
-    assert data["tasks"]["M01-001"]["status"] == "planned"
+    assert data["tasks"]["M01-001"]["status"] == "awaiting-review"
     assert len([r for r in data["runs"].values() if r["role"] == "reviewer"]) == 1
+    # criteria the implementer passed are untouched, which is why `planned` was wrong
+    assert all(a["status"] == "passed" for a in data["tasks"]["M01-001"]["acceptances"])
 
 
 def test_an_invalid_review_verdict_is_an_error_not_a_loop(planned, writ, project):

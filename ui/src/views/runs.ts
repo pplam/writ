@@ -127,7 +127,13 @@ function verdictSection(run: Run): HTMLElement | null {
 }
 
 function problemSection(run: Run): HTMLElement | null {
-  if (!run.verdict_error && !run.no_verdict && !run.note && !run.verdict_downgraded)
+  if (
+    !run.verdict_error &&
+    !run.no_verdict &&
+    !run.note &&
+    !run.verdict_downgraded &&
+    !run.verdict_misplaced
+  )
     return null;
   return el(
     'section',
@@ -164,6 +170,17 @@ function problemSection(run: Run): HTMLElement | null {
     // summary claiming success is otherwise unexplained.
     run.verdict_downgraded
       ? el('p', { class: 'muted' }, run.verdict_downgraded)
+      : null,
+    // Also not an error: the report was found and used, just not where writ put
+    // the agent's instructions. Shown so a recurring habit is visible.
+    run.verdict_misplaced
+      ? el(
+          'p',
+          { class: 'muted' },
+          'The verdict was written to ',
+          el('code', {}, run.verdict_misplaced),
+          ' rather than the path the agent was given. Writ used it from there.',
+        )
       : null,
     run.note ? el('p', { class: 'muted' }, run.note) : null,
   );

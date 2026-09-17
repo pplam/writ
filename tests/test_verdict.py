@@ -4,8 +4,10 @@ The fake agents here are shell one-liners that write a verdict file, so the whol
 loop is exercised without a live model.
 """
 import json
+import os
 import shlex
 import sys
+import time
 
 import pytest
 
@@ -34,6 +36,24 @@ else:
     open(match.group(1), "w").write(payload)
     sys.stdout.write("wrote verdict\\n")
 sys.exit({exit_code})
+"""
+    return f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+
+def agent_writing_elsewhere(payload, *, where=".reviews/report-verdict.json"):
+    """A fake agent that reports correctly, to a path of its own invention.
+
+    Modelled on a real reviewer: it did the whole job, wrote a valid verdict to
+    `.reviews/<task>-verdict.json`, announced that in prose, and never touched the
+    path it was given.
+    """
+    script = f"""
+import os, sys
+sys.stdin.read()
+path = {where!r}
+os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+open(path, "w").write({payload!r})
+sys.stdout.write("Verdict written to `" + path + "` — **accept**.\\n")
 """
     return f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
 
@@ -323,6 +343,67 @@ def test_review_refuses_a_task_that_was_never_reported(planned, writ):
     code, _, err = writ("review", "M01-001", "--agent", "true")
     assert code == 2
     assert "not awaiting review" in err
+
+
+def test_a_review_written_to_the_wrong_path_is_still_used(planned, writ, project):
+    """A complete review, written where the agent felt like writing it.
+
+    The real case: a reviewer re-ran the tests, judged all four criteria, wrote a
+    valid verdict to `.reviews/<task>-verdict.json`, and said so in prose. Writ
+    looked at one path, found nothing, and threw the whole review away — then sent
+    the task back to the queue to be reviewed again from scratch.
+    """
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    code, _, err = writ(
+        "review", "M01-001", "--agent", agent_writing_elsewhere(review("accept"))
+    )
+    assert code == 0
+    task = state.load(project)["tasks"]["M01-001"]
+    assert task["status"] == "completed"
+    # used, and not quietly: the habit is worth fixing in the prompt
+    assert "rather than the path it was given" in err
+    run = [r for r in state.load(project)["runs"].values() if r["role"] == "reviewer"][0]
+    assert run["verdict_misplaced"].endswith("report-verdict.json")
+    assert not run.get("no_verdict")
+    assert any("instead of" in e["text"] for e in task["evidence"])
+
+
+def test_a_verdict_from_an_earlier_run_is_not_adopted(planned, writ, project):
+    """The search is bounded by the run's own start time.
+
+    Without that it would find any verdict-shaped file left lying around and
+    credit it to whatever ran last, which is worse than reporting nothing.
+    """
+    stale = project / "stale-verdict.json"
+    stale.write_text(review("accept"), encoding="utf-8")
+    old = time.time() - 3600
+    os.utime(stale, (old, old))
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    writ("review", "M01-001", "--agent", "true")
+    data = state.load(project)
+    run = [r for r in data["runs"].values() if r["role"] == "reviewer"][0]
+    assert not run.get("verdict_misplaced")
+    assert run["no_verdict"]
+    # and the lost review leaves the task where it was, not back at planned
+    assert data["tasks"]["M01-001"]["status"] == "awaiting-review"
+
+
+def test_a_verdict_shaped_file_that_does_not_validate_is_not_adopted(
+    planned, writ, project
+):
+    """Named like a verdict is not the same as being one."""
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    writ(
+        "review",
+        "M01-001",
+        "--agent",
+        agent_writing_elsewhere('{"decision": "maybe"}'),
+    )
+    run = [
+        r for r in state.load(project)["runs"].values() if r["role"] == "reviewer"
+    ][0]
+    assert not run.get("verdict_misplaced")
+    assert run["no_verdict"]
 
 
 def test_review_with_no_id_reviews_everything_awaiting(planned, writ, project):

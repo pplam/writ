@@ -197,14 +197,25 @@ Every dispatched agent is told to write `verdict.json` into its run directory:
 ```
 
 Writ validates it before applying it. A criterion marked `passed` with no
-evidence is rejected, as is an `outcome: complete` that any criterion
-contradicts, or a verdict about criteria the task does not have. Rejected
-verdicts leave the task untouched and print why.
+evidence is rejected, as is a verdict about criteria the task does not have.
+Rejected verdicts leave the task untouched and print why. An `outcome` that the
+verdict's own criteria contradict is lowered to match them rather than rejected,
+since the criteria are the part carrying evidence.
+
+It is read from the path the agent was given, or from JSON printed to stdout in a
+fenced block. Failing both, writ looks for a verdict-shaped file the run wrote
+elsewhere in the project — agents invent their own conventions, and a complete
+report at the wrong path is still a report. A file found that way must postdate
+the run and validate for its role, and where it came from is recorded, because
+the fix for an agent that ignores the path is in the prompt.
 
 **An exit code is not a verdict.** A process can exit 0 having done nothing, so
-a run that produces no usable verdict moves no criterion; the task returns to
-`planned` and the transcript is left for you to read. Conversely a non-zero exit
-with a valid verdict still records the criteria the agent did meet.
+a run that produces no usable verdict moves no criterion and the transcript is
+left for you to read. Where the task lands depends on what was lost: an
+implementation returns to `planned`, while a lost review leaves the task at
+`awaiting-review`, because the code still stands and only the judgement is
+missing. Conversely a non-zero exit with a valid verdict still records the
+criteria the agent did meet.
 
 ### The decision log
 

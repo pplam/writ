@@ -118,6 +118,8 @@ export interface RunRow {
   no_output: boolean;
   /** Set when writ lowered a headline claim its own criteria contradicted. */
   verdict_downgraded: string;
+  /** Where a verdict was found, when the agent ignored the path it was given. */
+  verdict_misplaced: string;
   decision: string;
   summary: string;
   unmet: number[];

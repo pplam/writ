@@ -7,6 +7,8 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, IO, Iterable
 
@@ -104,6 +106,11 @@ def _verdict_instructions(task: dict[str, Any], verdict_path: Path | None) -> st
     lines = [
         "When you are done, report your verdict as JSON to this exact path:",
         f"  {path}",
+        "",
+        "That path, not one of your own choosing. It is where writ reads your "
+        "report from; a verdict written anywhere else, however well named, is not "
+        "the report you were asked for. Announcing a different path in your "
+        "output does not substitute for writing this one.",
         "",
         "The file must contain JSON only — no prose, no code fence.",
         "",
@@ -215,6 +222,13 @@ def build_review_prompt(
     path = verdict_path or Path(verdict.VERDICT_FILENAME)
     lines.append("Write your review as JSON to this exact path:")
     lines.append(f"  {path}")
+    lines.append("")
+    lines.append(
+        "That path, not one of your own choosing. It is where writ reads your "
+        "review from; a verdict written anywhere else, however well named, is not "
+        "the review you were asked for. Announcing a different path in your "
+        "output does not substitute for writing this one."
+    )
     lines.append("")
     lines.append("The file must contain JSON only — no prose, no code fence.")
     lines.append("")
@@ -614,8 +628,17 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
             return
         directory = Path(run["dir"])
         actor = _actor(run)
+        # The run's own start time bounds the search for a misplaced verdict, so
+        # a file left by an earlier run cannot be mistaken for this one's.
+        since = _started_epoch(run)
+        found_at: Path | None = None
         try:
-            reported = verdict.read(directory, role=role)
+            reported, found_at = verdict.read(
+                directory,
+                role=role,
+                root=Path(run.get("cwd") or root),
+                since=since,
+            )
         except WritError as exc:
             reported = None
             run["verdict_error"] = str(exc)
@@ -628,6 +651,17 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
                 run["verdict_error"] = str(exc)
                 add_evidence(task, f"unusable verdict from {actor}: {exc}", actor="writ")
             else:
+                if found_at is not None:
+                    # Used, and said out loud. An agent that writes its report to
+                    # a path of its own choosing will keep doing it, and the
+                    # remedy is in the prompt, not in a wider search next time.
+                    misplaced = (
+                        f"{actor} wrote its verdict to {found_at} instead of "
+                        f"{directory / verdict.VERDICT_FILENAME}; writ used it "
+                        "from there"
+                    )
+                    run["verdict_misplaced"] = str(found_at)
+                    add_evidence(task, misplaced, actor="writ")
                 run["verdict"] = {
                     "outcome": reported.outcome,
                     "decision": reported.decision,
@@ -648,11 +682,21 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
                     decisions.sync_markdown(root, data)
                 return
 
-        # No usable verdict. Record what happened without inventing a judgement:
-        # the task falls back to failed if the process itself failed, and
-        # otherwise returns to planned so it can be picked up again.
+        # No usable verdict. Record what happened without inventing a judgement.
+        # Where the task lands depends on which role failed to report, the same
+        # distinction `reap` draws: a lost implementation returns to the queue,
+        # but a lost *review* leaves the implementation standing and only the
+        # judgement missing, so the task goes back to `awaiting-review`. Sending
+        # it to `planned` discarded a completed implementation's place in the
+        # queue and left criteria marked passed under a status that says the work
+        # has not started — a state no reader can make sense of.
         if task["status"] in ("running", "reviewing"):
-            task["status"] = "failed" if code != 0 else "planned"
+            if code != 0:
+                task["status"] = "failed"
+            elif role == "reviewer":
+                task["status"] = "awaiting-review"
+            else:
+                task["status"] = "planned"
             task["updated_at"] = utcnow()
         reason = "exited without writing a usable verdict" + (
             f" ({note})" if note else ""
@@ -694,6 +738,24 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
         refresh_milestones(data)
 
 
+def _started_epoch(run: dict[str, Any]) -> float:
+    """When this run began, as a unix timestamp, for bounding a file search.
+
+    Falls back to the creation time, and then to 0.0 — a run with no recorded
+    time at all should search everything rather than nothing, since the point is
+    to find a report that exists.
+    """
+    for key in ("started_at", "created_at"):
+        stamp = run.get(key)
+        if not stamp:
+            continue
+        try:
+            return datetime.fromisoformat(stamp).timestamp()
+        except ValueError:  # pragma: no cover - stored by utcnow(), always valid
+            continue
+    return 0.0
+
+
 def _actor(run: dict[str, Any]) -> str:
     """A short name for who produced a verdict, for the evidence log."""
     role = run.get("role", "agent")
@@ -704,20 +766,34 @@ def _actor(run: dict[str, Any]) -> str:
     return f"{role}({name})"
 
 
-def verdict_summary(
-    root: Path, run_id: str
-) -> tuple[str | None, str | None, str | None]:
-    """The status a run produced, any verdict error, and any downgrade.
+@dataclass
+class RunReport:
+    """What a finished run has to say for itself, for the CLI to relay.
 
-    Three values because they are three different things to report: what writ
-    did, a verdict it could not use, and a claim it had to lower.
+    A record rather than a tuple of four optional strings: these are independent
+    things that can each be absent, and positional unpacking of them was already
+    at the point where adding the next one would be a silent breakage.
     """
+
+    #: the task status the verdict produced, or None when nothing was applied
+    status: str | None = None
+    #: a verdict that was written and rejected
+    error: str | None = None
+    #: a headline claim writ lowered to match its own criteria
+    downgraded: str | None = None
+    #: where a verdict was found, when not the path the agent was given
+    misplaced: str | None = None
+
+
+def verdict_summary(root: Path, run_id: str) -> RunReport:
+    """Everything a finished run recorded about its own verdict."""
     data = state.load(root)
     run = data["runs"].get(run_id) or {}
-    return (
-        run.get("resulting_status"),
-        run.get("verdict_error"),
-        run.get("verdict_downgraded"),
+    return RunReport(
+        status=run.get("resulting_status"),
+        error=run.get("verdict_error"),
+        downgraded=run.get("verdict_downgraded"),
+        misplaced=run.get("verdict_misplaced"),
     )
 
 

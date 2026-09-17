@@ -1,4 +1,4 @@
-/* built from ui/src (3141364851a9) */
+/* built from ui/src (934c1cd87a63) */
 /*
  * writ dashboard — compiled from ui/src by ui/build.mjs.
  * Do not edit: change the TypeScript and rebuild.
@@ -777,7 +777,11 @@ function verdictSection(run) {
         : null);
 }
 function problemSection(run) {
-    if (!run.verdict_error && !run.no_verdict && !run.note && !run.verdict_downgraded)
+    if (!run.verdict_error &&
+        !run.no_verdict &&
+        !run.note &&
+        !run.verdict_downgraded &&
+        !run.verdict_misplaced)
         return null;
     return el('section', { class: 'detail-section problem' }, el('h3', {}, 'Problem'), 
     // The most confusing failure writ has: the agent exits 0, the run reads
@@ -800,6 +804,11 @@ function problemSection(run) {
     // summary claiming success is otherwise unexplained.
     run.verdict_downgraded
         ? el('p', { class: 'muted' }, run.verdict_downgraded)
+        : null, 
+    // Also not an error: the report was found and used, just not where writ put
+    // the agent's instructions. Shown so a recurring habit is visible.
+    run.verdict_misplaced
+        ? el('p', { class: 'muted' }, 'The verdict was written to ', el('code', {}, run.verdict_misplaced), ' rather than the path the agent was given. Writ used it from there.')
         : null, run.note ? el('p', { class: 'muted' }, run.note) : null);
 }
 /**

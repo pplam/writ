@@ -23,7 +23,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .state import WritError, utcnow
 
@@ -212,23 +212,141 @@ def find(directory: Path) -> Path | None:
     return path if path.exists() else None
 
 
-def read(directory: Path, *, role: str = "agent") -> Verdict | None:
-    """Load a verdict from a run directory, falling back to stdout chatter.
+#: how deep under the project root to look for a misplaced verdict
+SEARCH_DEPTH = 3
 
-    Returns None when the agent left no parseable verdict at all, which the
-    caller treats as "no claim made" rather than as a failure to report: an
-    agent that crashed early never got the chance.
+#: directories never worth walking for one small JSON file
+SKIP_DIRS = frozenset(
+    {
+        ".git",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        "target",
+        "dist",
+        "build",
+        ".tox",
+    }
+)
+
+#: give up rather than stat a huge tree; a verdict is written near the top
+SEARCH_LIMIT = 2000
+
+
+def misplaced(
+    root: Path, run_directory: Path, *, since: float, role: str = "agent"
+) -> Path | None:
+    """A verdict this run wrote somewhere other than where it was asked to.
+
+    Agents invent their own conventions. One told to write
+    `.writ/runs/<id>/verdict.json` wrote `.reviews/<task>-verdict.json` instead,
+    announced it in prose, and writ read that as no verdict at all — discarding a
+    complete review that had already done the work of re-running the tests.
+
+    The file has to be attributable to this run, so a candidate must be named
+    like a verdict, have been modified since the run started, and parse as one
+    for this role. That is the same trust already extended to the agent, which
+    writes its own verdict and could have written it to the right path; it is not
+    a new one. Nothing here is silent — the caller reports where it was found,
+    because an agent that keeps missing the path is a bug to fix, not to absorb.
+    """
+    seen = 0
+    for candidate in _candidates(root, run_directory):
+        seen += 1
+        if seen > SEARCH_LIMIT:
+            return None
+        try:
+            if candidate.stat().st_mtime < since:
+                continue
+            text = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if not _looks_like_verdict(text):
+            continue
+        try:
+            parse(text, role=role, where=str(candidate))
+        except WritError:
+            # A file that names itself a verdict and does not validate as one is
+            # not a rescue. Reporting it as the reason would send the reader to a
+            # file the agent may not even have meant as its report.
+            continue
+        return candidate
+    return None
+
+
+def _candidates(root: Path, run_directory: Path) -> Iterator[Path]:
+    """Verdict-shaped filenames under `root`, nearest first, bounded in depth."""
+    root = root.resolve()
+    try:
+        skip_runs = run_directory.resolve().parent
+    except OSError:  # pragma: no cover - resolve on a live directory
+        skip_runs = None
+    queue: list[tuple[Path, int]] = [(root, 0)]
+    while queue:
+        directory, depth = queue.pop(0)
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.is_dir():
+                if depth >= SEARCH_DEPTH or entry.name in SKIP_DIRS:
+                    continue
+                # Every other run's directory holds a real verdict for a
+                # different run, which is the one thing that must never be
+                # mistaken for this one's.
+                if skip_runs is not None and entry.resolve() == skip_runs:
+                    continue
+                queue.append((entry, depth + 1))
+            elif entry.suffix == ".json" and "verdict" in entry.name.lower():
+                yield entry
+
+
+def read(
+    directory: Path,
+    *,
+    role: str = "agent",
+    root: Path | None = None,
+    since: float | None = None,
+) -> tuple[Verdict | None, Path | None]:
+    """Load a verdict, and say where it came from if not the expected path.
+
+    Order is exactness first: the file the agent was told to write, then JSON it
+    printed to stdout, then a verdict-shaped file it wrote elsewhere in the
+    project. The last is only searched when `root` and `since` are given, so
+    parsing a run directory in isolation stays a pure function of that directory.
+
+    Returns `(verdict, found_at)`, where `found_at` is set only when the verdict
+    turned up somewhere other than where it was asked for. Returns `(None, None)`
+    when the agent left no parseable verdict at all, which the caller treats as
+    "no claim made" rather than as a failure to report: an agent that crashed
+    early never got the chance.
     """
     path = find(directory)
     if path is not None:
-        return parse(path.read_text(encoding="utf-8"), role=role, where=str(path))
+        return parse(path.read_text(encoding="utf-8"), role=role, where=str(path)), None
     log = directory / "stdout.log"
-    if not log.exists():
-        return None
-    recovered = _from_text(log.read_text(encoding="utf-8", errors="replace"))
-    if recovered is None:
-        return None
-    return parse(recovered, role=role, where=str(log))
+    if log.exists():
+        recovered = _from_text(log.read_text(encoding="utf-8", errors="replace"))
+        if recovered is not None:
+            return parse(recovered, role=role, where=str(log)), None
+    if root is None or since is None:
+        return None, None
+    elsewhere = misplaced(root, directory, since=since, role=role)
+    if elsewhere is None:
+        return None, None
+    return (
+        parse(
+            elsewhere.read_text(encoding="utf-8", errors="replace"),
+            role=role,
+            where=str(elsewhere),
+        ),
+        elsewhere,
+    )
 
 
 def _from_text(text: str) -> str | None:

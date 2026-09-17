@@ -628,6 +628,8 @@ def _render_task(data: dict[str, Any], task: dict[str, Any]) -> str:
                 lines.append(f"      no verdict: {run['no_verdict']}")
             if run.get("verdict_downgraded"):
                 lines.append(f"      downgraded: {run['verdict_downgraded']}")
+            if run.get("verdict_misplaced"):
+                lines.append(f"      verdict found at: {run['verdict_misplaced']}")
     if task.get("evidence"):
         lines.append("\nevidence:")
         for entry in task["evidence"]:
@@ -1218,11 +1220,18 @@ def _report_verdict(
     The status change is the interesting part of a run, so it is reported
     explicitly rather than left for the user to go and look up.
     """
-    status, error, downgraded = runner.verdict_summary(root, run_id)
-    if error:
-        print(f"warning: {error}", file=sys.stderr)
-    if downgraded:
-        print(f"warning: {downgraded}", file=sys.stderr)
+    report = runner.verdict_summary(root, run_id)
+    if report.error:
+        print(f"warning: {report.error}", file=sys.stderr)
+    if report.downgraded:
+        print(f"warning: {report.downgraded}", file=sys.stderr)
+    if report.misplaced:
+        print(
+            f"warning: the {role} wrote its verdict to {report.misplaced} rather "
+            f"than the path it was given; writ used it from there",
+            file=sys.stderr,
+        )
+    status = report.status
     if status is None:
         print(verdict.missing_message(task_id, directory, role), file=sys.stderr)
         return
