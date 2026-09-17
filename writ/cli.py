@@ -31,6 +31,7 @@ import sys
 from . import commands
 from .decisions import SETTABLE_DECISION_STATUSES
 from .model import JUDGED_STATUSES, SETTABLE_STATUSES
+from .orchestrator import DEFAULT_ORDER, ORDERS
 from .state import WritError
 
 DESCRIPTION = """\
@@ -381,6 +382,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="N",
         help="stop after starting N tasks (reviews of them still finish)",
+    )
+    p.add_argument(
+        "--order",
+        choices=ORDERS,
+        default=DEFAULT_ORDER,
+        help=(
+            "which ready task to start first: id follows the plan's numbering "
+            "(default), depth prefers the longest remaining chain, unlocks "
+            "prefers the task the most others wait on"
+        ),
     )
     p.add_argument("--agent", default="pi", help="agent command (default: pi)")
     p.add_argument("--model", help="model for the implementing agent")

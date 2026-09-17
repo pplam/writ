@@ -1390,7 +1390,7 @@ def cmd_run(args) -> int:
         print(f"resuming: reconciled {len(reaped)} interrupted run(s)")
     data = state.load(root)
 
-    jobs = orchestrator.preview(data, budget=args.max_tasks)
+    jobs = orchestrator.preview(data, budget=args.max_tasks, order=args.order)
     if not jobs:
         if args.json:
             render.emit_json({"event": "idle", "reason": _nothing_to_run(data)})
@@ -1404,6 +1404,13 @@ def cmd_run(args) -> int:
         print(
             f"running up to {parallel} agent{'s' if parallel > 1 else ''} at a time"
             + (f", at most {args.max_tasks} tasks" if args.max_tasks else "")
+            + (
+                f", deepest work first"
+                if args.order == "depth"
+                else ", most-unblocking first"
+                if args.order == "unlocks"
+                else ""
+            )
         )
         print(f"logs: {state.runs_dir(root)}")
         print("─" * 62)
@@ -1417,6 +1424,7 @@ def cmd_run(args) -> int:
             reviewer_model=args.reviewer_model,
             parallel=parallel,
             max_tasks=args.max_tasks,
+            order=args.order,
             timeout=args.timeout,
             cwd=args.cwd,
             on_event=reporter,
@@ -1457,12 +1465,13 @@ def cmd_run(args) -> int:
 
 def _run_preview(data, args) -> int:
     """Show the intended walk without spending anything."""
-    jobs = orchestrator.preview(data, budget=args.max_tasks)
+    jobs = orchestrator.preview(data, budget=args.max_tasks, order=args.order)
     if args.json:
         render.emit_json(
             {
                 "event": "preview",
                 "parallel": max(1, args.parallel),
+                "order": args.order,
                 "invocations": [
                     {"role": job.role, "task": job.task_id} for job in jobs
                 ],

@@ -39,6 +39,15 @@ from .state import WritError, utcnow
 #: how long a worker may hold the scheduler open after a stop is requested
 GRACE_SECONDS = 5.0
 
+#: selection orders for the ready set. `id` follows the plan's own numbering, so
+#: work proceeds roughly in the order the design document laid it out and two
+#: runs over the same graph pick the same tasks in the same sequence. `depth`
+#: prefers the task with the longest chain of work behind it, which shortens the
+#: critical path once the pool is wide enough for depth rather than total work to
+#: be the limit. Below that it changes almost nothing, so `id` stays the default.
+ORDERS = ("id", "depth", "unlocks")
+DEFAULT_ORDER = "id"
+
 
 @dataclass
 class Job:
@@ -154,6 +163,7 @@ def next_job(
     budget: int | None,
     started: Iterable[str],
     reviewed: Iterable[str] = (),
+    order: str = DEFAULT_ORDER,
 ) -> Job | None:
     """Choose the next agent invocation, or None when there is nothing to do.
 
@@ -164,6 +174,10 @@ def next_job(
     Each task is attempted once per session in each role. A reviewer that writes
     no verdict leaves its task at `awaiting-review` — the same state that
     selected it — so without this the scheduler would re-review it forever.
+
+    `order` breaks ties among ready tasks. It cannot affect *which* tasks are
+    eligible, only which eligible one goes first, so no order can produce a run
+    the dependency rules would not allow.
     """
     busy = set(busy)
     started = set(started)
@@ -178,16 +192,76 @@ def next_job(
     if budget is not None and len(started) >= budget:
         return None
 
-    for task in sorted(data["tasks"].values(), key=lambda item: item["id"]):
-        if task["id"] in busy or task["id"] in started:
-            continue
-        if effective_status(data, task) != "ready":
-            continue
-        return Job(task_id=task["id"], role="agent")
-    return None
+    ready = [
+        task
+        for task in data["tasks"].values()
+        if task["id"] not in busy
+        and task["id"] not in started
+        and effective_status(data, task) == "ready"
+    ]
+    if not ready:
+        return None
+    return Job(task_id=_first(data, ready, order), role="agent")
 
 
-def preview(data: dict[str, Any], *, budget: int | None) -> list[Job]:
+def _first(data: dict[str, Any], ready: list[dict[str, Any]], order: str) -> str:
+    """The id of the ready task to start next, under `order`.
+
+    Every order falls back to the id, so selection stays deterministic: two runs
+    over the same graph make the same choices, which matters more for reading a
+    transcript than the few percent a cleverer order buys.
+    """
+    if order == "depth":
+        depths = _depths(data)
+        return min(ready, key=lambda t: (-depths[t["id"]], t["id"]))["id"]
+    if order == "unlocks":
+        counts = _dependents(data)
+        return min(ready, key=lambda t: (-len(counts[t["id"]]), t["id"]))["id"]
+    return min(task["id"] for task in ready)
+
+
+def _dependents(data: dict[str, Any]) -> dict[str, set[str]]:
+    """Reverse edges: task id -> the tasks that wait on it."""
+    out: dict[str, set[str]] = {task_id: set() for task_id in data["tasks"]}
+    for task_id, task in data["tasks"].items():
+        for dep in task.get("depends_on", []):
+            if dep in out:
+                out[dep].add(task_id)
+    return out
+
+
+def _depths(data: dict[str, Any]) -> dict[str, int]:
+    """Longest chain of remaining work from each task to a leaf.
+
+    Completed tasks contribute nothing, so the measure is of work still to do:
+    finishing the deepest remaining chain first is what keeps the critical path
+    from becoming the thing everything else waits on.
+    """
+    dependents = _dependents(data)
+    tasks = data["tasks"]
+    depths: dict[str, int] = {}
+
+    def depth(task_id: str, seen: frozenset[str] = frozenset()) -> int:
+        if task_id in depths:
+            return depths[task_id]
+        if task_id in seen:  # pragma: no cover - check_dag rejects cycles
+            return 0
+        onward = [
+            depth(child, seen | {task_id})
+            for child in dependents.get(task_id, ())
+            if tasks[child]["status"] != "completed"
+        ]
+        depths[task_id] = 1 + max(onward, default=0)
+        return depths[task_id]
+
+    for task_id in tasks:
+        depth(task_id)
+    return depths
+
+
+def preview(
+    data: dict[str, Any], *, budget: int | None, order: str = DEFAULT_ORDER
+) -> list[Job]:
     """The jobs a session would run, assuming everything passes.
 
     A projection, not a promise: a rejected verdict changes what comes next. It
@@ -204,7 +278,9 @@ def preview(data: dict[str, Any], *, budget: int | None) -> list[Job]:
     limit = 4 * len(simulated) + 8
     while guard < limit:
         guard += 1
-        job = next_job(shadow, busy=[], budget=budget, started=started)
+        job = next_job(
+            shadow, busy=[], budget=budget, started=started, order=order
+        )
         if job is None:
             break
         jobs.append(job)
@@ -230,6 +306,7 @@ def run(
     reviewer_model: str | None = None,
     parallel: int = 1,
     max_tasks: int | None = None,
+    order: str = DEFAULT_ORDER,
     timeout: int | None = None,
     cwd: str | None = None,
     agent_args: list[str] | None = None,
@@ -263,6 +340,7 @@ def run(
                     budget=max_tasks,
                     started=started,
                     reviewed=session.review_attempts,
+                    order=order,
                 )
                 if job is None:
                     break

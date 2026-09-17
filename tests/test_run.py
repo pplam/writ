@@ -799,3 +799,139 @@ def test_max_tasks_zero_means_reviews_only(planned, writ, project):
     data = state.load(project)
     assert data["tasks"]["M01-001"]["status"] == "completed"
     assert data["tasks"]["M02-001"]["status"] == "planned", "new work was started"
+
+
+# --------------------------------------------------------------------------
+# selection order
+
+
+def hub_and_chain(writ):
+    """A shallow hub that unblocks three, beside a four-deep chain.
+
+    Shaped so the three orders visibly disagree: by id the hub comes first, by
+    depth the chain does. Returns (hub, chain_head) since the fixture already
+    holds tasks and the new ids depend on what is there.
+    """
+    def add(title, dep):
+        code, out, err = writ("task", "--title", title, "--milestone", "M01",
+                              "--depends", dep, "--acceptance", "a")
+        assert code == 0, err
+        return out.strip().split()[-1]
+
+    root = "M01-001"
+    hub = add("hub", root)
+    for _ in range(3):
+        add("leaf", hub)
+    head = add("deep head", root)
+    previous = head
+    for step in range(3):
+        previous = add(f"deep {step}", previous)
+    assert hub < head, "the hub must be numbered first for these tests to bite"
+    return hub, head
+
+
+def dispatch_order(writ, *args):
+    _, out, _ = writ("run", "--dry-run", *args)
+    return [
+        line.split()[-1]
+        for line in out.splitlines()
+        if "dispatch" in line
+    ]
+
+
+def test_the_default_order_follows_the_plan(planned, writ):
+    hub_and_chain(writ)
+    order = dispatch_order(writ)
+    assert order == sorted(order), "ids were not walked in order"
+
+
+def test_depth_prefers_the_longest_remaining_chain(planned, writ):
+    hub, head = hub_and_chain(writ)
+    order = dispatch_order(writ, "--order", "depth")
+    # the chain head must come before the hub, though the hub is numbered first
+    assert order.index(head) < order.index(hub)
+
+
+def test_unlocks_prefers_the_task_most_others_wait_on(planned, writ):
+    hub, head = hub_and_chain(writ)
+    order = dispatch_order(writ, "--order", "unlocks")
+    assert order.index(hub) < order.index(head)
+
+
+def test_no_order_violates_a_dependency(planned, writ, project):
+    """An order may only choose among ready tasks, never widen the ready set."""
+    hub_and_chain(writ)
+    data = state.load(project)
+    for name in ("id", "depth", "unlocks"):
+        order = dispatch_order(writ, "--order", name)
+        seen = set()
+        for task_id in order:
+            for dep in data["tasks"][task_id].get("depends_on", []):
+                assert dep in seen, f"{name}: {task_id} ran before {dep}"
+            seen.add(task_id)
+
+
+def test_every_order_runs_every_task(planned, writ):
+    hub_and_chain(writ)
+    expected = len(dispatch_order(writ))
+    for name in ("depth", "unlocks"):
+        assert len(dispatch_order(writ, "--order", name)) == expected
+
+
+def test_an_order_is_deterministic(planned, writ):
+    hub_and_chain(writ)
+    for name in ("id", "depth", "unlocks"):
+        first = dispatch_order(writ, "--order", name)
+        assert dispatch_order(writ, "--order", name) == first
+
+
+def test_an_unknown_order_is_a_usage_error(planned, writ):
+    code, _, err = writ("run", "--order", "sideways", "--dry-run")
+    assert code == 2
+    assert "invalid choice" in err
+
+
+def test_depth_ignores_completed_work(planned, writ, project):
+    """Depth measures work still to do, not the chain's original length."""
+    hub, head = hub_and_chain(writ)
+    data = state.load(project)
+    deep = orchestrator._depths(data)[head]
+    chain = [
+        task_id
+        for task_id, task in data["tasks"].items()
+        if task["title"].startswith("deep ")
+    ]
+    with state.transaction(project) as live:
+        for task_id in chain:
+            live["tasks"][task_id]["status"] = "completed"
+    shallower = orchestrator._depths(state.load(project))[head]
+    assert shallower < deep
+
+
+def test_a_non_default_order_is_stated_in_the_banner(planned, writ):
+    hub_and_chain(writ)
+    _, out, _ = writ("run", "--max-tasks", "1", "--order", "depth",
+                     "--agent", agent(IMPLEMENTER), "--reviewer", agent(REVIEWER))
+    assert "deepest work first" in out
+
+
+def test_the_default_order_says_nothing_extra(planned, writ):
+    _, out, _ = writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
+                     "--reviewer", agent(REVIEWER))
+    assert "deepest work first" not in out
+    assert "most-unblocking first" not in out
+
+
+def test_the_order_reaches_the_json_preview(planned, writ):
+    _, out, _ = writ("--json", "run", "--dry-run", "--order", "depth")
+    assert json.loads(out)["order"] == "depth"
+
+
+def test_a_chosen_order_actually_runs(planned, writ, project):
+    hub_and_chain(writ)
+    code, _, err = writ("run", "--parallel", "2", "--order", "depth",
+                        "--agent", agent(IMPLEMENTER), "--reviewer",
+                        agent(REVIEWER))
+    assert code == 0, err
+    data = state.load(project)
+    assert all(t["status"] == "completed" for t in data["tasks"].values())

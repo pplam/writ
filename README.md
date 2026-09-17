@@ -420,6 +420,7 @@ writ run                               # one agent at a time, to the end
 writ run --parallel 3                  # three at a time where the graph allows
 writ run --max-tasks 5                 # start at most five tasks, then stop
 writ run --max-tasks 0                 # review what is waiting, start nothing
+writ run --order depth                 # longest chain of work first
 writ run --dry-run                     # the projected walk, spending nothing
 ```
 
@@ -622,6 +623,70 @@ Inside one process it works like this:
 One thread selects and claims; workers only run agents and record verdicts. Two
 threads both asking "what is ready?" could answer with the same task, so the
 question is only ever asked in one place.
+
+### Which ready task goes first
+
+When more tasks are ready than there are free slots, something has to choose.
+`--order` picks the rule:
+
+| order | starts | good for |
+|---|---|---|
+| `id` (default) | lowest task id | following the design document's own order |
+| `depth` | longest chain of remaining work | wide pools, where depth is the limit |
+| `unlocks` | the task the most others wait on | opening the graph early |
+
+Take a graph with a shallow hub that unblocks three leaves, next to a four-deep
+chain:
+
+```
+> M01-001  Root
+├─ · M01-002  Hub (unblocks 3)
+│  ├─ · M01-004  leaf A
+│  ├─ · M01-005  leaf B
+│  └─ · M01-006  leaf C
+└─ · M01-003  Deep head
+   └─ · M01-007  deep 2
+      └─ · M01-008  deep 3
+         └─ · M01-009  deep 4
+```
+
+The three orders disagree about what to do once the root is done:
+
+```
+--order id        M01-001  M01-002  M01-003  M01-004 …
+--order depth     M01-001  M01-003  M01-007  M01-002 …   drives the chain
+--order unlocks   M01-001  M01-002  M01-003  M01-007 …   opens the hub
+```
+
+On that graph at `--parallel 3` all three orders finish within a second of each
+other — it is too small for the choice to matter. The gain shows up when a deep
+chain is numbered *late*, so `id` saves it for last:
+
+```
+23 tasks: twelve shallow leaves (low ids) beside a ten-deep chain (high ids)
+--parallel 4
+
+  --order id        16-17s      the chain only starts once the leaves are done
+  --order depth     12-13s      the chain runs from the start, leaves fill in
+  --order unlocks   12-13s
+```
+
+That is roughly 22%, and about the best this buys. Across random graphs the
+difference is under 1% at `--parallel 2`, around 5% at 4, and about 10% at 8 —
+because below a wide pool the limit is total work divided by workers, and no
+ordering changes how much work there is. Only once the pool can absorb the whole
+ready set does the graph's depth start to bind.
+
+So `id` stays the default. It is predictable: work proceeds roughly in the order
+the design document laid out, and two runs over the same graph pick the same
+tasks in the same sequence, which is worth more when reading a transcript than a
+few percent of wall clock. Reach for `depth` when you are running wide and the
+plan's numbering does not already put the long pole first.
+
+An order only chooses among tasks that are *already* ready. It cannot make a task
+runnable sooner, so no `--order` can produce a run the dependency rules would not
+allow — and switching order between sessions is safe, since it is a preference for
+one run rather than stored state.
 
 ### Preview before spending
 
