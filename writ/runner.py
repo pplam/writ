@@ -698,6 +698,13 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
             else:
                 task["status"] = "planned"
             task["updated_at"] = utcnow()
+        # Recorded on this path too, not only after a verdict is applied. The first
+        # question about a run that judged nothing is where the task ended up, and
+        # the answer is no longer the same for every such run: a lost review holds
+        # at `awaiting-review` while a lost implementation returns to the queue.
+        # Left unset, anything reporting this had to guess, and the dashboard
+        # guessed one of them for both.
+        run["resulting_status"] = task["status"]
         reason = "exited without writing a usable verdict" + (
             f" ({note})" if note else ""
         )
@@ -775,7 +782,10 @@ class RunReport:
     at the point where adding the next one would be a silent breakage.
     """
 
-    #: the task status the verdict produced, or None when nothing was applied
+    #: the task status a verdict produced, or None when no verdict was applied.
+    #: Deliberately not "where the task ended up": the run records that for every
+    #: run, including the ones that judged nothing, and the CLI needs to tell a
+    #: status that was *decided* from one the task merely fell back to.
     status: str | None = None
     #: a verdict that was written and rejected
     error: str | None = None
@@ -789,8 +799,12 @@ def verdict_summary(root: Path, run_id: str) -> RunReport:
     """Everything a finished run recorded about its own verdict."""
     data = state.load(root)
     run = data["runs"].get(run_id) or {}
+    # `resulting_status` is now set on the no-verdict path too, so that a run can
+    # say where the task went. Reading it as "a verdict produced this" would have
+    # the CLI announce a judgement for a run that made none.
+    judged = None if run.get("no_verdict") else run.get("resulting_status")
     return RunReport(
-        status=run.get("resulting_status"),
+        status=judged,
         error=run.get("verdict_error"),
         downgraded=run.get("verdict_downgraded"),
         misplaced=run.get("verdict_misplaced"),

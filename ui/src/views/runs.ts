@@ -128,6 +128,31 @@ function verdictSection(run: Run): HTMLElement | null {
   );
 }
 
+/**
+ * What became of the task, for a run that judged nothing.
+ *
+ * Read off the run rather than asserted, because it is not the same for every
+ * such run and the wrong version is worse than none: a reviewer that fails to
+ * report leaves a finished implementation standing at `awaiting-review`, and
+ * telling that reader their task "was returned to the queue" sends them to
+ * re-dispatch work that is already done. An implementer that fails to report is
+ * the case that really does go back.
+ *
+ * Falls back to naming the gap rather than filling it. A run recorded before the
+ * status was kept has nothing to report here, and saying so is honest where
+ * picking the likelier answer would not be.
+ */
+function noVerdictOutcome(run: Run): string {
+  if (!run.resulting_status) return 'the task was left unjudged';
+  if (run.resulting_status === 'awaiting-review') {
+    return 'the task is still awaiting review, with the implementation intact';
+  }
+  if (run.resulting_status === 'planned') {
+    return 'the task was returned to the queue rather than judged';
+  }
+  return `the task became ${run.resulting_status} rather than judged`;
+}
+
 function problemSection(run: Run): HTMLElement | null {
   if (
     !run.verdict_error &&
@@ -148,8 +173,12 @@ function problemSection(run: Run): HTMLElement | null {
       ? el(
           'p',
           { class: 'error' },
-          `${run.no_verdict} — so its acceptance criteria were left untouched, and ` +
-            'the task was returned to the queue rather than judged',
+          // A second sentence rather than another clause: the reason already carries
+          // its own "— and ..." diagnosis for a silent run, and hanging the
+          // consequence off that too produced a sentence with three clauses and two
+          // dashes that had to be read twice.
+          `${run.no_verdict}. Its acceptance criteria were left untouched, and ` +
+            `${noVerdictOutcome(run)}.`,
         )
       : null,
     // A silent run is not an agent that skipped its report, and telling the two

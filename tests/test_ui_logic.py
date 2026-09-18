@@ -381,3 +381,41 @@ def test_a_render_is_what_keeps_the_scroll_position():
         })()"""
     )
     assert kept == 900
+
+
+# ------------------------------------------------------- what became of the task
+
+
+def test_a_lost_review_is_not_described_as_returning_to_the_queue():
+    """The wording bug. A reviewer that writes no verdict moves nothing.
+
+    The implementation is still there with its criteria still passed, and the task
+    is still in the review queue. Telling that reader the task "was returned to the
+    queue rather than judged" — as this said for every no-verdict run — sends them
+    to re-dispatch work that is already done.
+    """
+    sentence = evaluate("noVerdictOutcome({resulting_status: 'awaiting-review'})")
+    assert sentence == 'the task is still awaiting review, with the implementation intact'
+
+
+def test_a_lost_implementation_is_the_case_that_did_return_to_the_queue():
+    assert evaluate("noVerdictOutcome({resulting_status: 'planned'})") == (
+        'the task was returned to the queue rather than judged'
+    )
+
+
+def test_an_unrecorded_outcome_names_the_gap_rather_than_filling_it():
+    """Runs recorded before the status was kept have nothing to report here.
+
+    Naming the gap is honest; picking the likelier answer would be the same bug
+    again, quieter.
+    """
+    assert evaluate("noVerdictOutcome({resulting_status: ''})") == (
+        'the task was left unjudged'
+    )
+
+
+def test_a_failed_task_is_reported_as_what_it_became():
+    assert evaluate("noVerdictOutcome({resulting_status: 'failed'})") == (
+        'the task became failed rather than judged'
+    )

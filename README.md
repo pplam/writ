@@ -456,9 +456,16 @@ move nothing, which happens when an agent never writes its verdict:
 
 ```
 PROBLEM
-exited without writing a usable verdict — so its acceptance criteria were left
+exited without writing a usable verdict. Its acceptance criteria were left
 untouched, and the task was returned to the queue rather than judged
 ```
+
+What became of the task is read off the run, not assumed, because it is not the
+same answer every time. A reviewer that fails to report leaves a finished
+implementation standing, so its task holds at `awaiting-review` and the panel says
+so — telling that reader the task went back to the queue would send them to
+re-dispatch work that is already done. Only a lost *implementation* returns to the
+queue.
 
 When the transcript is empty too, writ says so rather than sending you to read
 nothing. An agent CLI that cannot reach its model often reports that as exit 0

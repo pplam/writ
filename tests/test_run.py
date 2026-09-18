@@ -1094,3 +1094,56 @@ def test_the_json_stream_carries_the_same_facts(planned, writ):
     assert any(e["summary"] for e in finished)
     assert any(e["unmet"] for e in finished)
     assert any(e["criteria"] for e in finished)
+
+
+
+def test_a_run_that_judged_nothing_still_records_where_the_task_went(
+    planned, writ, project
+):
+    """Where the task landed is part of the record, not left to the reader.
+
+    It is no longer the same answer for every such run: a lost review holds the
+    task at `awaiting-review` while a lost implementation returns it to the queue.
+    Unrecorded, anything reporting the run had to guess, and the dashboard guessed
+    "returned to the queue" for both — telling someone whose implementation was
+    intact to re-dispatch finished work.
+    """
+    code, _, _ = writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
+                      "--reviewer", "true")
+    assert code == 0
+    data = state.load(project)
+    run = next(r for r in data["runs"].values() if r["role"] == "reviewer")
+    assert run["resulting_status"] == "awaiting-review"
+    assert run["resulting_status"] == data["tasks"]["M01-001"]["status"]
+
+
+def test_a_lost_implementation_records_the_queue_it_returned_to(planned, writ, project):
+    """The other half: the same field, the other answer."""
+    code, _, _ = writ("run", "--max-tasks", "1", "--agent", "true")
+    data = state.load(project)
+    run = next(r for r in data["runs"].values() if r["role"] == "agent")
+    assert run["resulting_status"] == "planned"
+    assert run["resulting_status"] == data["tasks"]["M01-001"]["status"]
+
+
+def test_a_run_that_judged_nothing_does_not_report_a_judgement(planned, writ, project):
+    """`resulting_status` says where the task went, not that a verdict said so.
+
+    Recording it on the no-verdict path gave one field two meanings, and the CLI
+    read the other one: `_report_verdict` takes `status is None` as "nothing was
+    applied" and otherwise announces `task -> status (n/m criteria passed, judged by
+    the role)`. So a run that judged nothing began claiming it had. Caught only by
+    an unrelated assertion in another test, which is why this one exists.
+    """
+    writ("dispatch", "M01-001", "--agent", agent(IMPLEMENTER))
+    code, out, err = writ("review", "M01-001", "--agent", "true")
+    assert code == 0
+    # the claim that must not appear: nothing judged anything here
+    assert "judged by the reviewer" not in out
+    assert "-> awaiting-review (" not in out
+    # what it says instead
+    assert "exited without a usable verdict" in err
+    # and the run still records where the task landed, which is the point of it
+    data = state.load(project)
+    run = next(r for r in data["runs"].values() if r["role"] == "reviewer")
+    assert run["resulting_status"] == "awaiting-review"

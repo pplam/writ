@@ -1,4 +1,4 @@
-/* built from ui/src (cb67dd2c1146) */
+/* built from ui/src (9c1460fec645) */
 /*
  * writ dashboard — compiled from ui/src by ui/build.mjs.
  * Do not edit: change the TypeScript and rebuild.
@@ -786,6 +786,31 @@ function verdictSection(run) {
         ? el('div', { class: 'proposed' }, el('h4', {}, 'decisions proposed'), el('ul', {}, ...run.decisions.map((title) => el('li', {}, title))))
         : null);
 }
+/**
+ * What became of the task, for a run that judged nothing.
+ *
+ * Read off the run rather than asserted, because it is not the same for every
+ * such run and the wrong version is worse than none: a reviewer that fails to
+ * report leaves a finished implementation standing at `awaiting-review`, and
+ * telling that reader their task "was returned to the queue" sends them to
+ * re-dispatch work that is already done. An implementer that fails to report is
+ * the case that really does go back.
+ *
+ * Falls back to naming the gap rather than filling it. A run recorded before the
+ * status was kept has nothing to report here, and saying so is honest where
+ * picking the likelier answer would not be.
+ */
+function noVerdictOutcome(run) {
+    if (!run.resulting_status)
+        return 'the task was left unjudged';
+    if (run.resulting_status === 'awaiting-review') {
+        return 'the task is still awaiting review, with the implementation intact';
+    }
+    if (run.resulting_status === 'planned') {
+        return 'the task was returned to the queue rather than judged';
+    }
+    return `the task became ${run.resulting_status} rather than judged`;
+}
 function problemSection(run) {
     if (!run.verdict_error &&
         !run.no_verdict &&
@@ -798,8 +823,13 @@ function problemSection(run) {
     // "completed", and the task did not move. Nothing on the page explains that
     // unless this does.
     run.no_verdict
-        ? el('p', { class: 'error' }, `${run.no_verdict} — so its acceptance criteria were left untouched, and ` +
-            'the task was returned to the queue rather than judged')
+        ? el('p', { class: 'error' }, 
+        // A second sentence rather than another clause: the reason already carries
+        // its own "— and ..." diagnosis for a silent run, and hanging the
+        // consequence off that too produced a sentence with three clauses and two
+        // dashes that had to be read twice.
+        `${run.no_verdict}. Its acceptance criteria were left untouched, and ` +
+            `${noVerdictOutcome(run)}.`)
         : null, 
     // A silent run is not an agent that skipped its report, and telling the two
     // apart is the difference between re-reading a transcript that says nothing
