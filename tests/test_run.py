@@ -1011,11 +1011,48 @@ def test_the_log_counts_criteria_as_they_pass(planned, writ):
 
 def test_a_failure_says_why_in_the_log(planned, writ):
     """Otherwise the one line a reader sees sends them to `writ show`."""
-    _, out, _ = writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
-                     "--reviewer", agent(REJECTOR))
+    _, out, _ = writ("run", "--max-tasks", "1", "--max-rework", "0",
+                     "--agent", agent(IMPLEMENTER), "--reviewer", agent(REJECTOR))
     assert "x M01-001  failed" in out
     assert "unmet 1, 2, 3" in out
     assert "not convinced" in out, "the reviewer's own reason was dropped"
+
+
+def test_a_rejection_reads_as_rework_not_as_a_fresh_task(planned, writ):
+    """A bare `planned` would read as though the task had never run."""
+    _, out, _ = writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
+                     "--reviewer", agent(REJECTOR))
+    assert "rework 1/2" in out
+    assert "rework   M01-001" in out, "the re-dispatch is not called a dispatch"
+    assert "not convinced" in out, "the reviewer's reason must carry to the rework"
+
+
+def test_a_rejected_task_is_reworked_within_the_same_session(planned, writ, project):
+    """The ledger must not treat the second attempt as a repeat of the first."""
+    writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
+         "--reviewer", agent(REJECTOR))
+    data = state.load(project)
+    implementations = [
+        r for r in data["runs"].values()
+        if r["role"] == "agent" and r["task"] == "M01-001"
+    ]
+    assert len(implementations) == 3, "one dispatch plus two reworks"
+    assert data["tasks"]["M01-001"]["status"] == "failed"
+    assert data["tasks"]["M01-001"]["rework"]["exhausted"] is True
+
+
+def test_rework_does_not_spend_another_task_from_the_budget(planned, writ, project):
+    """--max-tasks caps how much of the graph a session takes on, not attempts."""
+    writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
+         "--reviewer", agent(REJECTOR))
+    data = state.load(project)
+    assert {r["task"] for r in data["runs"].values()} == {"M01-001"}
+
+
+def test_the_summary_counts_what_was_sent_back(planned, writ):
+    _, out, _ = writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
+                     "--reviewer", agent(REJECTOR))
+    assert "sent back for rework 2" in out
 
 
 def test_a_pass_does_not_repeat_the_summary(planned, writ):
@@ -1077,8 +1114,8 @@ def test_a_long_summary_is_trimmed_to_one_line(planned, writ):
         '"summary": "not convinced"',
         '"summary": "' + "a very long explanation " * 20 + '"',
     )
-    _, out, _ = writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
-                     "--reviewer", agent(wordy))
+    _, out, _ = writ("run", "--max-tasks", "1", "--max-rework", "0",
+                     "--agent", agent(IMPLEMENTER), "--reviewer", agent(wordy))
     reason = [line for line in transitions(out) if "a very long" in line]
     assert len(reason) == 1, reason
     assert len(reason[0]) < 120

@@ -30,6 +30,38 @@ SETTABLE_STATUSES = ("planned", "running", "blocked", "failed")
 #: statuses only a verdict or an explicit override may produce
 JUDGED_STATUSES = ("completed", "awaiting-review")
 
+#: how many times a reviewer may send one task back before it is left failed.
+#:
+#: A rejection is a finding, not a dead end. The reviewer just produced the one
+#: thing an implementing agent most needs — a named criterion, an actor who did
+#: not write the code, and the evidence they went on — so the useful next move is
+#: another attempt carrying that report, not a `failed` task waiting for someone
+#: to notice it and retype the reviewer's words into a fresh dispatch.
+#:
+#: Bounded, because an agent that cannot satisfy a reviewer in a few tries is not
+#: going to be argued into it by a fourth: at that point the task, the criteria,
+#: or the design is what is wrong, and that is a human's call. Zero restores the
+#: older behaviour of failing on the first rejection.
+DEFAULT_MAX_REWORK = 2
+
+
+def rework_attempts(task: dict[str, Any]) -> int:
+    """How many times a reviewer has sent this task back for another attempt."""
+    return int((task.get("rework") or {}).get("attempt", 0))
+
+
+def open_rework(task: dict[str, Any]) -> dict[str, Any] | None:
+    """The rejection this task is currently expected to answer, if any.
+
+    A record is open until a reviewer accepts the work or the rework budget runs
+    out. Kept after it closes — what a task was sent back for is part of its
+    history — so the two are distinguished here rather than by deleting it.
+    """
+    record = task.get("rework")
+    if not record or record.get("resolved_at") or record.get("exhausted"):
+        return None
+    return record
+
 
 def get_task(data: dict[str, Any], task_id: str) -> dict[str, Any]:
     task = data["tasks"].get(task_id)
@@ -204,6 +236,25 @@ def set_status(
                 f"{task_id} has unmet acceptance criteria: {listed} "
                 "(only a passing verdict clears these)"
             )
+    if status == "planned" and (task.get("rework") or {}).get("exhausted"):
+        # A task whose rework budget ran out is failed until a human moves it, and
+        # moving it back to `planned` is that human saying "try again". Leaving the
+        # spent counter in place would make the next rejection immediately final,
+        # which is the opposite of what they just asked for. The record stays for
+        # its history; only the budget is reset, and the evidence log still carries
+        # every round that led here.
+        record = task["rework"]
+        # The attempt counter keeps climbing — it is the honest count of how many
+        # times this task has been rejected, and the next agent should see it. The
+        # budget is extended instead, so "attempt 4 of 2+2" rather than a counter
+        # that lies about the history.
+        task["rework"] = {
+            **record,
+            "allowance": int(record.get("allowance", 0)) + int(record.get("max", 0)),
+            "exhausted": False,
+            "reset_by": actor,
+            "reset_at": utcnow(),
+        }
     task["status"] = status
     task["updated_at"] = utcnow()
     if evidence:

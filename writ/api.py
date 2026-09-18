@@ -29,6 +29,8 @@ from .model import (
     blocking_dependencies,
     effective_status,
     milestone_tasks,
+    open_rework,
+    rework_attempts,
 )
 
 #: Log tail sent with a run detail. Enough to see how an agent is doing without
@@ -178,6 +180,11 @@ def task_row(data: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
             if task["id"] in other.get("depends_on", [])
         ),
         "runs": len(task.get("runs", [])),
+        # How many times a reviewer sent this task back. A task on its third
+        # attempt and one on its first are in the same status and are not the same
+        # situation, and the row is where that has to show.
+        "rework_attempts": rework_attempts(task),
+        "awaiting_rework": open_rework(task) is not None,
     }
 
 
@@ -206,6 +213,7 @@ def task(data: dict[str, Any], task_id: str) -> dict[str, Any]:
                 for index, item in enumerate(found.get("acceptances", []), start=1)
             ],
             "evidence": found.get("evidence", []),
+            "rework": found.get("rework") or None,
             "run_list": [
                 _run_row(data["runs"][run_id])
                 for run_id in found.get("runs", [])

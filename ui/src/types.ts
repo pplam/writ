@@ -68,6 +68,10 @@ export interface TaskRow {
   blocked_by: string[];
   blocks: string[];
   runs: number;
+  /** Times a reviewer rejected this task and sent it back for another attempt. */
+  rework_attempts: number;
+  /** A rejection this task has not yet answered: it is queued to be reworked. */
+  awaiting_rework: boolean;
 }
 
 export interface Acceptance {
@@ -85,6 +89,39 @@ export interface Evidence {
   at: string;
 }
 
+export interface Rework {
+  attempt: number;
+  /** The --max-rework the rejecting review ran under. */
+  max: number;
+  /** Extra attempts granted by an operator requeueing an exhausted task. */
+  allowance: number;
+  /** max + allowance: what `attempt` is actually measured against. */
+  budget: number;
+  at: string;
+  reviewer: string;
+  summary: string;
+  notes: string;
+  unmet: number[];
+  /** What the reviewer objected to, per criterion, in its own words. */
+  findings: ReworkFinding[];
+  /** What the previous attempt claimed, before the review overwrote it. */
+  claimed: ReworkFinding[];
+  claimed_by: string;
+  claimed_summary: string;
+  /** The budget ran out: the task is failed rather than queued. */
+  exhausted: boolean;
+  resolved_at?: string;
+  resolved_by?: string;
+  reset_by?: string;
+  reset_at?: string;
+}
+
+export interface ReworkFinding {
+  number: number;
+  status: string;
+  evidence: string;
+}
+
 export interface Task extends TaskRow {
   design_doc: string;
   design_section: string;
@@ -93,6 +130,8 @@ export interface Task extends TaskRow {
   forbidden: string[];
   acceptances: Acceptance[];
   evidence: Evidence[];
+  /** The most recent rejection, open or answered. Null if never rejected. */
+  rework: Rework | null;
   run_list: RunRow[];
   created_at: string;
   updated_at: string;

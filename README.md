@@ -147,18 +147,23 @@ structured as a task list, or when you want no agent in the loop.
 
 ```
 planned ──(deps complete)──> ready ──dispatch──> running
-                                                    │
-                                         agent writes a verdict
-                                                    │
-                    ┌───────────────────────────────┼──────────────┐
-                    ▼                               ▼              ▼
-             awaiting-review                     failed         blocked
-                    │
-                 review ──> reviewing ──┬──> completed   (reviewer accepted)
-                                        └──> failed      (reviewer rejected)
+   ▲                                                │
+   │                                     agent writes a verdict
+   │                                                │
+   │                ┌───────────────────────────────┼──────────────┐
+   │                ▼                               ▼              ▼
+   │         awaiting-review                     failed         blocked
+   │                │
+   │             review ──> reviewing ──┬──> completed  (reviewer accepted)
+   │                                    ├──> planned    (rejected, rework left)
+   └────────────────────────────────────┘
+                                        └──> failed     (rejected, budget spent)
 ```
 
 `ready` is derived from the DAG, never stored.
+
+A rejection returns the task to the queue rather than ending it, and the next
+agent on it is handed the review — see [Rework](#rework).
 
 If the process working on a task dies, the task goes back to the last status it
 can be resumed from: `running` returns to `planned`, and `reviewing` returns to
@@ -175,7 +180,7 @@ represents a judgement about the work:
   cannot mark its own task `completed` — an agent grading its own homework is
   not evidence.
 - the **reviewer agent** re-runs the tests and re-reads the diff, and its
-  decision is what produces `completed` or `failed`.
+  decision is what produces `completed`, another attempt, or `failed`.
 
 So `writ set` covers only workflow moves (`planned`, `running`, `blocked`,
 `failed`). It has no `completed`, with or without `--force`.
@@ -216,6 +221,103 @@ implementation returns to `planned`, while a lost review leaves the task at
 `awaiting-review`, because the code still stands and only the judgement is
 missing. Conversely a non-zero exit with a valid verdict still records the
 criteria the agent did meet.
+
+### Rework
+
+A reviewer's rejection is a finding, not a dead end, so it buys the task another
+attempt instead of ending it:
+
+```
+writ review M01-001 --agent codex
+...
+M01-001 -> planned (0/3 criteria passed, judged by the reviewer)
+sent back for rework (1 of 2): the next agent on this task is given this review
+next: writ dispatch M01-001
+```
+
+The task returns to `planned` — back in the ready set, with the same criteria to
+meet — and `writ run` picks it up in the same session it was rejected in:
+
+```
+dispatch M01-001  ->  claude -p --permission-mode ...
+         ? M01-001  awaiting-review  3/3
+review   M01-001  ->  codex exec --full-auto
+         · M01-001  rework 1/2  0/3  unmet 1, 2, 3
+           the test named in criterion 2 asserts nothing
+rework   M01-001  ->  claude -p --permission-mode ...
+         ? M01-001  awaiting-review  3/3
+review   M01-001  ->  codex exec --full-auto
+         + M01-001  completed  3/3
+```
+
+**The rejection travels with the task.** This is the part that makes another
+attempt worth anything: a re-dispatch with the original prompt is the same prompt,
+and an agent given the same prompt has every reason to write the same code. So the
+reworking agent is told, before the design excerpt, what happened:
+
+```
+THIS TASK WAS ALREADY IMPLEMENTED AND THE REVIEW REJECTED IT. You are attempt 2,
+and writ allows 2 rework attempts before the task is left failed for a human.
+
+The code from the previous attempt is still in the working tree. You are fixing
+it, not starting over — read it first, and keep whatever the review did not
+object to.
+
+reviewer(codex) reviewed it and rejected it
+  the test named in criterion 2 asserts nothing
+
+What it found, by criterion:
+  2. reviewer marked this failed
+     reviewer: ran pytest -q; test_merges_lists passes with the body commented out
+     the previous attempt claimed this passed: pytest -q -> 12 passed
+```
+
+Both sides of the disagreement, on purpose. The previous agent's claim is not
+evidence, but the *contradiction* is informative: a criterion the implementer said
+it verified and the reviewer found broken points at a test that does not test what
+it says, while one the implementer never claimed points at work that was simply
+not done. Those need different second attempts, and an agent given only the
+rejection cannot tell them apart.
+
+The next reviewer is told too, as a checklist rather than a conclusion — it still
+judges for itself, and a previous rejection is not evidence either:
+
+```
+This work was rejected 1 time already, most recently by reviewer(codex), and has
+been reworked since. What that review objected to:
+  2. failed: ran pytest -q; test_merges_lists passes with the body commented out
+
+Check those specifically, on top of the criteria. They are the bars this attempt
+exists to clear, and an unaddressed one is a rejection.
+```
+
+**The budget is finite.** `--max-rework` defaults to 2, so a task gets three
+implementation attempts in total. An agent that cannot satisfy a reviewer in three
+tries is not going to be argued into it by a fourth — at that point the task, its
+criteria, or the design is what is wrong, and that is a human's call:
+
+```
+M01-001 -> failed (0/3 criteria passed, judged by the reviewer)
+rework budget of 2 attempts is spent, so this is left failed for you
+next: writ show M01-001   # see what it could not meet
+```
+
+`--max-rework 0` fails on the first rejection. Either way the rejection is kept on
+the task, so `writ show` answers the question a bare `failed` cannot — what it was
+sent back for, how many times, and by whom:
+
+```
+rework: attempt 2 of 2, rejected by reviewer(codex) at 2026-02-11T09:22:41+00:00 — budget spent, left failed
+  2. failed: ran pytest -q; test_merges_lists passes with the body commented out
+  notes: the list-merge path is still unreachable
+```
+
+Two things rework deliberately does not change. Attempts do not count against
+`--max-tasks`, which caps how much of the graph a session takes on rather than how
+many agents it runs — refusing a rework would leave a task failed for want of a
+slot it had already spent. And `awaiting-review` still does not unblock dependents:
+work built on a task whose review might send it back is work built on a premise
+that has not been checked.
 
 ### The decision log
 
@@ -303,9 +405,9 @@ operates on.
 
 | Command | Purpose |
 |---|---|
-| `writ run [--parallel N] [--max-tasks N] [--agent CMD] [--model M] [--reviewer CMD] [--reviewer-model M] [--timeout S] [--cwd D] [--force] [--quiet] [--dry-run]` | walk the whole graph until it is done or stuck |
+| `writ run [--parallel N] [--max-tasks N] [--max-rework N] [--agent CMD] [--model M] [--reviewer CMD] [--reviewer-model M] [--timeout S] [--cwd D] [--force] [--quiet] [--dry-run]` | walk the whole graph until it is done or stuck |
 | `writ dispatch <id> [--agent CMD] [--model M] [--detach] [--timeout S] [--cwd D] [--quiet] [--dry-run] [-- args]` | an agent implements the task and reports a verdict |
-| `writ review [id] [--agent CMD] [--model M] [--timeout S] [--cwd D] [--force] [--quiet] [--dry-run]` | a second agent verifies and signs off; no id reviews all awaiting |
+| `writ review [id] [--agent CMD] [--model M] [--timeout S] [--cwd D] [--max-rework N] [--force] [--quiet] [--dry-run]` | a second agent verifies and signs off; no id reviews all awaiting |
 | `writ cancel [run-id]` | stop a run, or reap dead ones when given no id |
 | `writ agents [--agent CMD] [--model M]` | how writ invokes each agent headlessly |
 
@@ -587,6 +689,7 @@ writ run --parallel 3                  # three at a time where the graph allows
 writ run --max-tasks 5                 # start at most five tasks, then stop
 writ run --max-tasks 0                 # review what is waiting, start nothing
 writ run --order depth                 # longest chain of work first
+writ run --max-rework 0                # fail a task the first time it is rejected
 writ run --dry-run                     # the projected walk, spending nothing
 ```
 
@@ -599,7 +702,9 @@ Reviews are scheduled ahead of new dispatches. Reported work that nobody has
 checked is what blocks everything downstream, so clearing it first keeps the
 frontier moving. For the same reason `--max-tasks` caps how many tasks *start*,
 but never refuses a review — stopping with work stuck at `awaiting-review` would
-be worse than not having started it.
+be worse than not having started it. Rework is exempt for the same reason: a task
+the session already started gets its next attempt even once the budget is spent,
+since refusing it would leave that task failed over a slot it had already used.
 
 Use a different model for review than for implementation:
 
@@ -649,9 +754,9 @@ agent wrote, not from its exit code — a process can exit 0 having done nothing
 No verdict means no criterion moves, and writ says so.
 
 A review is the same five steps with a different prompt and a different landing
-place: `awaiting-review -> reviewing`, then `completed` or `failed`. That is the
-only transition that produces `completed`, which is why the loop must run both
-phases.
+place: `awaiting-review -> reviewing`, then `completed`, back to `planned` for
+rework, or `failed`. That is the only transition that produces `completed`, which
+is why the loop must run both phases.
 
 ### How the DAG advances
 
@@ -800,13 +905,19 @@ produced, and what that changed:
 dispatch M01-002  ->  claude -p                 an agent started
          ? M01-002  awaiting-review  3/3        it reported, three bars passed
 review   M01-002  ->  codex exec -              a reviewer started
-         x M01-002  failed  0/3  unmet 1, 2, 3  it rejected all three
+         · M01-002  rework 1/2  0/3  unmet 1,2  it rejected two of the three
            the retry path is untested           the reviewer's own words
+rework   M01-002  ->  claude -p                 a second attempt, given the review
 ```
 
 Flush-left lines are agents starting; indented lines are the store changing. The
-counts are acceptance criteria, so `0/3  unmet 1, 2, 3` names which bars are
+counts are acceptance criteria, so `0/3  unmet 1, 2` names which bars are
 still open without needing `writ show`.
+
+A rejection reads as `rework 1/2` rather than as the bare `planned` it stores.
+Both are true, and `planned` is the useless one to print: the reader's question
+about a rejected task is whether anything happens next, and `planned` reads as
+though it had never run. The re-dispatch is called `rework` for the same reason.
 
 A failure carries the agent's one-line reason, because that is the line you
 actually read when something goes wrong. A pass does not — there it would be

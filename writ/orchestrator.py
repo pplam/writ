@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import agents, runner, state
-from .model import acceptance_summary, effective_status
+from .model import acceptance_summary, effective_status, rework_attempts
 from .state import WritError, utcnow
 
 #: how long a worker may hold the scheduler open after a stop is requested
@@ -55,10 +55,34 @@ class Job:
 
     task_id: str
     role: str  # "agent" | "reviewer"
+    #: how many times this task had been sent back for rework when the job was
+    #: chosen. Part of the ledger key, not decoration: see `key`.
+    attempt: int = 0
 
     @property
     def verb(self) -> str:
-        return "review" if self.role == "reviewer" else "dispatch"
+        if self.role == "reviewer":
+            return "review"
+        # A re-dispatch after a rejection is the same invocation with a different
+        # prompt, but calling it "dispatch" in the preview and the log reads as
+        # work that had not started yet.
+        return "rework" if self.attempt else "dispatch"
+
+    @property
+    def key(self) -> str:
+        """How the session remembers this job was tried.
+
+        A session refuses to attempt the same task twice in the same role, which
+        is what stops a reviewer that writes no verdict from being re-selected
+        forever. A rejection has to get past that guard without weakening it: the
+        task genuinely should be dispatched again, but only because something
+        changed. The rework count is that something, so it goes in the key — the
+        second attempt is a different job from the first, while a repeat of the
+        *same* attempt is still refused.
+
+        Bare task id at attempt 0, so a ledger from anywhere else still matches.
+        """
+        return self.task_id if not self.attempt else f"{self.task_id}#{self.attempt}"
 
 
 @dataclass
@@ -77,6 +101,10 @@ class Outcome:
     unmet: list[int] = field(default_factory=list)
     criteria: dict[str, int] | None = None
     decisions: list[str] = field(default_factory=list)
+    #: (attempt, budget) when a reviewer sent this task back rather than failing
+    #: it, so the log can say "rework 1 of 2" instead of a bare `planned` that
+    #: reads as though the task had never run.
+    rework: tuple[int, int] | None = None
 
     @property
     def ok(self) -> bool:
@@ -97,6 +125,10 @@ class Session:
     #: from `reviewed` so a review that could not start is not counted as one,
     #: while still being remembered as tried.
     review_attempts: list[str] = field(default_factory=list)
+    #: tasks a reviewer rejected and sent back for another attempt. Not failures
+    #: — the walk carried on with them — but not free either, so a session that
+    #: spent half its agents on second attempts says so.
+    reworked: list[str] = field(default_factory=list)
     stopped: bool = False
     aborted: bool = False
     started_at: str = field(default_factory=utcnow)
@@ -178,9 +210,14 @@ def next_job(
     a completed task is the only thing that unblocks its dependents, so finishing
     work in flight opens more of the graph than starting more work does.
 
-    Each task is attempted once per session in each role. A reviewer that writes
-    no verdict leaves its task at `awaiting-review` — the same state that
-    selected it — so without this the scheduler would re-review it forever.
+    Each task is attempted once per session in each role *per rework round*. A
+    reviewer that writes no verdict leaves its task at `awaiting-review` — the
+    same state that selected it — so without the ledger the scheduler would
+    re-review it forever. A reviewer that rejects, on the other hand, has changed
+    something: the task goes back to the queue carrying the rejection, and its
+    next attempt is a different job under a different key (see `Job.key`), so it
+    is dispatched again within this same session rather than waiting for the next
+    one.
 
     `order` breaks ties among ready tasks. It cannot affect *which* tasks are
     eligible, only which eligible one goes first, so no order can produce a run
@@ -191,24 +228,48 @@ def next_job(
     reviewed = set(reviewed)
 
     for task in sorted(data["tasks"].values(), key=lambda item: item["id"]):
-        if task["id"] in busy or task["id"] in reviewed:
+        job = Job(
+            task_id=task["id"], role="reviewer", attempt=rework_attempts(task)
+        )
+        if task["id"] in busy or job.key in reviewed:
             continue
         if task["status"] == "awaiting-review":
-            return Job(task_id=task["id"], role="reviewer")
-
-    if budget is not None and len(started) >= budget:
-        return None
+            return job
 
     ready = [
         task
         for task in data["tasks"].values()
         if task["id"] not in busy
-        and task["id"] not in started
+        and Job(
+            task_id=task["id"], role="agent", attempt=rework_attempts(task)
+        ).key
+        not in started
         and effective_status(data, task) == "ready"
     ]
+    # The budget counts tasks, not attempts. `--max-tasks N` caps how much of the
+    # graph a session takes on, and reworking a task it already started is not
+    # taking on more of it — so a spent budget stops *new* tasks and still lets a
+    # task already in the ledger have its next attempt. Refusing that would leave
+    # a rejected task failed for want of a slot it had already spent, which is the
+    # same reason a review ignores the budget: half-finished work is worse than
+    # none.
+    if budget is not None:
+        taken = {_base(key) for key in started}
+        if len(taken) >= budget:
+            ready = [task for task in ready if task["id"] in taken]
     if not ready:
         return None
-    return Job(task_id=_first(data, ready, order), role="agent")
+    task_id = _first(data, ready, order)
+    return Job(
+        task_id=task_id,
+        role="agent",
+        attempt=rework_attempts(data["tasks"][task_id]),
+    )
+
+
+def _base(key: str) -> str:
+    """The task id inside a ledger key, whichever attempt it names."""
+    return key.split("#", 1)[0]
 
 
 def _first(data: dict[str, Any], ready: list[dict[str, Any]], order: str) -> str:
@@ -293,7 +354,7 @@ def preview(
         jobs.append(job)
         task = simulated[job.task_id]
         if job.role == "agent":
-            started.append(job.task_id)
+            started.append(job.key)
             task["status"] = "awaiting-review"
         else:
             task["status"] = "completed"
@@ -317,6 +378,7 @@ def run(
     timeout: int | None = None,
     cwd: str | None = None,
     agent_args: list[str] | None = None,
+    max_rework: int | None = None,
     on_event: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> Session:
     """Walk the DAG until it runs out of work, an error stops it, or you do."""
@@ -362,6 +424,7 @@ def run(
                         timeout=timeout,
                         cwd=cwd,
                         agent_args=agent_args or [],
+                        max_rework=max_rework,
                     )
                 except WritError as exc:
                     # A job that cannot even be started is recorded and skipped,
@@ -372,17 +435,17 @@ def run(
                     session.errors.append(f"{job.task_id}: {exc}")
                     emit("error", {"task": job.task_id, "message": str(exc)})
                     if job.role == "reviewer":
-                        session.review_attempts.append(job.task_id)
+                        session.review_attempts.append(job.key)
                     else:
-                        started.append(job.task_id)
+                        started.append(job.key)
                     continue
                 run_id, resolved = prepared
                 if job.role == "agent":
-                    started.append(job.task_id)
+                    started.append(job.key)
                     session.dispatched.append(job.task_id)
                 else:
                     session.reviewed.append(job.task_id)
-                    session.review_attempts.append(job.task_id)
+                    session.review_attempts.append(job.key)
                 emit(
                     "started",
                     {
@@ -390,6 +453,7 @@ def run(
                         "role": job.role,
                         "run": run_id,
                         "command": resolved.display,
+                        "attempt": job.attempt,
                         "in_flight": len(in_flight) + 1,
                     },
                 )
@@ -430,6 +494,7 @@ def _prepare(
     timeout: int | None,
     cwd: str | None,
     agent_args: list[str],
+    max_rework: int | None = None,
 ) -> tuple[str, agents.ResolvedAgent]:
     """Claim the task by marking it running, and write its prompt.
 
@@ -453,6 +518,7 @@ def _prepare(
         cwd=cwd,
         force=False,
         role=job.role,
+        max_rework=max_rework,
     )
     return run_id, resolved
 
@@ -483,7 +549,25 @@ def _execute(root: Path, job: Job, run_id: str) -> Outcome:
         unmet=list(reported.get("unmet", [])),
         criteria=acceptance_summary(task) if task else None,
         decisions=list(reported.get("decisions", [])),
+        rework=_rework_round(job, task, reported),
     )
+
+
+def _rework_round(
+    job: Job, task: dict[str, Any], reported: dict[str, Any]
+) -> tuple[int, int] | None:
+    """(attempt, budget) if this reviewer's rejection bought another attempt.
+
+    Read from the task rather than inferred from its status: `planned` after a
+    reviewer run could also be a reap of a lost implementation, and the two need
+    different lines in the log.
+    """
+    if job.role != "reviewer" or reported.get("decision") != "reject":
+        return None
+    record = task.get("rework") or {}
+    if record.get("exhausted") or not record.get("attempt"):
+        return None
+    return record["attempt"], record.get("budget", record.get("max", 0))
 
 
 def _wait_for_one(
@@ -506,6 +590,8 @@ def _wait_for_one(
 def _record(session: Session, outcome: Outcome) -> None:
     if outcome.error:
         session.errors.append(f"{outcome.job.task_id}: {outcome.error}")
+    if outcome.rework:
+        session.reworked.append(outcome.job.task_id)
     status = outcome.status
     if status == "completed":
         session.completed.append(outcome.job.task_id)
@@ -525,6 +611,7 @@ def _finished_payload(outcome: Outcome) -> dict[str, Any]:
         "unmet": outcome.unmet,
         "criteria": outcome.criteria,
         "decisions": outcome.decisions,
+        "rework": list(outcome.rework) if outcome.rework else None,
     }
 
 
@@ -615,6 +702,11 @@ def summary(data: dict[str, Any], session: Session) -> list[str]:
         f"ran {session.agent_runs} agents over {len(set(session.dispatched))} tasks"
         f" in {_elapsed(session)}",
         f"completed {len(session.completed)}, failed {len(session.failed)}"
+        + (
+            f", sent back for rework {len(session.reworked)}"
+            if session.reworked
+            else ""
+        )
         + (f", errors {len(session.errors)}" if session.errors else ""),
         f"project {complete}/{total} tasks complete",
     ]

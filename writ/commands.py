@@ -605,6 +605,26 @@ def _render_task(data: dict[str, Any], task: dict[str, Any]) -> str:
         lines.append(f"\nlast verdict: {claim} by {who} at {last.get('at')}")
         if last.get("summary"):
             lines.append(f"  {last['summary']}")
+    record = task.get("rework")
+    if record:
+        attempt = record.get("attempt", 0)
+        head = (
+            f"\nrework: attempt {attempt} of "
+            f"{record.get('budget', record.get('max'))}, "
+            f"rejected by {record.get('reviewer') or '-'} at {record.get('at')}"
+        )
+        if record.get("resolved_at"):
+            head += f" — answered, accepted at {record['resolved_at']}"
+        elif record.get("exhausted"):
+            head += " — budget spent, left failed"
+        lines.append(head)
+        for finding in record.get("findings") or []:
+            lines.append(
+                f"  {finding.get('number')}. {finding.get('status')}: "
+                f"{finding.get('evidence', '')}".rstrip()
+            )
+        if record.get("notes"):
+            lines.append(f"  notes: {record['notes']}")
     if status == "awaiting-review":
         lines.append(f"\nawaiting review: writ review {task['id']}")
     if task.get("allowed"):
@@ -1181,6 +1201,7 @@ def _run_agent_on_task(args, *, role: str, task_id: str, extra: list[str]) -> in
         cwd=args.cwd,
         force=args.force,
         role=role,
+        max_rework=getattr(args, "max_rework", None),
     )
     if resolved.warning:
         print(f"warning: {resolved.warning}", file=sys.stderr)
@@ -1243,9 +1264,25 @@ def _report_verdict(
         f"({counts['passed']}/{counts['total']} criteria passed, "
         f"judged by the {role})"
     )
+    record = task.get("rework") or {}
     if status == "awaiting-review":
         print(f"next: writ review {task_id}")
+    elif status == "planned" and role == "reviewer" and record.get("attempt"):
+        # The case this would otherwise report as a bare `-> planned`, which looks
+        # like the run undid itself. It is the rejection being turned into another
+        # attempt, and the next command is a dispatch, not an investigation.
+        print(
+            f"sent back for rework ({record['attempt']} of "
+            f"{record.get('budget', record.get('max'))}): "
+            "the next agent on this task is given this review"
+        )
+        print(f"next: writ dispatch {task_id}")
     elif status == "failed":
+        if record.get("exhausted"):
+            print(
+                f"rework budget of {record.get('budget', record.get('max'))} "
+                "attempts is spent, so this is left failed for you"
+            )
         print(f"next: writ show {task_id}   # see what it could not meet")
 
 
@@ -1465,6 +1502,7 @@ def cmd_run(args) -> int:
             order=args.order,
             timeout=args.timeout,
             cwd=args.cwd,
+            max_rework=getattr(args, "max_rework", None),
             on_event=reporter,
         )
     finally:
@@ -1478,6 +1516,7 @@ def cmd_run(args) -> int:
                 "tasks": len(set(session.dispatched)),
                 "completed": session.completed,
                 "failed": session.failed,
+                "reworked": session.reworked,
                 "errors": session.errors,
                 "stopped": session.stopped or session.aborted,
                 "remaining": [
@@ -1583,7 +1622,12 @@ class _RunReporter:
         if name == "started":
             if self.quiet:
                 return None
-            verb = "review  " if payload["role"] == "reviewer" else "dispatch"
+            if payload["role"] == "reviewer":
+                verb = "review  "
+            elif payload.get("attempt"):
+                verb = "rework  "
+            else:
+                verb = "dispatch"
             return f"{verb} {payload['task']}  ->  {payload['command']}"
         if name == "finished":
             return self._finished(payload)
@@ -1605,7 +1649,18 @@ class _RunReporter:
         The agent already wrote a one-line account; use it.
         """
         status = payload["status"] or "unknown"
-        parts = [f"{render.mark(status)} {payload['task']}  {status}"]
+        rework = payload.get("rework")
+        if rework:
+            # `planned` is the truthful status and a useless thing to print: the
+            # reader's question about a rejected task is whether anything happens
+            # next, and a bare `planned` reads as though it never ran.
+            attempt, budget = rework
+            parts = [
+                f"{render.mark('planned')} {payload['task']}  "
+                f"rework {attempt}/{budget}"
+            ]
+        else:
+            parts = [f"{render.mark(status)} {payload['task']}  {status}"]
 
         counts = payload.get("criteria")
         if counts and counts.get("total"):
@@ -1625,7 +1680,7 @@ class _RunReporter:
 
         detail = []
         reason = payload.get("summary")
-        if reason and status in ("failed", "blocked"):
+        if reason and (rework or status in ("failed", "blocked")):
             detail.append(_first_line(reason))
         proposed = payload.get("decisions")
         if proposed:

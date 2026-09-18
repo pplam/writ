@@ -321,13 +321,107 @@ def test_review_completes_a_task_the_agent_only_claimed(planned, writ, project):
     assert task["last_verdict"]["role"] == "reviewer"
 
 
-def test_a_rejecting_review_fails_the_task(planned, writ, project):
+def test_a_rejecting_review_sends_the_task_back_for_rework(planned, writ, project):
+    """A rejection is a finding, not a dead end: it buys another attempt."""
     writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
     _, out, _ = writ("review", "M01-001", "--agent", agent_reporting(review("reject")))
+    assert "sent back for rework (1 of 2)" in out
+    assert "next: writ dispatch M01-001" in out
+    task = state.load(project)["tasks"]["M01-001"]
+    # planned, so it is back in the ready set and the next `writ run` picks it up
+    assert task["status"] == "planned"
+    assert [a["status"] for a in task["acceptances"]] == ["failed"] * 3
+    assert task["rework"]["attempt"] == 1
+    assert task["rework"]["reviewer"].startswith("reviewer")
+
+
+def test_the_rejection_is_recorded_with_both_sides_of_it(planned, writ, project):
+    """The next attempt needs the claim and the finding, not just the finding."""
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    writ("review", "M01-001", "--agent", agent_reporting(review("reject")))
+    record = state.load(project)["tasks"]["M01-001"]["rework"]
+    assert len(record["findings"]) == 3
+    assert all(f["status"] == "failed" for f in record["findings"])
+    # what the implementer said before the review overwrote the criteria
+    assert all(c["status"] == "passed" for c in record["claimed"])
+    assert record["claimed"][0]["evidence"]
+
+
+def test_a_reworking_agent_is_given_the_rejection(planned, writ, project):
+    """A re-dispatch that does not carry the review is the same prompt again."""
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    writ("review", "M01-001", "--agent", agent_reporting(review("reject")))
+    _, out, _ = writ("dispatch", "M01-001", "--dry-run")
+    assert "THIS TASK WAS ALREADY IMPLEMENTED AND THE REVIEW REJECTED IT" in out
+    assert "You are attempt 2" in out
+    assert "reviewer marked this failed" in out
+    assert "the previous attempt claimed this passed" in out
+
+
+def test_a_re_review_is_told_what_the_last_one_objected_to(planned, writ, project):
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    writ("review", "M01-001", "--agent", agent_reporting(review("reject")))
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    _, out, _ = writ("review", "M01-001", "--dry-run")
+    assert "rejected 1 time already" in out
+    assert "an unaddressed one is a rejection" in out
+
+
+def test_the_rework_budget_is_finite(planned, writ, project):
+    """An agent that cannot satisfy a reviewer in N tries needs a human."""
+    for _ in range(3):
+        writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+        _, out, _ = writ(
+            "review", "M01-001", "--agent", agent_reporting(review("reject"))
+        )
     assert "M01-001 -> failed" in out
+    assert "rework budget of 2 attempts is spent" in out
     task = state.load(project)["tasks"]["M01-001"]
     assert task["status"] == "failed"
-    assert [a["status"] for a in task["acceptances"]] == ["failed"] * 3
+    assert task["rework"]["exhausted"] is True
+
+
+def test_max_rework_zero_fails_on_the_first_rejection(planned, writ, project):
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    _, out, _ = writ(
+        "review", "M01-001", "--agent", agent_reporting(review("reject")),
+        "--max-rework", "0",
+    )
+    assert "M01-001 -> failed" in out
+    assert state.load(project)["tasks"]["M01-001"]["status"] == "failed"
+
+
+def test_requeueing_an_exhausted_task_grants_more_attempts(planned, writ, project):
+    """`writ set ... planned` on a spent task is a human asking for another try."""
+    for _ in range(3):
+        writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+        writ("review", "M01-001", "--agent", agent_reporting(review("reject")))
+    assert state.load(project)["tasks"]["M01-001"]["rework"]["exhausted"] is True
+
+    writ("set", "M01-001", "planned")
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    _, out, _ = writ("review", "M01-001", "--agent", agent_reporting(review("reject")))
+    # not failed again on the first rejection after the reset
+    assert "sent back for rework (4 of 4)" in out
+    record = state.load(project)["tasks"]["M01-001"]["rework"]
+    # the count keeps climbing rather than lying about the history
+    assert record["attempt"] == 4
+    assert record["allowance"] == 2
+    assert record["exhausted"] is False
+
+
+def test_an_accepted_rework_closes_the_record(planned, writ, project):
+    """A task that was sent back and then passed is not still awaiting rework."""
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    writ("review", "M01-001", "--agent", agent_reporting(review("reject")))
+    writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
+    writ("review", "M01-001", "--agent", agent_reporting(review("accept")))
+    task = state.load(project)["tasks"]["M01-001"]
+    assert task["status"] == "completed"
+    assert task["rework"]["resolved_at"]
+    # and the next prompt for this task no longer argues a settled rejection
+    _, out, _ = writ("dispatch", "M01-001", "--dry-run", "--force")
+    assert "THE REVIEW REJECTED IT" not in out
 
 
 def test_the_review_prompt_shows_the_claim_but_says_not_to_trust_it(planned, writ):

@@ -31,7 +31,7 @@ import sys
 from . import commands
 from .server import DEFAULT_PORT
 from .decisions import SETTABLE_DECISION_STATUSES
-from .model import JUDGED_STATUSES, SETTABLE_STATUSES
+from .model import DEFAULT_MAX_REWORK, JUDGED_STATUSES, SETTABLE_STATUSES
 from .orchestrator import DEFAULT_ORDER, ORDERS
 from .state import WritError
 
@@ -347,6 +347,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--dry-run", action="store_true", help="print the review prompt and stop"
     )
+    p.add_argument(
+        "--max-rework",
+        type=int,
+        default=DEFAULT_MAX_REWORK,
+        metavar="N",
+        help=(
+            f"times a rejected task is re-dispatched with the review attached "
+            f"before it is left failed (default: {DEFAULT_MAX_REWORK}, 0 to fail "
+            "on the first rejection)"
+        ),
+    )
     p.set_defaults(func=commands.cmd_review)
 
     p = sub.add_parser(
@@ -418,6 +429,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="N",
         help="stop after starting N tasks (reviews of them still finish)",
+    )
+    p.add_argument(
+        "--max-rework",
+        type=int,
+        default=DEFAULT_MAX_REWORK,
+        metavar="N",
+        help=(
+            f"times a rejected task is re-dispatched with the review attached "
+            f"before it is left failed (default: {DEFAULT_MAX_REWORK}, 0 to fail "
+            "on the first rejection)"
+        ),
     )
     p.add_argument(
         "--order",

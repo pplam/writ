@@ -15,10 +15,13 @@ from typing import Any, IO, Iterable
 
 from . import agents, decisions, planner, state, verdict
 from .model import (
+    DEFAULT_MAX_REWORK,
     add_evidence,
     blocking_dependencies,
     get_task,
+    open_rework,
     refresh_milestones,
+    rework_attempts,
 )
 from .state import WritError, utcnow
 
@@ -82,6 +85,10 @@ def build_prompt(
         lines.append(excerpt)
         lines.append("---")
         lines.append("")
+    rework = _rework_section(task)
+    if rework:
+        lines.append(rework)
+        lines.append("")
     if task.get("evidence"):
         recent = task["evidence"][-4:]
         lines.append("Previous attempts on this task recorded:")
@@ -92,6 +99,84 @@ def build_prompt(
     lines.append(GUARDRAILS)
     lines.append("")
     lines.append(_verdict_instructions(task, verdict_path))
+    return "\n".join(lines)
+
+
+def _rework_section(task: dict[str, Any]) -> str:
+    """Hand a reworking agent the rejection it exists to answer.
+
+    This is the whole reason a rejected task can go back to the queue rather than
+    straight to `failed`. A re-dispatch that does not carry the review is just the
+    same prompt again, and an agent given the same prompt has every reason to
+    write the same code — so the rejection is stated first, in full, with the
+    claim it contradicted beside it.
+
+    Both sides on purpose. The previous agent's claim is not evidence, but the
+    disagreement is informative: a criterion the implementer said it verified and
+    the reviewer found broken points at a test that does not test what it says,
+    while one the implementer never claimed points at work that was simply not
+    done. Those need different second attempts.
+    """
+    record = open_rework(task)
+    if not record:
+        return ""
+    attempt = record.get("attempt", 1)
+    budget = record.get("budget", record.get("max", DEFAULT_MAX_REWORK))
+    reviewer = record.get("reviewer") or "a reviewer"
+    lines = [
+        f"THIS TASK WAS ALREADY IMPLEMENTED AND THE REVIEW REJECTED IT. "
+        f"You are attempt {attempt + 1}, and writ allows {budget} rework "
+        f"attempt{'s' if budget != 1 else ''} before the task is left failed for "
+        "a human.",
+        "",
+        "The code from the previous attempt is still in the working tree. You are "
+        "fixing it, not starting over — read it first, and keep whatever the "
+        "review did not object to.",
+        "",
+        f"{reviewer} reviewed it and rejected it",
+    ]
+    if record.get("summary"):
+        lines.append(f"  {record['summary']}")
+    findings = record.get("findings") or []
+    if findings:
+        lines.append("")
+        lines.append("What it found, by criterion:")
+        claimed = {
+            item.get("number"): item for item in record.get("claimed") or []
+        }
+        for finding in findings:
+            number = finding.get("number")
+            lines.append(
+                f"  {number}. reviewer marked this {finding.get('status', 'failed')}"
+            )
+            if finding.get("evidence"):
+                lines.append(f"     reviewer: {finding['evidence']}")
+            prior = claimed.get(number) or {}
+            if prior.get("status") == "passed" and prior.get("evidence"):
+                # The most useful line in the section: the bar was claimed met,
+                # with evidence, and an agent that did not write the code could
+                # not reproduce it. Whatever that evidence was, it was not enough.
+                lines.append(
+                    f"     the previous attempt claimed this passed: "
+                    f"{prior['evidence']}"
+                )
+    if record.get("notes"):
+        lines.append("")
+        lines.append(f"Reviewer's notes: {record['notes']}")
+    if record.get("claimed_summary"):
+        lines.append("")
+        lines.append(
+            f"The previous attempt described its own work as: "
+            f"{record['claimed_summary']}"
+        )
+    lines.append("")
+    lines.append(
+        "Address every finding above. A criterion the reviewer marked failed "
+        "needs the behaviour fixed and then demonstrated — re-running the same "
+        "check that already passed for the last attempt is not an answer to it. "
+        "If you conclude a finding is wrong, say so explicitly in your summary "
+        "with what you ran to establish that; do not quietly re-claim the bar."
+    )
     return "\n".join(lines)
 
 
@@ -194,6 +279,33 @@ def build_review_prompt(
         lines.append("---")
         lines.append(excerpt)
         lines.append("---")
+        lines.append("")
+    prior = task.get("rework")
+    if prior and not prior.get("resolved_at"):
+        # A re-review that does not know it is one re-derives the same objections
+        # from scratch, or misses that its predecessor's were never answered. The
+        # findings are given as a checklist, not as a conclusion: this reviewer
+        # still decides for itself, and a previous rejection is not evidence.
+        attempt = prior.get("attempt", 1)
+        lines.append(
+            f"This work was rejected {attempt} time{'s' if attempt != 1 else ''} "
+            f"already, most recently by {prior.get('reviewer') or 'a reviewer'}, "
+            "and has been reworked since. What that review objected to:"
+        )
+        for finding in prior.get("findings") or []:
+            lines.append(
+                f"  {finding.get('number')}. {finding.get('status', 'failed')}: "
+                f"{finding.get('evidence', '')}".rstrip()
+            )
+        if prior.get("summary"):
+            lines.append(f"  overall: {prior['summary']}")
+        lines.append("")
+        lines.append(
+            "Check those specifically, on top of the criteria. They are the bars "
+            "this attempt exists to clear, and an unaddressed one is a rejection. "
+            "They are not a verdict either: judge what is in front of you, and if "
+            "an earlier objection was wrong, say so in your summary."
+        )
         lines.append("")
     lines.append(
         "Verify by running the project's tests yourself and reading the diff. "
@@ -468,12 +580,18 @@ def prepare(
     cwd: str | None,
     force: bool,
     role: str = "agent",
+    max_rework: int | None = None,
 ) -> tuple[str, Path, str, agents.ResolvedAgent]:
     """Create the run directory and record the run as `starting`.
 
     `role` selects the prompt and how the resulting verdict is applied: an
     implementing agent parks the task at `awaiting-review`, a reviewer completes
     or fails it.
+
+    `max_rework` is recorded on the run rather than read when the verdict lands,
+    because the verdict is applied by `_finish` in a worker thread that has the
+    run and nothing else. Recording it also makes the run say which budget it was
+    judged under, which a run read weeks later otherwise cannot tell you.
     """
     resolved = agents.resolve(agent, agent_args, model)
     with state.transaction(root) as data:
@@ -518,6 +636,7 @@ def prepare(
             "model": model,
             "cwd": str(Path(cwd or root).expanduser().resolve()),
             "timeout": timeout,
+            "max_rework": DEFAULT_MAX_REWORK if max_rework is None else max_rework,
             "created_at": utcnow(),
             "started_at": None,
             "finished_at": None,
@@ -703,7 +822,13 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
                     # applied, just not as claimed. Kept in its own field so
                     # neither reads as the other.
                     run["verdict_downgraded"] = reported.downgraded
-                status = verdict.apply(data, task, reported, actor=actor)
+                status = verdict.apply(
+                    data,
+                    task,
+                    reported,
+                    actor=actor,
+                    max_rework=run.get("max_rework"),
+                )
                 run["resulting_status"] = status
                 refresh_milestones(data)
                 if reported.decisions:

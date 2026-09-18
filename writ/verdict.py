@@ -598,15 +598,30 @@ def apply(
     *,
     actor: str,
     review_required: bool = True,
+    max_rework: int | None = None,
 ) -> str:
     """Record a verdict against a task and return the status it produced.
 
     The implementing agent's verdict never reaches `completed` while review is
     required; it parks the task at `awaiting-review` instead. This is the whole
     point of the split, so it is enforced here rather than left to the caller.
+
+    A reviewer's rejection returns the task to the queue while its rework budget
+    holds, carrying the rejection with it — see `_send_back`. Past that budget,
+    and for an implementer that reports its own work incomplete, the task fails.
     """
     from . import decisions as decision_log
-    from .model import add_evidence, refresh_milestones
+    from .model import DEFAULT_MAX_REWORK, add_evidence, refresh_milestones
+
+    if max_rework is None:
+        max_rework = DEFAULT_MAX_REWORK
+
+    # Taken before the reviewer's judgement overwrites them: what the implementer
+    # claimed, per criterion, is half of what the next attempt needs to see. The
+    # other half is what the reviewer made of it, and after this loop the task
+    # only holds the second.
+    claimed = [dict(item) for item in task.get("acceptances", [])]
+    claimed_verdict = dict(task.get("last_verdict") or {})
 
     for criterion in verdict.criteria:
         entry = task["acceptances"][criterion.number - 1]
@@ -615,12 +630,28 @@ def apply(
         entry["judged_by"] = actor
         entry["judged_at"] = utcnow()
 
+    rejected = verdict.role == "reviewer" and verdict.decision == "reject"
     if verdict.outcome == "blocked":
         status = "blocked"
+    elif rejected:
+        status = _send_back(
+            task,
+            verdict,
+            actor=actor,
+            max_rework=max_rework,
+            claimed=claimed,
+            claimed_verdict=claimed_verdict,
+        )
     elif verdict.outcome == "incomplete":
         status = "failed"
     elif verdict.role == "reviewer" or not review_required:
         status = "completed"
+        # The work was accepted, so whatever it was last sent back for has been
+        # answered. Closed rather than deleted: the record is how a reader later
+        # sees that this task took three attempts and what the first two missed.
+        if task.get("rework"):
+            task["rework"]["resolved_at"] = utcnow()
+            task["rework"]["resolved_by"] = actor
     else:
         status = "awaiting-review"
 
@@ -656,6 +687,101 @@ def apply(
         )
     refresh_milestones(data)
     return status
+
+
+def _send_back(
+    task: dict[str, Any],
+    verdict: Verdict,
+    *,
+    actor: str,
+    max_rework: int,
+    claimed: list[dict[str, Any]],
+    claimed_verdict: dict[str, Any],
+) -> str:
+    """Record a rejection and decide whether the task gets another attempt.
+
+    Returns `planned` — back into the ready set, since the criteria it must meet
+    have not changed — or `failed` once the budget is spent. Either way the
+    rejection is written to `task["rework"]`, because the reason is the part worth
+    keeping: a task that failed after three attempts and one that failed on the
+    first look the same without it.
+
+    The record holds both sides of the disagreement. The reviewer's judgement is
+    already on the criteria, but the claim it contradicted is not — it was just
+    overwritten — and "you said you ran the tests, the reviewer ran them and got
+    two failures" is a far more useful thing to hand the next attempt than either
+    half alone.
+    """
+    from .model import add_evidence
+
+    prior = task.get("rework") or {}
+    attempt = int(prior.get("attempt", 0)) + 1
+    # An operator who moves an exhausted task back to `planned` is asking for more
+    # attempts, and `set_status` records that as an allowance on top of the flag's
+    # budget rather than by resetting the count.
+    allowance = int(prior.get("allowance", 0))
+    budget = max_rework + allowance
+    exhausted = attempt > budget
+    record = {
+        "attempt": attempt,
+        "max": max_rework,
+        "allowance": allowance,
+        "budget": budget,
+        "at": utcnow(),
+        "reviewer": actor,
+        "summary": verdict.summary,
+        "notes": verdict.notes or "",
+        "unmet": list(verdict.unmet),
+        # The reviewer's own words, per criterion. `task["acceptances"]` carries
+        # the same evidence now, but the next reviewer's verdict will overwrite
+        # it, and by then this is what says what the last one objected to.
+        "findings": [
+            {
+                "number": criterion.number,
+                "status": criterion.status,
+                "evidence": criterion.evidence,
+            }
+            for criterion in verdict.criteria
+            if criterion.status != "passed"
+        ],
+        "claimed": [
+            {
+                "number": index,
+                "status": item.get("status", "pending"),
+                "evidence": item.get("evidence", ""),
+            }
+            for index, item in enumerate(claimed, start=1)
+        ],
+        "claimed_by": claimed_verdict.get("actor", ""),
+        "claimed_summary": claimed_verdict.get("summary", ""),
+        "exhausted": exhausted,
+    }
+    task["rework"] = record
+    if exhausted:
+        add_evidence(
+            task,
+            f"{actor} rejected this for the {_ordinal(attempt)} time; "
+            f"the rework budget of {budget} is spent, so the task is left "
+            "failed for a human to look at",
+            actor="writ",
+        )
+        return "failed"
+    add_evidence(
+        task,
+        f"sent back for rework ({attempt} of {budget}) after {actor} "
+        "rejected it; the next agent on this task is given the rejection",
+        actor="writ",
+    )
+    return "planned"
+
+
+#: 1 -> "first". Only ever used for small rework counts, so the table stops
+#: where the rework budget realistically does.
+ORDINALS = {1: "first", 2: "second", 3: "third", 4: "fourth", 5: "fifth"}
+
+
+def _ordinal(number: int) -> str:
+    return ORDINALS.get(number, f"{number}th")
 
 
 def _evidence_line(verdict: Verdict, actor: str) -> str:
