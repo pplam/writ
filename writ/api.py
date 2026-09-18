@@ -288,6 +288,10 @@ def _run_row(run: dict[str, Any]) -> dict[str, Any]:
         # exit is a failed invocation, not a skipped report, and the two have
         # completely different remedies.
         "no_output": bool(run.get("no_output")),
+        # ...or said a great deal and still never acted, because its last tool call
+        # was printed rather than made. Points at the model's call syntax, which is
+        # a different remedy again.
+        "unparsed_tool_call": bool(run.get("unparsed_tool_call")),
         # A claim writ lowered to match the criteria. Not an error: the verdict
         # was applied, just not as headlined.
         "verdict_downgraded": run.get("verdict_downgraded") or "",

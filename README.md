@@ -478,6 +478,23 @@ most likely never reached a model (unknown model id, missing provider
 credentials, or exhausted quota)
 ```
 
+The opposite shape of that failure is a transcript full of work that still judged
+nothing, because the agent's last act was a tool call that got printed instead of
+run. A model that garbles its own call syntax ends its turn as if it had merely
+spoken, and the harness exits 0 having done nothing. Reading the transcript for a
+reason the agent declined to report finds none, so writ names the fragment at the
+end of it:
+
+```
+PROBLEM
+exited without writing a usable verdict — and its transcript ends in a tool call
+that was printed rather than made, so the model garbled the call syntax and the
+turn ended without it doing the work
+```
+
+Nothing in the prompt causes that, and the remedy is a model whose tool calling is
+more reliable.
+
 A verdict that was written but rejected says which field was wrong:
 
 ```

@@ -1,4 +1,4 @@
-/* built from ui/src (9c1460fec645) */
+/* built from ui/src (e8bd6921d6e6) */
 /*
  * writ dashboard — compiled from ui/src by ui/build.mjs.
  * Do not edit: change the TypeScript and rebuild.
@@ -824,10 +824,10 @@ function problemSection(run) {
     // unless this does.
     run.no_verdict
         ? el('p', { class: 'error' }, 
-        // A second sentence rather than another clause: the reason already carries
-        // its own "— and ..." diagnosis for a silent run, and hanging the
-        // consequence off that too produced a sentence with three clauses and two
-        // dashes that had to be read twice.
+        // A second sentence rather than another clause. The reason already carries
+        // its own "— and ..." diagnosis for the silent and unparsed-call cases,
+        // and hanging the consequence off that too produced a sentence with three
+        // clauses and two dashes that had to be read twice.
         `${run.no_verdict}. Its acceptance criteria were left untouched, and ` +
             `${noVerdictOutcome(run)}.`)
         : null, 
@@ -838,6 +838,14 @@ function problemSection(run) {
         ? el('p', { class: 'muted' }, 'The transcript is empty, so start with the invocation rather than the ' +
             'prompt: check the model id, that the agent is authenticated for ' +
             'that provider, and that its quota is not exhausted. Running ', el('code', {}, run.command), ' by hand usually says which.')
+        : null, 
+    // The transcript looks like work, so the reader's instinct is to read it for a
+    // reason the agent declined to report. There isn't one: it never got that far.
+    run.no_verdict && run.unparsed_tool_call
+        ? el('p', { class: 'muted' }, 'The transcript ends with tool-call markup as text, so the model wrote a ' +
+            'call the agent could not parse and the turn ended there. Nothing in ' +
+            'the prompt causes that — try the task on a model whose tool calling ' +
+            'is more reliable.')
         : null, run.verdict_error ? el('p', { class: 'error' }, run.verdict_error) : null, 
     // Not an error: the verdict was applied, with the claim lowered to match the
     // criteria under it. Shown here because a task that reads "failed" against a

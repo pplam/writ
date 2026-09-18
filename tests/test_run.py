@@ -1096,6 +1096,59 @@ def test_the_json_stream_carries_the_same_facts(planned, writ):
     assert any(e["criteria"] for e in finished)
 
 
+#: a model that garbles its own tool call, so the harness prints it instead of
+#: running it — the M03-002 failure. Plenty of output, no verdict, exit 0.
+BABBLER = r"""
+import sys
+sys.stdin.read()
+print("Now let me verify the query plan independently by reproducing it:")
+print()
+print("<parameter>")
+print('<\u256finvoke name="bash">')
+print('<parameter name="command" string="true">cd . && pytest -q')
+print("</parameter>")
+print("</parameter>")
+"""
+
+
+def test_a_printed_tool_call_is_reported_as_the_model_breaking_not_a_missing_report(
+    planned, writ, project
+):
+    """The transcript looks like work, and none of it happened.
+
+    A model that mangles its own call syntax gets the call printed rather than
+    executed; the turn then ends as if it had only spoken, and the harness exits 0.
+    Left undiagnosed this is indistinguishable on a page from an agent that did the
+    work and skipped its report, which sends the reader to re-read a prompt that is
+    not the problem — the remedy is a different model.
+    """
+    code, _, _ = writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
+                      "--reviewer", agent(BABBLER))
+    assert code == 0
+    data = state.load(project)
+    run = next(r for r in data["runs"].values() if r["role"] == "reviewer")
+    assert run["unparsed_tool_call"] is True
+    assert "printed rather than made" in run["no_verdict"]
+    # not the silent case: it said plenty, which is what makes this one deceptive
+    assert not run.get("no_output")
+
+
+def test_an_agent_that_merely_forgets_to_report_is_not_blamed_on_tool_calling(
+    planned, writ, project
+):
+    """The guard on the above. `true` writes nothing and calls nothing.
+
+    Naming a cause that is not there is worse than naming none: it sends the reader
+    to change models over a run whose model behaved.
+    """
+    code, _, _ = writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
+                      "--reviewer", "true")
+    assert code == 0
+    data = state.load(project)
+    run = next(r for r in data["runs"].values() if r["role"] == "reviewer")
+    assert not run.get("unparsed_tool_call")
+    assert "printed rather than made" not in run["no_verdict"]
+
 
 def test_a_run_that_judged_nothing_still_records_where_the_task_went(
     planned, writ, project

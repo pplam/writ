@@ -173,10 +173,10 @@ function problemSection(run: Run): HTMLElement | null {
       ? el(
           'p',
           { class: 'error' },
-          // A second sentence rather than another clause: the reason already carries
-          // its own "— and ..." diagnosis for a silent run, and hanging the
-          // consequence off that too produced a sentence with three clauses and two
-          // dashes that had to be read twice.
+          // A second sentence rather than another clause. The reason already carries
+          // its own "— and ..." diagnosis for the silent and unparsed-call cases,
+          // and hanging the consequence off that too produced a sentence with three
+          // clauses and two dashes that had to be read twice.
           `${run.no_verdict}. Its acceptance criteria were left untouched, and ` +
             `${noVerdictOutcome(run)}.`,
         )
@@ -193,6 +193,18 @@ function problemSection(run: Run): HTMLElement | null {
             'that provider, and that its quota is not exhausted. Running ',
           el('code', {}, run.command),
           ' by hand usually says which.',
+        )
+      : null,
+    // The transcript looks like work, so the reader's instinct is to read it for a
+    // reason the agent declined to report. There isn't one: it never got that far.
+    run.no_verdict && run.unparsed_tool_call
+      ? el(
+          'p',
+          { class: 'muted' },
+          'The transcript ends with tool-call markup as text, so the model wrote a ' +
+            'call the agent could not parse and the turn ended there. Nothing in ' +
+            'the prompt causes that — try the task on a model whose tool calling ' +
+            'is more reliable.',
         )
       : null,
     run.verdict_error ? el('p', { class: 'error' }, run.verdict_error) : null,

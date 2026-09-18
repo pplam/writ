@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -429,6 +430,33 @@ def produced_output(directory: Path) -> bool:
     return False
 
 
+# A tool call that arrived as text rather than being made. Agent harnesses parse
+# these tags out of a model's reply and execute them, so seeing them in the
+# transcript means the harness did not recognise this one and printed it instead.
+UNPARSED_CALL = re.compile(r"<\s*.{0,4}?invoke\s+name\s*=", re.IGNORECASE)
+
+
+def unparsed_tool_call(directory: Path) -> bool:
+    """Whether the transcript shows a tool call the harness failed to make.
+
+    A model that garbles its own call syntax — a stray character inside the tag,
+    unbalanced closing tags — gets that text printed rather than executed. The
+    turn then ends as if the model had merely spoken, and the harness exits 0
+    having done nothing, so the run looks like an agent that worked and forgot to
+    write its verdict. It never got as far as working.
+
+    Matched loosely on purpose: it is the mangling that produces this, so the tag
+    is by definition not well formed, and a pattern strict enough to require
+    valid syntax would miss precisely the cases worth reporting.
+    """
+    log = directory / "stdout.log"
+    if not log.exists():
+        return False
+    return UNPARSED_CALL.search(
+        log.read_text(encoding="utf-8", errors="replace")
+    ) is not None
+
+
 def prepare(
     root: Path,
     task_id: str,
@@ -724,6 +752,19 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
                 " — and printed no output at all, so it most likely never "
                 "reached a model (unknown model id, missing provider "
                 "credentials, or exhausted quota)"
+            )
+        # The opposite shape of the same problem: plenty of output, none of it a
+        # report, because the agent's last act was a tool call that was printed
+        # instead of run. That is the model breaking its own call syntax, so the
+        # remedy is the model rather than the prompt — and re-reading a transcript
+        # that ends mid-call tells you nothing unless something names what the
+        # fragment at the end of it is.
+        elif code != 124 and not note and unparsed_tool_call(directory):
+            run["unparsed_tool_call"] = True
+            reason += (
+                " — and its transcript ends in a tool call that was printed "
+                "rather than made, so the model garbled the call syntax and the "
+                "turn ended without it doing the work"
             )
         # On the run as well as the task. `dispatch` explains this at the time,
         # but a run read later is the confusing case: exit 0, status completed,

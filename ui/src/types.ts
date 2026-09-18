@@ -116,6 +116,8 @@ export interface RunRow {
   no_verdict: string;
   /** True when it also printed nothing, meaning it likely never ran at all. */
   no_output: boolean;
+  /** True when the transcript ends in a tool call that was printed, not made. */
+  unparsed_tool_call: boolean;
   /** Set when writ lowered a headline claim its own criteria contradicted. */
   verdict_downgraded: string;
   /** Where a verdict was found, when the agent ignored the path it was given. */
