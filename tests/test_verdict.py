@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from writ import state, verdict
+from writ import model, state, verdict
 from writ.state import WritError
 
 
@@ -942,3 +942,94 @@ def test_the_review_prompt_states_the_criterion_count(planned, writ):
     writ("dispatch", "M01-001", "--agent", agent_reporting(passing()))
     _, out, _ = writ("review", "M01-001", "--dry-run")
     assert "This task has 3 acceptance criteria, numbered 1 to 3." in out
+
+
+def test_a_blocked_task_keeps_its_reason_where_a_reader_will_find_it(
+    planned, writ, project
+):
+    """The reason belongs on the task, not only in its history.
+
+    `last_verdict` dropped `blocked_on`, so the only surviving copy was one evidence
+    line among several. A task blocked by its own report has no unsatisfied
+    dependency either, so `writ show` listed every dependency as met and said
+    nothing about why it had stopped — and nothing clears a block on its own, so it
+    sat there with no visible next step.
+    """
+    payload = json.dumps(
+        {
+            "outcome": "blocked",
+            "summary": "cannot proceed",
+            "blocked_on": "writing activation needs a repository method outside allowed",
+            "criteria": [{"number": 1, "status": "pending", "evidence": ""}],
+        }
+    )
+    writ("dispatch", "M01-001", "--agent", agent_reporting(payload))
+    task = state.load(project)["tasks"]["M01-001"]
+    assert task["last_verdict"]["blocked_on"] == (
+        "writing activation needs a repository method outside allowed"
+    )
+    code, out, _ = writ("show", "M01-001")
+    assert code == 0
+    assert any(
+        line.startswith("blocked on: writing activation needs a repository method")
+        for line in out.splitlines()
+    )
+
+
+def test_the_reason_is_recovered_for_a_task_blocked_before_it_was_kept(
+    planned, writ, project
+):
+    """Every task blocked by an earlier writ has the reason only in its evidence.
+
+    Reading it back from the line writ itself wrote is exact. The alternative is a
+    reason that exists in the store and appears nowhere a reader looks, on precisely
+    the tasks most likely to be sitting blocked right now.
+    """
+    payload = json.dumps(
+        {
+            "outcome": "blocked",
+            "summary": "cannot proceed",
+            "blocked_on": "the storage format is undecided",
+            "criteria": [{"number": 1, "status": "pending", "evidence": ""}],
+        }
+    )
+    writ("dispatch", "M01-001", "--agent", agent_reporting(payload))
+    data = state.load(project)
+    task = data["tasks"]["M01-001"]
+    # the old shape: evidence written, field absent
+    del task["last_verdict"]["blocked_on"]
+    state.save(project, data)
+    assert model.blocked_on(task) == "the storage format is undecided"
+    code, out, _ = writ("show", "M01-001")
+    assert any(
+        line.startswith("blocked on: the storage format is undecided")
+        for line in out.splitlines()
+    )
+
+
+def test_a_task_that_is_no_longer_blocked_reports_no_reason(planned, writ, project):
+    """`last_verdict` keeps the previous report until a new one replaces it.
+
+    So the reason has to be conditional on the status, or a task that was blocked
+    and has since been unblocked would keep explaining a block it is no longer under
+    — worse than saying nothing, because it is confidently wrong.
+    """
+    blocked = json.dumps(
+        {
+            "outcome": "blocked",
+            "summary": "cannot proceed",
+            "blocked_on": "the storage format is undecided",
+            "criteria": [{"number": 1, "status": "pending", "evidence": ""}],
+        }
+    )
+    writ("dispatch", "M01-001", "--agent", agent_reporting(blocked))
+    writ("set", "M01-001", "planned")
+    data = state.load(project)
+    task = data["tasks"]["M01-001"]
+    # the stale reason is still on the record, which is the trap
+    assert task["last_verdict"]["blocked_on"]
+    assert model.blocked_on(task) == ""
+    code, out, _ = writ("show", "M01-001")
+    # the header line specifically. The history below still carries the evidence
+    # line from when it was blocked, and should: that happened.
+    assert not any(line.startswith("blocked on:") for line in out.splitlines())

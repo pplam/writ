@@ -28,6 +28,7 @@ from .model import (
     add_milestone,
     add_task,
     check_dag,
+    blocked_on,
     blocking_dependencies,
     effective_status,
     find,
@@ -581,6 +582,13 @@ def _render_task(data: dict[str, Any], task: dict[str, Any]) -> str:
     blockers = blocking_dependencies(data, task)
     if blockers:
         lines.append(f"blocked by: {', '.join(blockers)}")
+    # Near the status rather than down in the evidence. A task blocked by its own
+    # report has no unsatisfied dependency, so `blocked by:` above says nothing and
+    # every dependency reads as met; without this the reason is one history line
+    # under the criteria, and nothing clears a block on its own.
+    reason = blocked_on(task)
+    if reason:
+        lines.append(f"blocked on: {reason}")
     dependents = [
         other["id"]
         for other in sorted(data["tasks"].values(), key=lambda t: t["id"])

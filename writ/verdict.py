@@ -663,6 +663,11 @@ def apply(
         "outcome": verdict.outcome,
         "decision": verdict.decision,
         "summary": verdict.summary,
+        # Kept, because a blocked task's whole meaning is this sentence. Dropping it
+        # left the reason recoverable only as one evidence line among several, and
+        # a `blocked` status with satisfied dependencies and no stated cause reads
+        # as writ having lost track of why it stopped.
+        "blocked_on": verdict.blocked_on,
         "at": utcnow(),
     }
     add_evidence(task, _evidence_line(verdict, actor), actor=actor)

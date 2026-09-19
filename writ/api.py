@@ -26,6 +26,7 @@ from typing import Any
 from . import render, runner, state, verdict
 from .model import (
     acceptance_summary,
+    blocked_on,
     blocking_dependencies,
     effective_status,
     milestone_tasks,
@@ -201,6 +202,15 @@ def task(data: dict[str, Any], task_id: str) -> dict[str, Any]:
             "notes": found.get("notes") or "",
             "allowed": found.get("allowed", []),
             "forbidden": found.get("forbidden", []),
+            # Why the agent stopped, for a task it could not finish. The one thing a
+            # reader of a blocked task is looking for, and `blocked_by` cannot supply
+            # it: a task blocked by its own report has no unsatisfied dependency, so
+            # every dependency reads as met and nothing says what the obstacle was.
+            #
+            # Falls back to the evidence line, which is where this lived before
+            # `last_verdict` kept the field, so tasks blocked by an earlier version
+            # still explain themselves.
+            "blocked_on": blocked_on(found),
             "acceptances": [
                 {
                     "number": index,

@@ -111,6 +111,40 @@ def blocking_dependencies(data: dict[str, Any], task: dict[str, Any]) -> list[st
     return blockers
 
 
+#: how writ has always written a block reason into a task's evidence
+BLOCKED_EVIDENCE_PREFIX = "blocked on: "
+
+
+def blocked_on(task: dict[str, Any]) -> str:
+    """Why a blocked task stopped, or "" when it is not blocked or did not say.
+
+    Distinct from `blocking_dependencies`, and the distinction is the point: a task
+    blocked by its own report has no unsatisfied dependency, so every dependency
+    reads as met and nothing else on the record says what the obstacle was. Nothing
+    clears a block on its own either — it waits for a person — so a reason that
+    cannot be found is a task that sits indefinitely with no visible next step.
+
+    Only for a task that is actually blocked: `last_verdict` keeps the previous
+    report until a new one replaces it, and a stale reason on a task that has since
+    moved on is worse than none.
+
+    The evidence fallback covers tasks blocked before `last_verdict` carried the
+    field, which is every one blocked by an earlier version. Reading back the line
+    writ itself wrote is exact, and the alternative is a reason that exists in the
+    store but appears nowhere a reader looks.
+    """
+    if task.get("status") != "blocked":
+        return ""
+    verdict = task.get("last_verdict") or {}
+    if verdict.get("blocked_on"):
+        return str(verdict["blocked_on"])
+    for item in reversed(task.get("evidence", [])):
+        text = str(item.get("text", ""))
+        if text.startswith(BLOCKED_EVIDENCE_PREFIX):
+            return text[len(BLOCKED_EVIDENCE_PREFIX) :]
+    return ""
+
+
 def effective_status(data: dict[str, Any], task: dict[str, Any]) -> str:
     """Stored status, refined to `ready` when a planned task is unblocked."""
     if task["status"] == "planned" and not blocking_dependencies(data, task):

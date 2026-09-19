@@ -104,6 +104,11 @@ export function renderTaskDetail(
       el('h2', {}, task.title),
     ),
     metaRow(task),
+    // Above the criteria, because for a blocked task this is the answer to the only
+    // question being asked. It used to be readable only as one evidence line below
+    // four other sections, while Dependencies showed everything satisfied — so the
+    // page looked like writ had stopped for no reason it could name.
+    blockedSection(task),
     acceptanceSection(task),
     task.notes ? section('Notes', null, el('p', { class: 'prose' }, task.notes)) : null,
     dependencySection(task),
@@ -282,6 +287,24 @@ function runSection(task: Task, handlers: TaskHandlers): HTMLElement {
         return row;
       }),
     ),
+  );
+}
+
+/**
+ * What stopped a blocked task, when it said so.
+ *
+ * A task blocked by its own report has no unsatisfied dependency, so the
+ * Dependencies section shows every one of them met and the status pill is the only
+ * sign anything is wrong. Nothing auto-clears a block either — it waits for a
+ * person — so a reason that cannot be found is a task that sits there
+ * indefinitely with no visible next step.
+ */
+function blockedSection(task: Task): HTMLElement | null {
+  if (!task.blocked_on) return null;
+  return section(
+    'Blocked on',
+    null,
+    el('p', { class: 'prose blocked-reason' }, task.blocked_on),
   );
 }
 

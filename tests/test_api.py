@@ -346,3 +346,36 @@ def test_a_run_that_wrote_no_verdict_says_so_on_the_record(writ, design, project
     # Distinct from a verdict that was written and rejected.
     assert detail["verdict_error"] == ""
     assert state.load(project)["tasks"]["M01-001"]["status"] == "planned"
+
+
+def test_a_blocked_task_carries_its_reason_to_the_page(writ, design, project):
+    """Without this the dashboard can only show the word "blocked".
+
+    A task blocked by its own report has no unsatisfied dependency, so the page
+    listed every dependency as satisfied and nothing said what the obstacle was. The
+    reason was in the store the whole time, as one history line below four other
+    sections.
+    """
+    writ("init")
+    writ("plan", str(design), "--extract")
+    data = state.load(project)
+    task = data["tasks"]["M01-001"]
+    task["status"] = "blocked"
+    task["last_verdict"] = {"outcome": "blocked", "blocked_on": "needs a decision first"}
+    state.save(project, data)
+    detail = api.task(state.load(project), "M01-001")
+    assert detail["blocked_on"] == "needs a decision first"
+    # and the thing it is not: no dependency is holding this up
+    assert detail["blocked_by"] == []
+
+
+def test_a_task_that_is_not_blocked_carries_no_reason(writ, design, project):
+    """`last_verdict` outlives the status it was written under."""
+    writ("init")
+    writ("plan", str(design), "--extract")
+    data = state.load(project)
+    task = data["tasks"]["M01-001"]
+    task["status"] = "completed"
+    task["last_verdict"] = {"outcome": "blocked", "blocked_on": "a stale reason"}
+    state.save(project, data)
+    assert api.task(state.load(project), "M01-001")["blocked_on"] == ""

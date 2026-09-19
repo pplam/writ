@@ -170,6 +170,13 @@ can be resumed from: `running` returns to `planned`, and `reviewing` returns to
 `awaiting-review`. The next `writ run` (or `writ cancel` with no id) does that
 reconciliation.
 
+`blocked` is the one status nothing clears on its own, so an agent that reports it
+must say what stopped it, and writ keeps that sentence on the task. `writ show`
+prints it beside the status and the dashboard leads the panel with it, because a
+task blocked by its own report has no unsatisfied dependency — every dependency
+reads as met, and without the reason the only next step visible to a reader is the
+word "blocked".
+
 ### Statuses are set by agents, not by hand
 
 The implementing agent reports a structured verdict; a reviewer agent that did

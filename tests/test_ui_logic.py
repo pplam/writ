@@ -419,3 +419,21 @@ def test_a_failed_task_is_reported_as_what_it_became():
     assert evaluate("noVerdictOutcome({resulting_status: 'failed'})") == (
         'the task became failed rather than judged'
     )
+
+
+# ------------------------------------------------------------------ blocked tasks
+
+
+def test_a_blocked_task_gets_a_section_and_an_unblocked_one_does_not():
+    """The decision this makes. A blocked task's dependencies all read as satisfied,
+    because what stopped it was its own report rather than an unmet dependency, so
+    the status pill was the only sign anything was wrong.
+
+    Asserted as present-or-absent rather than by reading the rendered text: the stub
+    DOM here builds no real tree to query, and the heading is a literal in the
+    source. What is worth pinning is that an empty reason renders nothing at all,
+    because the field is empty for every task that is not blocked and a bare
+    "Blocked on" heading over nothing would be worse than silence.
+    """
+    assert evaluate("blockedSection({blocked_on: 'needs a decision first'}) !== null") is True
+    assert evaluate("blockedSection({blocked_on: ''}) === null") is True

@@ -128,6 +128,8 @@ export interface Task extends TaskRow {
   notes: string;
   allowed: string[];
   forbidden: string[];
+  /** Why a blocked task stopped. Empty unless the task is blocked. */
+  blocked_on: string;
   acceptances: Acceptance[];
   evidence: Evidence[];
   /** The most recent rejection, open or answered. Null if never rejected. */

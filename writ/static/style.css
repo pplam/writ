@@ -1,4 +1,4 @@
-/* built from ui/src (5009ee05f616) */
+/* built from ui/src (1199cf6ff2cd) */
 /*
  * One stylesheet, no framework.
  *
@@ -738,6 +738,16 @@ code, .mono, pre { font-family: var(--mono); }
   font-family: var(--mono);
   font-size: 12px;
   white-space: pre-wrap;
+}
+
+/* The reason a blocked task stopped. Tinted like a failure because it is one the
+ * reader has to act on: nothing clears a block on its own. */
+.blocked-reason {
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--s-failed);
+  border-left: 2.5px solid var(--i-failed);
+  border-radius: 5px;
 }
 
 .criterion-by { display: flex; gap: 7px; margin: 6px 0 0; }
