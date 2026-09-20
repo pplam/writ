@@ -7,12 +7,27 @@ dependency-ordered task DAG with explicit acceptance criteria, hands one task at
 a time back to an agent, and keeps an append-only decision log. State is plain
 files — JSON, markdown, and logs — under `<project>/.writ`.
 
-Two premises. An agent should never be asked to "implement the design": it gets
-one bounded task, a stated bar, and a guardrail list. And whether that bar was
-met is decided by agents, not typed in by a human — the agent that did the work
-reports a structured verdict with evidence, and a reviewer agent that did not
-write the code decides whether to sign it off. Everything either of them claimed
-stays inspectable afterwards.
+Three premises.
+
+An agent should never be asked to "implement the design": it gets one bounded
+task, a stated bar, and a guardrail list.
+
+Whether that bar was met is decided by agents, not typed in by a human. The agent
+that did the work reports a structured verdict with evidence, and a reviewer agent
+that did not write the code decides whether to sign it off. Everything either of
+them claimed stays inspectable afterwards.
+
+And the plan gets the same treatment as the work. A plan is a reviewed artifact,
+not the direct output of one agent: its requirements are inventoried and their
+coverage checked, independent critics read it, a human approves it on the record,
+and gates judge whether the finished work actually adds up. `writ run` will not
+start a plan nobody has signed off.
+
+**Contents** — [Install](#install) · [Quick start](#quick-start) ·
+[Storage](#storage) · [Planning](#planning) · [Task lifecycle](#task-lifecycle) ·
+[Commands](#commands) · [Watching it work](#watching-it-work) ·
+[Running the whole graph](#running-the-whole-graph) · [Dispatch](#dispatch) ·
+[Agent invocation](#agent-invocation) · [Tests](#tests)
 
 ## Install
 
@@ -65,7 +80,9 @@ writ review M01-001 --agent codex      # a different agent checks the claim
 
 ```
 <project>/.writ/
-  state.json          milestones, tasks, runs, decisions
+  state.json          the whole project: the plan and its status, requirements,
+                      milestones, tasks and gates, runs, findings, repair
+                      requests, decisions
   decisions.md        human-readable mirror of the decision log
   run.session         the pid of the active `writ run`, if any
   plans/<plan-id>/
@@ -73,9 +90,15 @@ writ review M01-001 --agent codex      # a different agent checks the claim
     plan.json         the plan it returned, before validation
     stdout.log
     stderr.log
+  reviews/r<revision>/<critic>/
+    prompt.txt        what that critic was asked, at that plan revision
+    findings.json     what it found
+    stdout.log
+    stderr.log
   runs/<run-id>/
     prompt.txt        exactly what the agent was given
     verdict.json      what it claimed, per criterion, with evidence
+    patch.json        repair runs only: the graph change it proposed
     stdout.log
     stderr.log
     supervisor.log    detached runs only
@@ -122,6 +145,7 @@ instead of paying for another run.
 | `--from-plan PATH` | import a plan artifact, run no agent |
 | `--extract` | skip the agent entirely (see below) |
 | `--timeout S` | kill the planner after S seconds (default 1800) |
+| `--cwd D` | working directory for the agent (default: `--root`) |
 | `--quiet` | do not mirror the agent's output to the terminal |
 | `--chain` | order unordered tasks linearly in plan order (old default) |
 | `--no-gates` | commit the plan without milestone or final gates |
@@ -180,17 +204,8 @@ writ approve --by ada --reason "read it through"
 writ approve --force --reason "known gap, shipping the spike"
 ```
 
-`--force` does not delete the objections. They stay in the ledger marked
-`accepted`, with who accepted them and why, so a later reader can see the plan ran
-with known gaps and which ones they were.
-
-The ledger keeps ids across re-checks: a finding that is still true keeps `F-0007`
-and its first-seen revision, one that has gone away is closed as `resolved` rather
-than vanishing, and one that comes back is reopened. "This has been objected to
-since revision 2" is a thing the plan can tell you.
-
-`--force` is the wholesale answer: every open finding at once, under one reason.
-For disagreeing with one of them, answer it on its own:
+Or answer one finding at a time, which is the more useful shape when you disagree
+with a particular objection rather than with all of them:
 
 ```bash
 writ show F-0007                                    # what was said, and by whom
@@ -198,12 +213,18 @@ writ set F-0007 accepted --reason "known, shipping" # stands, run anyway
 writ set F-0007 declined --reason "served by /stats" # the reviewer is wrong
 ```
 
-Both answers need a reason — an accepted finding without one is the silent
-ignoring this is meant to prevent, and a declined one without one is an unargued
-assertion that the reviewer was wrong. Neither can be set `resolved`: that word is
-earned when a check or a gate demonstrates the outcome the finding asked for, so a
-person who wants the plan to proceed anyway says `accepted` and the record says why
-it moved.
+Either way the objections survive. `--force` marks every open finding `accepted`
+rather than deleting it, with who accepted it and why, so a later reader can see
+the plan ran with known gaps and which ones they were. Both single answers need a
+reason too: an accepted finding without one is the silent ignoring this exists to
+prevent, and a declined one without one is an unargued assertion that the reviewer
+was wrong. Neither can be set `resolved` — that word is earned when a check or a
+gate demonstrates the outcome the finding asked for.
+
+The ledger keeps ids across re-checks: a finding that is still true keeps `F-0007`
+and its first-seen revision, one that has gone away is closed as `resolved` rather
+than vanishing, and one that comes back is reopened. "This has been objected to
+since revision 2" is a thing the plan can tell you.
 
 ### Critics
 
@@ -339,8 +360,19 @@ represents a judgement about the work:
 - the **reviewer agent** re-runs the tests and re-reads the diff, and its
   decision is what produces `completed`, another attempt, or `failed`.
 
-So `writ set` covers only workflow moves (`planned`, `running`, `blocked`,
-`failed`). It has no `completed`, with or without `--force`.
+So `writ set` covers only workflow moves, and has no `completed` with or without
+`--force`. A status is a value rather than a verb — one command for every
+transition, so the legal ones live in one place and `--help` lists them:
+
+```bash
+writ set M01-001 running
+writ set M01-001 blocked --evidence "waiting on the storage decision"
+```
+
+Two values are absent on purpose: `ready` is derived from the DAG, and `completed`
+belongs to the review flow above. Because ids carry their own type, the same verb
+rules on a decision an agent proposed or disposes of a finding — see
+[the decision log](#the-decision-log).
 
 ### The verdict
 
@@ -531,7 +563,7 @@ writ override M01-002 failed --reason "criterion 2 regressed" --accept 2=failed
 
 ## Commands
 
-Twenty-one commands, organized by what you are doing rather than what type it
+Twenty commands, organized by what you are doing rather than what type it
 operates on.
 
 **Set up**
@@ -548,7 +580,7 @@ operates on.
 
 | Command | Purpose |
 |---|---|
-| `writ status [--watch] [--interval S] [--until-idle]` | progress, ready work, live runs |
+| `writ status [--watch] [--interval S] [--until-idle] [--no-clear]` | progress, ready work, live runs |
 | `writ list [tasks\|milestones\|runs\|decisions\|findings\|requirements\|gates\|repairs] [--status S] [--milestone M] [--task T] [--ready] [--awaiting-review] [--proposed] [--open] [--uncovered] [--active] [--limit N]` | any collection |
 | `writ coverage [--uncovered] [--requirement ID]` | requirement → tasks → state |
 | `writ show <id> [--verbose] [--prompt]` | any single thing |
@@ -568,8 +600,8 @@ operates on.
 
 | Command | Purpose |
 |---|---|
-| `writ run [--parallel N] [--max-tasks N] [--max-rework N] [--agent CMD] [--model M] [--reviewer CMD] [--reviewer-model M] [--timeout S] [--cwd D] [--force] [--quiet] [--dry-run]` | walk the whole graph until it is done or stuck |
-| `writ dispatch <id> [--agent CMD] [--model M] [--detach] [--timeout S] [--cwd D] [--quiet] [--dry-run] [-- args]` | an agent implements the task and reports a verdict |
+| `writ run [--parallel N] [--order id\|depth\|unlocks] [--max-tasks N] [--max-rework N] [--agent CMD] [--model M] [--reviewer CMD] [--reviewer-model M] [--timeout S] [--cwd D] [--force] [--quiet] [--dry-run]` | walk the whole graph until it is done or stuck |
+| `writ dispatch <id> [--agent CMD] [--model M] [--detach] [--force] [--timeout S] [--cwd D] [--quiet] [--dry-run] [-- args]` | an agent implements the task and reports a verdict |
 | `writ review [id] [--agent CMD] [--model M] [--timeout S] [--cwd D] [--max-rework N] [--force] [--quiet] [--dry-run]` | a second agent verifies and signs off; no id reviews all awaiting |
 | `writ cancel [run-id]` | stop a run, or reap dead ones when given no id |
 | `writ agents [--agent CMD] [--model M]` | how writ invokes each agent headlessly |
@@ -794,7 +826,7 @@ Nothing the agent did not itself mark `passed` is ever credited, so the
 adjustment only lowers a claim. It is on the task's own log too, because the next
 agent to pick the task up is the one that needs to know.
 
-A criterion left out of the report is read the same way as one reported `pending`:
+A criterion left out of the report is read as the `pending` it should have been:
 
 ```
 PROBLEM
@@ -802,14 +834,13 @@ decision was 'pass' but criteria 1, 2, 3 were not reported on, so nothing
 confirmed them; writ recorded 'needs-repair'
 ```
 
-Silence used to be the one way past this check. Writ compared the headline against
-the criteria in front of it, so a report that mentioned no criteria had none unmet
-and its claim stood — and the worst case was a gate, which could sign off a whole
-milestone with `"criteria": []`. The bars a verdict owes a report on are a fact
-about the task, not about the report, so writ now fills that in: an unreported
-criterion counts as unmet, a gate lowered this way gets a blocking finding per
-skipped criterion so a repair has something to act on, and the only way to claim
-`complete`, `accept` or `pass` is to say something about every bar.
+Silence was the one way past this check, since a report mentioning no criteria had
+none unmet — worst of all in a gate, which could sign off a milestone with
+`"criteria": []`. Which bars a verdict owes a report on is a fact about the task
+rather than about the report, so writ fills that in: the only way to claim
+`complete`, `accept` or `pass` is to say something about every one. A gate lowered
+this way also gets a blocking finding per skipped criterion, because a repair
+planner reads nothing else.
 
 ### The graph, live
 
@@ -850,25 +881,6 @@ A hidden tab stops following and says `paused (tab hidden)`, catching up when yo
 come back. Not an optimisation — a browser allows about six connections per
 origin, and a held-open stream uses one, so a handful of forgotten writ tabs would
 otherwise starve the next one you opened.
-
-### A status is a value, not a verb
-
-```bash
-writ set M01-001 running
-writ set M01-001 blocked --evidence "waiting on the storage decision"
-```
-
-One command for every transition, so the legal values live in one place and
-`--help` lists them. Two are absent on purpose: `ready` is derived from the DAG,
-and `completed` belongs to the review flow above.
-
-Because ids carry their own type, the same verb rules on a decision an agent
-proposed:
-
-```bash
-writ set D-0001 active
-writ set D-0002 rejected --reason "packaging is M03, not this task's call"
-```
 
 ## Running the whole graph
 
@@ -1297,21 +1309,15 @@ A failed task parks everything downstream of it, and the summary says what:
 ran 4 agents over 2 tasks in 12s
 completed 0, failed 2
 project 0/6 tasks complete
-blocked by failed work: M01-002, M01-003
+blocked by failed work: M01-003, M01-004, M01-005   (failed: M01-002)
 ```
 
-That list is transitive: if C waits on B waits on a failed A, both B and C are
-reported, because both are equally stuck. `writ run` exits 1 when anything
-failed, so it can be used in a script.
+The first list is transitive: if C waits on B waits on a failed A, both B and C
+are reported, because both are equally stuck. The second names only what actually
+failed, which is the id to go and look at — the rest are casualties, and a list
+that mixed them read as though a task had failed when it had merely been waiting.
 
-Output is a progress log rather than a transcript — with several agents
-interleaved, mirroring their stdout would be unreadable. Each agent's full
-output is on disk:
-
-```bash
-writ logs M01-003                      # what that agent actually did
-writ logs M01-003 --stderr
-```
+`writ run` exits 1 when anything failed, so it can be used in a script.
 
 ## Dispatch
 
@@ -1393,5 +1399,5 @@ checking.
 uv run --with pytest python -m pytest
 ```
 
-72 tests, hermetic — the "agents" under test are short `python -c` commands, so
+694 tests, hermetic — the "agents" under test are short `python -c` commands, so
 nothing touches the network.
