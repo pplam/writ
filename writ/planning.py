@@ -15,10 +15,12 @@ from __future__ import annotations
 import json
 import re
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import agents, runner, state
+from . import agents, plancheck, runner, state
+from .plancheck import Requirement
 from .planner import PlannedMilestone, PlannedTask, section_text
 from .state import WritError
 
@@ -38,6 +40,23 @@ TASK_ALIASES: dict[str, tuple[str, ...]] = {
     "forbidden": ("forbidden", "forbid", "forbidden_paths"),
     "design_section": ("design_section", "section", "heading"),
     "notes": ("notes", "intent", "approach", "summary"),
+    "requirement_ids": (
+        "requirement_ids",
+        "requirements",
+        "requirement",
+        "covers",
+        "reqs",
+    ),
+}
+REQUIREMENT_ALIASES: dict[str, tuple[str, ...]] = {
+    "id": ("id", "requirement_id", "ref"),
+    "text": ("text", "requirement", "statement", "description", "title"),
+    "priority": ("priority", "importance", "level"),
+    "status": ("status", "disposition", "coverage"),
+    "source": ("source", "section", "design_section", "where", "quote"),
+    "evidence": ("evidence", "proof", "existing_evidence"),
+    "reason": ("reason", "justification", "why"),
+    "verification": ("verification", "verify", "verification_hints", "how"),
 }
 MILESTONE_ALIASES: dict[str, tuple[str, ...]] = {
     "id": ("id", "milestone_id", "ref"),
@@ -48,6 +67,18 @@ MILESTONE_ALIASES: dict[str, tuple[str, ...]] = {
 
 SCHEMA = """\
 {
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "text": "one obligation the document states, in your own words",
+      "source": "exact heading it came from",
+      "priority": "must" | "should" | "may",
+      "status": "planned" | "existing" | "out-of-scope" | "deferred",
+      "evidence": "status existing only: the test or code that satisfies it",
+      "reason": "status out-of-scope or deferred only: why it is not this plan's",
+      "verification": ["how this can be demonstrated"]
+    }
+  ],
   "milestones": [
     {
       "id": "M01",
@@ -59,6 +90,7 @@ SCHEMA = """\
           "title": "imperative, specific: 'Add append-only event log writer'",
           "notes": "approach, key files, pitfalls found while reading the repo",
           "design_section": "exact heading from the design document",
+          "requirement_ids": ["REQ-001", "REQ-004"],
           "acceptances": [
             "a criterion a person or command can check",
             "another one"
@@ -74,6 +106,18 @@ SCHEMA = """\
 
 RULES = """\
 Rules:
+- Start with `requirements`, before any task. Read the document and write down
+  every obligation it states: behaviour, constraint, interface, non-functional
+  bar. One obligation per entry, in your own words, with the heading it came from.
+  This inventory is what the plan is checked against, so an obligation you leave
+  out is one nothing will ever verify — and one you invent becomes work with no
+  mandate. Do not fold two requirements into one entry to make the list shorter.
+- Every requirement must end somewhere. Either one or more tasks name it in
+  `requirement_ids`, or it is `existing` with evidence naming the test or code
+  that already satisfies it, or it is `out-of-scope`/`deferred` with a reason.
+  Silently dropping one is the failure this inventory exists to prevent.
+- Every task should name the requirements it covers. A task that covers none is
+  either infrastructure — say so in its notes — or work nothing asked for.
 - One task is one bounded agent session: a single coherent change with a stated
   bar. Split anything that spans unrelated components or that you could not
   review in one sitting. Do not emit a task called "implement the design".
@@ -92,8 +136,18 @@ Rules:
   above. It must form a DAG: no cycles, no self-references. Order milestones so
   earlier work unblocks later work, and leave independent tasks independent
   instead of chaining everything into one line.
+- State every edge the work actually needs. A task with no `depends_on` is run as
+  soon as the graph allows, possibly first and possibly beside any other — the
+  plan's order is not an ordering. If B reads an interface A creates, B must say
+  so; nothing else will notice.
 - allowed and forbidden are repo-relative paths or packages that fence a task to
   the components it should touch. Omit them when a task is genuinely global.
+- Two tasks that nothing orders must not list the same path in `allowed`. They
+  can run at the same time, in the same working tree, and whichever finishes
+  second loses its work. Give the file one owner and have the other depend on it.
+- Where branches of the graph have to compose, say what checks that they do: a
+  task depending on both, whose criteria exercise the combined behaviour. A plan
+  that ends in several independent leaves has verified each of them alone.
 - design_section must be a heading that appears verbatim in the design document,
   so a task can be traced back to what asked for it. Use "Parent / Child" for a
   nested heading.
@@ -221,7 +275,7 @@ def generate(
     context: dict[str, Any],
     stream: bool = False,
     on_start=None,
-) -> tuple[list[PlannedMilestone], Path, int]:
+) -> tuple[PlanDocument, Path, int]:
     """Run the planning agent and return the validated plan it produced."""
     resolved = agents.resolve(agent, agent_args, model)
     plan_id = new_plan_id(doc)
@@ -254,10 +308,10 @@ def generate(
     if text is None:
         raise WritError(_no_plan_message(resolved, directory, code))
     try:
-        milestones = load_plan(text)
+        document = load_document(text)
     except WritError as exc:
         raise WritError(f"{exc} (plan artifact: {plan_path})") from exc
-    return milestones, plan_path, code
+    return document, plan_path, code
 
 
 def _no_plan_message(
@@ -350,14 +404,44 @@ def _balanced(text: str, start: int) -> str | None:
 # validation
 
 
+@dataclass
+class PlanDocument:
+    """A validated plan: what the design requires, and the work that covers it.
+
+    The requirement inventory is the half `load_plan` used to throw away. It is
+    optional — `--extract` produces none, and so does any plan written before
+    Writ asked for one — so an empty list means "this plan makes no claim about
+    coverage", not "this plan covers nothing. Everything that reads it treats
+    those two differently.
+    """
+
+    milestones: list[PlannedMilestone] = field(default_factory=list)
+    requirements: list[Requirement] = field(default_factory=list)
+
+    @property
+    def requirement_ids(self) -> set[str]:
+        return {requirement.id for requirement in self.requirements}
+
+
 def read_plan(path: Path) -> list[PlannedMilestone]:
     if not path.exists():
         raise WritError(f"plan file not found: {path}")
     return load_plan(path.read_text(encoding="utf-8"))
 
 
+def read_document(path: Path) -> PlanDocument:
+    if not path.exists():
+        raise WritError(f"plan file not found: {path}")
+    return load_document(path.read_text(encoding="utf-8"))
+
+
 def load_plan(text: str) -> list[PlannedMilestone]:
-    """Validate a plan document and convert it into planned milestones."""
+    """Just the milestones, for callers that do not care about coverage."""
+    return load_document(text).milestones
+
+
+def load_document(text: str) -> PlanDocument:
+    """Validate a plan document: its requirement inventory and its milestones."""
     stripped = text.strip()
     if not stripped:
         raise WritError("the plan is empty")
@@ -370,7 +454,9 @@ def load_plan(text: str) -> list[PlannedMilestone]:
         payload = json.loads(recovered)
 
     raw_milestones = payload
+    requirements: list[Requirement] = []
     if isinstance(payload, dict):
+        requirements = _requirements(payload.get("requirements"))
         raw_milestones = _pick(payload, MILESTONE_ALIASES["tasks"] + ("milestones",))
         if raw_milestones is None:
             raise WritError("the plan has no `milestones` list")
@@ -402,7 +488,57 @@ def load_plan(text: str) -> list[PlannedMilestone]:
             milestone.tasks.append(task)
         milestones.append(milestone)
     _check_refs(milestones)
-    return milestones
+    return PlanDocument(milestones=milestones, requirements=requirements)
+
+
+def _requirements(value: Any) -> list[Requirement]:
+    """Validate the requirement inventory, or accept its absence.
+
+    Absent is legal: `--extract` states no requirements, and neither does a plan
+    from before Writ asked for them. Present but malformed is not, because a
+    coverage check run against a broken inventory would report absences that are
+    really parse failures — which is worse than no coverage check at all.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise WritError("`requirements` must be a list")
+    requirements: list[Requirement] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(value):
+        where = f"requirements[{index}]"
+        if not isinstance(raw, dict):
+            raise WritError(f"{where} must be an object")
+        req_id = _text(_pick(raw, REQUIREMENT_ALIASES["id"]), f"{where}.id")
+        if req_id in seen:
+            raise WritError(f"duplicate requirement id in the plan: {req_id}")
+        seen.add(req_id)
+        status = (
+            _optional_text(_pick(raw, REQUIREMENT_ALIASES["status"])) or "planned"
+        ).lower()
+        if status not in plancheck.REQUIREMENT_STATUSES:
+            raise WritError(
+                f"{where}.status is {status!r}; expected one of "
+                f"{', '.join(plancheck.REQUIREMENT_STATUSES)}"
+            )
+        requirements.append(
+            Requirement(
+                id=req_id,
+                text=_text(_pick(raw, REQUIREMENT_ALIASES["text"]), f"{where}.text"),
+                priority=(
+                    _optional_text(_pick(raw, REQUIREMENT_ALIASES["priority"])) or "must"
+                ).lower(),
+                status=status,
+                source=_optional_text(_pick(raw, REQUIREMENT_ALIASES["source"])) or "",
+                evidence=_optional_text(_pick(raw, REQUIREMENT_ALIASES["evidence"])) or "",
+                reason=_optional_text(_pick(raw, REQUIREMENT_ALIASES["reason"])) or "",
+                verification=_strings(
+                    _pick(raw, REQUIREMENT_ALIASES["verification"]),
+                    f"{where}.verification",
+                ),
+            )
+        )
+    return requirements
 
 
 def _task(raw: Any, where: str, milestone_title: str) -> PlannedTask:
@@ -422,6 +558,9 @@ def _task(raw: Any, where: str, milestone_title: str) -> PlannedTask:
         depends_on=_strings(_pick(raw, TASK_ALIASES["depends_on"]), f"{where}.depends_on"),
         allowed=_strings(_pick(raw, TASK_ALIASES["allowed"]), f"{where}.allowed"),
         forbidden=_strings(_pick(raw, TASK_ALIASES["forbidden"]), f"{where}.forbidden"),
+        requirement_ids=_strings(
+            _pick(raw, TASK_ALIASES["requirement_ids"]), f"{where}.requirement_ids"
+        ),
         stated_section=bool(section),
     )
 

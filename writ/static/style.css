@@ -1,4 +1,4 @@
-/* built from ui/src (1199cf6ff2cd) */
+/* built from ui/src (23891edef615) */
 /*
  * One stylesheet, no framework.
  *
@@ -888,3 +888,108 @@ pre.command {
 @media (prefers-reduced-motion: reduce) {
   *, .node.live .box, .spinner, .meter-fill { animation: none !important; transition: none !important; }
 }
+
+/*
+ * The plan view: findings, requirements, repairs.
+ *
+ * All three are lists of short records that each carry a verdict, so they share a
+ * card shape and differ only in what the left border says. The border is the
+ * severity or the state, which makes a page of them scannable without reading:
+ * red down the left is what stops the plan.
+ */
+.plan-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+
+.finding-list, .coverage-list, .repair-list, .held-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.held-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+
+.finding, .coverage, .repair, .held {
+  border: 1px solid var(--line);
+  border-left-width: 2.5px;
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  background: var(--panel);
+}
+
+.finding header, .coverage header, .repair header, .held header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.finding.error { border-left-color: var(--i-failed); }
+.finding.warning { border-left-color: var(--i-review); }
+.finding.note { border-left-color: var(--edge); }
+
+/*
+ * An answered finding is history: it stays legible, because a plan that ran with a
+ * known objection is only readable if the objection is still there, but it should
+ * not compete with what is still open.
+ */
+.finding.answered { opacity: 0.68; border-left-color: var(--edge); }
+
+.coverage.uncovered, .coverage.unevidenced { border-left-color: var(--i-failed); }
+.coverage.at-risk { border-left-color: var(--i-failed); }
+.coverage.satisfied { border-left-color: var(--i-completed); }
+.coverage.in-progress { border-left-color: var(--i-running); }
+/* Covered but not started: the default, and the only state that is just waiting. */
+.coverage.planned { border-left-color: var(--edge); }
+.coverage.out-of-scope, .coverage.deferred { border-left-color: var(--edge); opacity: 0.72; }
+
+.repair.open, .repair.planning { border-left-color: var(--i-review); }
+.repair.applied { border-left-color: var(--i-completed); }
+.repair.abandoned { border-left-color: var(--edge); opacity: 0.72; }
+
+.held { border-left-color: var(--i-review); }
+
+.finding .command, .held .command, .card .ruling .command { margin: 8px 0 0; }
+
+/* The filter chip for the view you are on. */
+.count.selected b { text-decoration: underline; text-underline-offset: 3px; }
+
+/*
+ * A plan approved over its own findings. Louder than the other pills on purpose:
+ * it is the one badge that says a human overruled something.
+ */
+.pill.forced { background: var(--s-failed); color: var(--i-failed); font-weight: 600; }
+.pill.needs-approval, .pill.needs-repair, .pill.must { background: var(--s-review); color: var(--i-review); }
+.pill.approved, .pill.complete, .pill.resolved, .pill.satisfied { background: var(--s-completed); color: var(--i-completed); }
+.pill.uncovered, .pill.unevidenced, .pill.at-risk { background: var(--s-failed); color: var(--i-failed); }
+.pill.in-progress { background: var(--s-running); color: var(--i-running); }
+.pill.executing { background: var(--s-running); color: var(--i-running); }
+.pill.declined, .pill.out-of-scope, .pill.deferred, .pill.may { opacity: 0.8; }
+
+/* An id that opens the task drawer. Same affordance as .as-button, narrower use. */
+.id-link {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 0 2px;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/*
+ * A gate's own history, in the task drawer.
+ *
+ * Numbered because the order is the content: round two finding what round one
+ * found is a plan that is not converging, and that only reads as a sequence.
+ */
+.gate-attempts { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 10px; }
+.gate-attempt::marker { color: var(--faint); font-variant-numeric: tabular-nums; }
+.gate-attempt p { margin: 4px 0 0; }
+
+.held-questions { margin: 6px 0 0; padding-left: 20px; color: var(--dim); }
+.held-questions li { margin-bottom: 3px; }
+
+.pill.pass { background: var(--s-completed); color: var(--i-completed); }

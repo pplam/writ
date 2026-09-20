@@ -1,0 +1,380 @@
+"""Independent adversarial review of a plan, before any of it runs.
+
+Writ's own checks can prove a criterion names no command. They cannot tell that a
+task is the wrong task. That needs a reader, and the argument these tests are about
+is that the reader must not be the author — and must report findings rather than
+rewrite the plan, for the same reason a gate does.
+"""
+from __future__ import annotations
+
+import json
+import shlex
+import sys
+
+import pytest
+
+from writ import critics, plancheck, plans, state
+from writ.state import WritError
+
+from tests.test_plans import PLAN
+
+
+CRITIC = """
+import json, os, re, sys
+prompt = sys.stdin.read()
+path = re.search(r'Write your findings as JSON to this exact path:\\n  (\\S+)', prompt).group(1)
+brief = re.search(r'Your brief, and nothing else: (.+?)\\.\\n', prompt).group(1)
+payload = json.loads(os.environ.get("WRIT_TEST_REPORT", "{}"))
+findings = payload.get("findings", [])
+# Only the critic named in WRIT_TEST_CRITIC reports anything, so a test can say
+# which review produced which finding.
+want = os.environ.get("WRIT_TEST_CRITIC", "")
+if want and want not in prompt.split("Your brief")[0] + brief:
+    findings = []
+open(path, "w").write(json.dumps({
+    "findings": findings,
+    "summary": payload.get("summary", "reviewed " + brief[:30]),
+    "confidence": payload.get("confidence", "high"),
+}))
+"""
+
+SILENT = """
+import json, re, sys
+prompt = sys.stdin.read()
+path = re.search(r'Write your findings as JSON to this exact path:\\n  (\\S+)', prompt).group(1)
+open(path, "w").write(json.dumps({"findings": [], "summary": "nothing to report"}))
+"""
+
+MUTE = """
+import sys
+sys.stdin.read()
+print("I have decided not to write a report")
+"""
+
+BLOCKING_FINDING = {
+    "severity": "blocking",
+    "category": "missing-coverage",
+    "where": "REQ-003",
+    "message": "No task implements the queue depth view",
+    "suggested_action": "add a task, or mark it out of scope with a reason",
+    "requirement_ids": ["REQ-003"],
+    "evidence": "searched the plan and the repository for queue depth",
+}
+
+
+def agent(script: str) -> str:
+    return f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+
+@pytest.fixture
+def planned_with_requirements(writ, project, design, tmp_path):
+    artifact = tmp_path / "plan.json"
+    artifact.write_text(json.dumps(PLAN), encoding="utf-8")
+    writ("init")
+    writ("plan", str(design), "--from-plan", str(artifact))
+    return writ
+
+
+# --------------------------------------------------------------------------
+# the briefs
+
+
+def test_each_critic_gets_one_question():
+    briefs = [critic.brief for critic in critics.CRITICS]
+    assert len(set(briefs)) == len(briefs)
+    # Every critic states what it is not looking at, so five reviews are five
+    # reviews rather than five copies of the same one.
+    assert all(critic.out_of_scope for critic in critics.CRITICS)
+    assert all(critic.checks for critic in critics.CRITICS)
+
+
+def test_an_unknown_critic_is_named_against_the_ones_that_exist():
+    with pytest.raises(WritError, match="coverage"):
+        critics.by_name(["vibes"])
+    # And a bad name among good ones fails rather than quietly running the rest.
+    with pytest.raises(WritError, match="'vibes'"):
+        critics.by_name(["coverage,vibes"])
+
+
+def test_critics_can_be_named_with_commas_or_spaces():
+    assert [c.name for c in critics.by_name(["coverage,scope"])] == [
+        "coverage",
+        "scope",
+    ]
+    # Declaration order, not argument order, so two runs of a set read alike.
+    assert [c.name for c in critics.by_name(["scope", "coverage"])] == [
+        "coverage",
+        "scope",
+    ]
+    assert [c.name for c in critics.by_name([" coverage , coverage "])] == ["coverage"]
+
+
+def test_the_prompt_carries_the_plan_and_forbids_rewriting(tmp_path):
+    prompt = critics.build_prompt(
+        critics.CRITICS[0],
+        root=tmp_path,
+        doc=tmp_path / "design.md",
+        plan_text='{"tasks": []}',
+        report_path=tmp_path / "findings.json",
+    )
+    assert "you are not fixing it" in prompt
+    assert "Do not rewrite the plan" in prompt
+    assert '{"tasks": []}' in prompt
+    # It is told its own brief and told what to leave alone.
+    assert critics.CRITICS[0].brief in prompt
+    assert critics.CRITICS[0].out_of_scope in prompt
+
+
+def test_the_prompt_shows_what_writ_already_found(tmp_path):
+    prompt = critics.build_prompt(
+        critics.CRITICS[0],
+        root=tmp_path,
+        doc=None,
+        plan_text="{}",
+        report_path=tmp_path / "findings.json",
+        found=[
+            plancheck.Finding(
+                severity="error",
+                category="vague-acceptance",
+                message="criterion 1 is not checkable",
+                where="M01-001",
+            )
+        ],
+    )
+    assert "do not re-report them" in prompt
+    assert "criterion 1 is not checkable" in prompt
+
+
+# --------------------------------------------------------------------------
+# parsing
+
+
+def test_a_report_becomes_ledger_findings():
+    report = critics.parse(
+        json.dumps({"findings": [BLOCKING_FINDING], "summary": "one hole",
+                    "confidence": "high"}),
+        critics.CRITICS[0],
+    )
+    assert report.blocking == 1
+    finding = report.findings[0]
+    # The same shape writ's own checks produce, tagged with who said it.
+    assert finding.severity == "error"
+    assert finding.where == "REQ-003"
+    assert finding.requirement_ids == ["REQ-003"]
+    assert finding.source == "critic:coverage"
+    assert "searched the plan" in finding.message
+
+
+def test_an_advisory_finding_does_not_block():
+    report = critics.parse(
+        json.dumps({"findings": [{**BLOCKING_FINDING, "severity": "advisory"}]}),
+        critics.CRITICS[0],
+    )
+    assert report.blocking == 0
+    assert report.findings[0].severity == "warning"
+
+
+def test_a_finding_that_names_nowhere_is_refused():
+    with pytest.raises(WritError, match="names no task"):
+        critics.parse(
+            json.dumps({"findings": [{**BLOCKING_FINDING, "where": ""}]}),
+            critics.CRITICS[0],
+        )
+
+
+def test_a_finding_that_says_nothing_is_refused():
+    with pytest.raises(WritError, match="says nothing"):
+        critics.parse(
+            json.dumps({"findings": [{**BLOCKING_FINDING, "message": ""}]}),
+            critics.CRITICS[0],
+        )
+
+
+def test_an_unknown_severity_is_refused():
+    with pytest.raises(WritError, match="severity"):
+        critics.parse(
+            json.dumps({"findings": [{**BLOCKING_FINDING, "severity": "bad"}]}),
+            critics.CRITICS[0],
+        )
+
+
+def test_finding_nothing_is_a_legitimate_report():
+    report = critics.parse(
+        json.dumps({"findings": [], "summary": "checked every edge"}),
+        critics.CRITICS[1],
+    )
+    assert report.ok and report.findings == [] and report.summary
+
+
+def test_a_report_printed_as_chatter_is_still_read():
+    report = critics.parse(
+        "Here is what I found:\n```json\n"
+        + json.dumps({"findings": [BLOCKING_FINDING]})
+        + "\n```\n",
+        critics.CRITICS[0],
+    )
+    assert report.blocking == 1
+
+
+# --------------------------------------------------------------------------
+# through the command
+
+
+def test_critique_records_findings_in_the_same_ledger(
+    planned_with_requirements, project, writ, monkeypatch
+):
+    monkeypatch.setenv(
+        "WRIT_TEST_REPORT", json.dumps({"findings": [BLOCKING_FINDING]})
+    )
+    monkeypatch.setenv("WRIT_TEST_CRITIC", "builds what the design")
+    code, out, err = writ("critique", "--agent", agent(CRITIC), "--quiet")
+    # Blocking findings stand against the plan, so this is a non-zero exit.
+    assert code == 1
+    records = [
+        record
+        for record in plans.finding_records(state.load(project))
+        if str(record.get("source", "")).startswith("critic:")
+    ]
+    assert len(records) == 1
+    assert records[0]["source"] == "critic:coverage"
+    assert records[0]["disposition"] == "open"
+
+
+def test_a_blocking_critic_finding_holds_the_plan(
+    planned_with_requirements, project, writ, monkeypatch
+):
+    assert plans.runnable(state.load(project))
+    monkeypatch.setenv(
+        "WRIT_TEST_REPORT", json.dumps({"findings": [BLOCKING_FINDING]})
+    )
+    writ("critique", "--agent", agent(CRITIC), "--quiet")
+    data = state.load(project)
+    # No new vocabulary: a critic's objection holds the plan exactly as a
+    # structural one does, and the same approve overrules it.
+    assert plans.plan_status(data)["status"] == "needs-approval"
+    assert not plans.runnable(data)
+    assert writ("run", "--agent", "false")[0] == 2
+
+
+def test_a_clean_critique_leaves_the_plan_runnable(
+    planned_with_requirements, project, writ
+):
+    code, out, _ = writ("critique", "--agent", agent(SILENT), "--quiet")
+    assert code == 0
+    assert "found nothing to report" in out
+    assert plans.runnable(state.load(project))
+
+
+def test_one_critic_failing_does_not_lose_the_others(
+    planned_with_requirements, project, writ, monkeypatch
+):
+    # An agent that writes no report at all.
+    code, out, err = writ("critique", "--agent", agent(MUTE), "--quiet")
+    assert code == 1
+    assert "wrote no report" in err
+    records = critics.reviews(state.load(project))
+    # Every failure is on the record by name, rather than the review silently
+    # reducing to whoever happened to succeed.
+    assert len(records) == len(critics.CRITICS)
+    assert all(record.get("error") for record in records)
+
+
+def test_only_the_named_critics_run(planned_with_requirements, project, writ):
+    writ("critique", "--agent", agent(SILENT), "--quiet", "--critics", "coverage")
+    names = [record["critic"] for record in critics.reviews(state.load(project))]
+    assert names == ["coverage"]
+
+
+def test_a_review_is_stale_once_the_plan_moves_on(
+    planned_with_requirements, project, writ
+):
+    writ("critique", "--agent", agent(SILENT), "--quiet")
+    assert critics.unreviewed(state.load(project)) == []
+    with state.transaction(project) as data:
+        plans.bump(data)
+    # A critic that passed the plan two revisions ago reviewed something else.
+    assert critics.unreviewed(state.load(project)) == [
+        critic.name for critic in critics.CRITICS
+    ]
+
+
+def test_critique_needs_a_plan(writ, project):
+    writ("init")
+    code, _, err = writ("critique", "--agent", agent(SILENT))
+    assert code == 2 and "no plan" in err
+
+
+def test_plan_without_the_flag_runs_no_critics(writ, project, design, tmp_path):
+    artifact = tmp_path / "plan.json"
+    artifact.write_text(json.dumps(PLAN), encoding="utf-8")
+    writ("init")
+    writ("plan", str(design), "--from-plan", str(artifact), "--quiet")
+    # Each critic is an agent run, so they are opt-in.
+    assert critics.reviews(state.load(project)) == []
+
+
+def test_a_bare_critics_flag_runs_all_of_them(writ, project, design, tmp_path):
+    artifact = tmp_path / "plan.json"
+    artifact.write_text(json.dumps(PLAN), encoding="utf-8")
+    writ("init")
+    writ(
+        "plan", str(design), "--from-plan", str(artifact),
+        "--critics", "--critic-agent", agent(SILENT), "--quiet",
+    )
+    # `--critics` with no names is a request for all of them, not an empty one.
+    assert [r["critic"] for r in critics.reviews(state.load(project))] == [
+        critic.name for critic in critics.CRITICS
+    ]
+
+
+def test_plan_can_run_the_critics_in_one_pass(writ, project, design, tmp_path):
+    artifact = tmp_path / "plan.json"
+    artifact.write_text(json.dumps(PLAN), encoding="utf-8")
+    writ("init")
+    code, out, _ = writ(
+        "plan", str(design), "--from-plan", str(artifact),
+        "--critics", "coverage", "--critic-agent", agent(SILENT), "--quiet",
+    )
+    assert code == 0
+    assert [r["critic"] for r in critics.reviews(state.load(project))] == ["coverage"]
+
+
+# --------------------------------------------------------------------------
+# what `writ check` says about the review
+
+
+def test_check_says_when_no_critic_has_read_the_plan(
+    planned_with_requirements, writ
+):
+    code, out, _ = writ("check")
+    assert "no critic has read this plan" in out
+    # Not a finding: writ cannot tell whether an unread plan is wrong.
+    assert "0 blocking" in out
+
+
+def test_check_names_the_critics_that_have_not_read_it(
+    planned_with_requirements, writ
+):
+    writ("critique", "--agent", agent(SILENT), "--quiet", "--critics", "coverage,scope")
+    code, out, _ = writ("check")
+    assert "not reviewed at this revision: dependency, acceptance, feasibility" in out
+
+
+def test_check_is_quiet_once_every_critic_has_read_it(
+    planned_with_requirements, writ
+):
+    writ("critique", "--agent", agent(SILENT), "--quiet")
+    code, out, _ = writ("check")
+    assert "critic" not in out
+    assert "not reviewed" not in out
+
+
+def test_check_reports_staleness_as_json(planned_with_requirements, writ):
+    writ("critique", "--agent", agent(SILENT), "--quiet", "--critics", "coverage")
+    code, out, _ = writ("--json", "check")
+    assert json.loads(out)["unreviewed"] == [
+        "dependency",
+        "scope",
+        "acceptance",
+        "feasibility",
+    ]

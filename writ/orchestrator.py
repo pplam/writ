@@ -32,7 +32,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from . import agents, runner, state
+from . import agents, gates, plans, repair, runner, state
 from .model import acceptance_summary, effective_status, rework_attempts
 from .state import WritError, utcnow
 
@@ -54,15 +54,23 @@ class Job:
     """One agent invocation the scheduler decided to make."""
 
     task_id: str
-    role: str  # "agent" | "reviewer"
+    role: str  # "agent" | "reviewer" | "gate" | "repair"
     #: how many times this task had been sent back for rework when the job was
     #: chosen. Part of the ledger key, not decoration: see `key`.
     attempt: int = 0
+    #: for a repair job, the request it is planning against. Part of the key for
+    #: the same reason `attempt` is: a second request on the same gate is a
+    #: different job, a retry of the same one is not.
+    request: str = ""
 
     @property
     def verb(self) -> str:
         if self.role == "reviewer":
             return "review"
+        if self.role == "gate":
+            return "gate"
+        if self.role == "repair":
+            return "repair"
         # A re-dispatch after a rejection is the same invocation with a different
         # prompt, but calling it "dispatch" in the preview and the log reads as
         # work that had not started yet.
@@ -82,6 +90,14 @@ class Job:
 
         Bare task id at attempt 0, so a ledger from anywhere else still matches.
         """
+        if self.role == "repair":
+            # The attempt here counts patches writ refused, not rework rounds. A
+            # refused patch leaves the request open in the state that selected
+            # it, so without the count the scheduler would either re-plan it
+            # forever or — since the key would be identical — never again. The
+            # bound lives in `repair.patches_left`.
+            suffix = f"#{self.attempt}" if self.attempt else ""
+            return f"{self.task_id}~{self.request or 'repair'}{suffix}"
         return self.task_id if not self.attempt else f"{self.task_id}#{self.attempt}"
 
 
@@ -105,6 +121,17 @@ class Outcome:
     #: it, so the log can say "rework 1 of 2" instead of a bare `planned` that
     #: reads as though the task had never run.
     rework: tuple[int, int] | None = None
+    #: for a gate: why it is held, if it is (`awaiting-repair`,
+    #: `needs-decision`, `repair-exhausted`)
+    held: str = ""
+    #: for a gate: the repair request it opened
+    request: str = ""
+    #: for a repair job: the task ids its patch added, if writ accepted it
+    repaired: list[str] = field(default_factory=list)
+    #: for a repair job: why writ refused the patch
+    refused: str = ""
+    #: gate findings recorded by this run
+    findings: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -129,6 +156,13 @@ class Session:
     #: — the walk carried on with them — but not free either, so a session that
     #: spent half its agents on second attempts says so.
     reworked: list[str] = field(default_factory=list)
+    #: gate reviews run, and the gates that asked for the plan to be repaired
+    gated: list[str] = field(default_factory=list)
+    repaired: list[str] = field(default_factory=list)
+    #: gates that stopped for a human: an unanswerable question, or a spent
+    #: repair budget. The run is not finished when one of these is outstanding —
+    #: it is waiting, which is a different thing and has to read differently.
+    held: list[str] = field(default_factory=list)
     stopped: bool = False
     aborted: bool = False
     started_at: str = field(default_factory=utcnow)
@@ -136,7 +170,7 @@ class Session:
 
     @property
     def agent_runs(self) -> int:
-        return len(self.dispatched) + len(self.reviewed)
+        return len(self.dispatched) + len(self.reviewed) + len(self.gated)
 
 
 class Stop(Exception):
@@ -228,6 +262,8 @@ def next_job(
     reviewed = set(reviewed)
 
     for task in sorted(data["tasks"].values(), key=lambda item: item["id"]):
+        if gates.is_gate(task):
+            continue
         job = Job(
             task_id=task["id"], role="reviewer", attempt=rework_attempts(task)
         )
@@ -236,14 +272,33 @@ def next_job(
         if task["status"] == "awaiting-review":
             return job
 
+    # Repair planning outranks new implementation for the same reason review does:
+    # it is the only thing that can un-hold a gate, and a held gate is holding
+    # everything behind it. It is cheap to choose — one agent, no code written —
+    # and leaving it until the ready set empties would stall the graph behind work
+    # that is merely available.
+    for request in repair.open_requests(data):
+        if request.get("status") not in ("open", "planning"):
+            continue
+        if not repair.patches_left(request):
+            # Writ has refused everything this planner proposed. The gate is held
+            # for a human; re-planning it would spend agents on the same refusal.
+            continue
+        job = Job(
+            task_id=request["gate"],
+            role="repair",
+            request=request["id"],
+            attempt=repair.refusals(request),
+        )
+        if request["gate"] in busy or job.key in started:
+            continue
+        return job
+
     ready = [
         task
         for task in data["tasks"].values()
         if task["id"] not in busy
-        and Job(
-            task_id=task["id"], role="agent", attempt=rework_attempts(task)
-        ).key
-        not in started
+        and _job_for(task).key not in started
         and effective_status(data, task) == "ready"
     ]
     # The budget counts tasks, not attempts. `--max-tasks N` caps how much of the
@@ -256,20 +311,38 @@ def next_job(
     if budget is not None:
         taken = {_base(key) for key in started}
         if len(taken) >= budget:
-            ready = [task for task in ready if task["id"] in taken]
+            # Gates are exempt. `--max-tasks N` caps how much implementation work
+            # a session takes on, and a gate is not implementation: refusing to
+            # run the gate over the tasks the budget just allowed would stop the
+            # session exactly where its work is least verified.
+            ready = [
+                task
+                for task in ready
+                if task["id"] in taken or gates.is_gate(task)
+            ]
     if not ready:
         return None
-    task_id = _first(data, ready, order)
-    return Job(
-        task_id=task_id,
-        role="agent",
-        attempt=rework_attempts(data["tasks"][task_id]),
-    )
+    task_id = _first(data, _prefer_tasks(ready), order)
+    return _job_for(data["tasks"][task_id])
+
+
+def _job_for(task: dict[str, Any]) -> Job:
+    """The job that would run this ready node, gate or task.
+
+    The attempt number differs by kind, and that is the point of routing both
+    through one function. A task's attempt counts rework rounds; a gate's counts
+    repair rounds, because a gate whose repair has landed is genuinely due again
+    — the code it is reviewing has changed — and keying it at attempt 0 would
+    leave the session believing it had already been run.
+    """
+    if gates.is_gate(task):
+        return Job(task_id=task["id"], role="gate", attempt=gates.rounds(task))
+    return Job(task_id=task["id"], role="agent", attempt=rework_attempts(task))
 
 
 def _base(key: str) -> str:
     """The task id inside a ledger key, whichever attempt it names."""
-    return key.split("#", 1)[0]
+    return key.split("#", 1)[0].split("~", 1)[0]
 
 
 def _first(data: dict[str, Any], ready: list[dict[str, Any]], order: str) -> str:
@@ -286,6 +359,19 @@ def _first(data: dict[str, Any], ready: list[dict[str, Any]], order: str) -> str
         counts = _dependents(data)
         return min(ready, key=lambda t: (-len(counts[t["id"]]), t["id"]))["id"]
     return min(task["id"] for task in ready)
+
+
+def _prefer_tasks(ready: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Implementation work before gates, when both are ready.
+
+    A gate is ready as soon as its dependencies complete, and it will still be
+    ready in ten minutes. An implementation task that is ready now may be the one
+    thing a parallel pool has to work on, so spending a worker on a gate while
+    tasks wait narrows the graph for no gain. Gates are not starved: once the
+    ready tasks run out, they are all that is left.
+    """
+    tasks = [task for task in ready if not gates.is_gate(task)]
+    return tasks or ready
 
 
 def _dependents(data: dict[str, Any]) -> dict[str, set[str]]:
@@ -385,6 +471,15 @@ def run(
     session = Session()
     emit = on_event or (lambda name, payload: None)
 
+    # The approval gate. Checked here rather than only in the CLI so that any
+    # caller of `run` — the supervisor, the server, a test — is held to it: an
+    # unreviewed plan is not executable, and a second entry point that skipped
+    # the check would make the gate advisory.
+    with state.transaction(root) as data:
+        if not plans.runnable(data):
+            raise WritError(plans.not_runnable_message(data))
+        plans.mark_executing(data)
+
     # Idempotent: the CLI reaps first so it can report the resume, and reaping
     # again here finds nothing. Kept so a direct caller of `run` still recovers
     # a killed session rather than tripping over its leftovers.
@@ -432,6 +527,7 @@ def run(
                     # attempted in the ledger for its own role: a failed review
                     # leaves the task at `awaiting-review`, which is the state
                     # that selected it, so anything else re-selects it forever.
+                    # The same is true of a repair job, whose request stays open.
                     session.errors.append(f"{job.task_id}: {exc}")
                     emit("error", {"task": job.task_id, "message": str(exc)})
                     if job.role == "reviewer":
@@ -443,6 +539,11 @@ def run(
                 if job.role == "agent":
                     started.append(job.key)
                     session.dispatched.append(job.task_id)
+                elif job.role == "gate":
+                    started.append(job.key)
+                    session.gated.append(job.task_id)
+                elif job.role == "repair":
+                    started.append(job.key)
                 else:
                     session.reviewed.append(job.task_id)
                     session.review_attempts.append(job.key)
@@ -461,6 +562,15 @@ def run(
                 in_flight[future] = job
 
             if not in_flight:
+                # Nothing running and nothing selectable: the walk is over. That is
+                # a weaker claim than it used to be, and it holds only because
+                # everything a finished job can create — a gate becoming ready, a
+                # repair request, the tasks a repair adds — is committed inside that
+                # job's own transaction before it returns. So by the time this line
+                # is reached, `next_job` has already had the chance to see it. The
+                # run ends with work outstanding only when that work needs a person,
+                # and `summary` says which of those it is rather than reporting the
+                # project as done.
                 break
 
             done = _wait_for_one(in_flight, abort)
@@ -539,17 +649,25 @@ def _execute(root: Path, job: Job, run_id: str) -> Outcome:
     task = data["tasks"].get(job.task_id, {})
     run = data["runs"].get(run_id, {})
     reported = run.get("verdict") or {}
+    held = task.get("held") or {}
+    applied = run.get("patch_applied") or {}
+    attempts = task.get("gate_attempts") or []
     return Outcome(
         job=job,
         run_id=run_id,
         exit_code=code,
         status=task.get("status"),
         error=run.get("verdict_error"),
-        summary=reported.get("summary", ""),
+        summary=reported.get("summary", "") or run.get("patch_error", ""),
         unmet=list(reported.get("unmet", [])),
         criteria=acceptance_summary(task) if task else None,
         decisions=list(reported.get("decisions", [])),
         rework=_rework_round(job, task, reported),
+        held=str(held.get("reason", "")) if task.get("status") == "blocked" else "",
+        request=str(held.get("request", "")),
+        repaired=list(applied.get("tasks", [])),
+        refused=str(run.get("patch_error", "")),
+        findings=list(attempts[-1].get("findings", [])) if attempts else [],
     )
 
 
@@ -593,8 +711,18 @@ def _record(session: Session, outcome: Outcome) -> None:
     if outcome.rework:
         session.reworked.append(outcome.job.task_id)
     status = outcome.status
+    if outcome.job.role == "repair":
+        if outcome.repaired:
+            session.repaired.append(outcome.job.task_id)
+        return
     if status == "completed":
         session.completed.append(outcome.job.task_id)
+    elif status == "blocked" and outcome.job.role == "gate":
+        # A gate that asked for repair is not a failure: the plan is being fixed
+        # and the run carries on. A gate held for a human is not a failure either,
+        # but it does need saying, because nothing else will move it.
+        if outcome.held in ("needs-decision", "repair-exhausted"):
+            session.held.append(outcome.job.task_id)
     elif status in ("failed", "blocked"):
         session.failed.append(outcome.job.task_id)
 
@@ -612,6 +740,11 @@ def _finished_payload(outcome: Outcome) -> dict[str, Any]:
         "criteria": outcome.criteria,
         "decisions": outcome.decisions,
         "rework": list(outcome.rework) if outcome.rework else None,
+        "held": outcome.held,
+        "request": outcome.request,
+        "repaired": outcome.repaired,
+        "refused": outcome.refused,
+        "findings": outcome.findings,
     }
 
 
@@ -726,9 +859,15 @@ def summary(data: dict[str, Any], session: Session) -> list[str]:
         lines.append(f"ready to dispatch: {', '.join(remaining)}")
     blocked = _stalled(data)
     if blocked:
+        # Name what failed, not only what is waiting. "blocked by failed work:
+        # G-M01" reads as if G-M01 failed, when G-M01 is the casualty and the
+        # reader needs the id of the task to go and look at.
+        roots = _stall_roots(data)
         lines.append(
             f"blocked by failed work: {', '.join(blocked)}"
+            + (f"   (failed: {', '.join(roots)})" if roots else "")
         )
+    lines.extend(_gate_lines(data, session))
     # Proposals are inert until a human rules on them, so a run that produced
     # some has left work that no later `writ run` will pick up. Say so, or the
     # records sit unread.
@@ -745,18 +884,47 @@ def summary(data: dict[str, Any], session: Session) -> list[str]:
     return lines
 
 
+#: reasons a gate is blocked that are not failures. See `held_gates`.
+HELD_REASONS = ("awaiting-repair", "needs-decision", "repair-exhausted", "repair-refused")
+
+
+def held_gates(data: dict[str, Any]) -> dict[str, str]:
+    """Gates stopped short of a verdict, and why — id -> reason.
+
+    A gate blocked this way has not failed. `awaiting-repair` means the plan is
+    being changed and the gate will be asked again; the rest mean a person has to
+    look. Both are distinct from a task that failed, and the distinction has to
+    survive into the summary: a run that ends with a gate awaiting a decision has
+    not finished the project, and saying "blocked by failed work" would send the
+    reader looking for a failure that is not there.
+    """
+    found = {}
+    for task_id, task in data["tasks"].items():
+        if not gates.is_gate(task) or task.get("status") != "blocked":
+            continue
+        reason = str((task.get("held") or {}).get("reason", ""))
+        if reason in HELD_REASONS:
+            found[task_id] = reason
+    return found
+
+
 def _stalled(data: dict[str, Any]) -> list[str]:
     """Tasks that cannot start until something failed is dealt with.
 
     Transitive on purpose: if A failed and C waits on B waits on A, then C is
     just as stuck as B, and reporting only the frontier would understate how
     much of the graph one failure has parked.
+
+    Held gates are excluded, along with the work behind them. They are reported
+    separately because they are a different situation with a different next step
+    — see `held_gates`.
     """
     tasks = data["tasks"]
+    held = held_gates(data)
     poisoned = {
         task_id
         for task_id, task in tasks.items()
-        if task["status"] in ("failed", "blocked")
+        if task["status"] in ("failed", "blocked") and task_id not in held
     }
     if not poisoned:
         return []
@@ -779,6 +947,81 @@ def _stalled(data: dict[str, Any]) -> list[str]:
         for task_id in poisoned
         if tasks[task_id]["status"] == "planned"
     )
+
+
+def _stall_roots(data: dict[str, Any]) -> list[str]:
+    """The failed or blocked tasks that everything in `_stalled` is waiting on.
+
+    The frontier, not the whole poisoned set: a task that failed because its own
+    dependency failed is not where the reader should start. Held gates are excluded
+    for the same reason they are in `_stalled` — they are reported separately.
+    """
+    tasks = data["tasks"]
+    held = held_gates(data)
+    return sorted(
+        task_id
+        for task_id, task in tasks.items()
+        if task["status"] in ("failed", "blocked")
+        and task_id not in held
+        and not any(
+            tasks[dep]["status"] in ("failed", "blocked")
+            for dep in task.get("depends_on", [])
+            if dep in tasks
+        )
+    )
+
+
+#: what a held gate means for the reader, and what moves it
+_HELD_ADVICE = {
+    "awaiting-repair": ("plan repair pending", "writ list repairs"),
+    "needs-decision": ("waiting on a decision", "writ list decisions --proposed"),
+    "repair-exhausted": ("out of repair rounds", "writ show {gate}"),
+    "repair-refused": ("no acceptable repair patch", "writ show {gate}"),
+}
+
+
+def _gate_lines(data: dict[str, Any], session: Session) -> list[str]:
+    """What the gates did this session, and which of them are still waiting.
+
+    Reported apart from the task counts because a gate is not a unit of work: it
+    produced no code, and folding its outcome into "completed 4, failed 1" would
+    make a plan that needs repairing look like an implementation that broke.
+    """
+    lines = []
+    if session.repaired:
+        lines.append(
+            f"plan repaired: {', '.join(sorted(set(session.repaired)))}"
+            f"   (revision {plans.revision(data)})"
+        )
+    held = held_gates(data)
+    for gate_id, reason in sorted(held.items()):
+        label, hint = _HELD_ADVICE.get(reason, (reason, "writ show {gate}"))
+        lines.append(f"{gate_id} held: {label}   ({hint.format(gate=gate_id)})")
+    if held:
+        waiting = sorted(_behind(data, set(held)))
+        if waiting:
+            lines.append(f"waiting on gates: {', '.join(waiting)}")
+    return lines
+
+
+def _behind(data: dict[str, Any], stoppers: set[str]) -> set[str]:
+    """Unstarted tasks that transitively depend on any of `stoppers`."""
+    tasks = data["tasks"]
+    reached = set(stoppers)
+    changed = True
+    while changed:
+        changed = False
+        for task_id, task in tasks.items():
+            if task_id in reached or task["status"] == "completed":
+                continue
+            if any(dep in reached for dep in task.get("depends_on", [])):
+                reached.add(task_id)
+                changed = True
+    return {
+        task_id
+        for task_id in reached - stoppers
+        if tasks[task_id]["status"] == "planned"
+    }
 
 
 def _elapsed(session: Session) -> str:

@@ -36,6 +36,15 @@ OUTCOMES = ("complete", "incomplete", "blocked")
 #: what a reviewer may decide
 DECISIONS = ("accept", "reject")
 
+#: what a gate may decide. A gate judges integrated work, so "reject" is not
+#: enough: the useful distinction is between work that is wrong (repairable by
+#: adding tasks) and a question the design does not answer (not repairable by any
+#: amount of work). See writ/gates.py.
+GATE_DECISIONS = ("pass", "needs-repair", "needs-decision")
+
+#: severities a gate may attach to a finding, worst first
+FINDING_SEVERITIES = ("blocking", "advisory")
+
 CRITERION_STATUSES = ("passed", "failed", "pending")
 
 
@@ -72,7 +81,8 @@ Rules for the verdict:
    not check it. Both are acceptable outcomes and are more useful than a guess.
 4. `outcome` must be `complete` only when every criterion is `passed`. Writ
    lowers a `complete` that its own criteria contradict, so heading a report
-   `complete` over an unmet bar gains nothing and only obscures what you did.
+   `complete` over an unmet bar gains nothing and only obscures what you did. A
+   criterion you leave out entirely counts as `pending` for the same reason.
 5. If a criterion cannot be met from inside this task's allowed files — a bar
    that depends on another task's code, or on something you are forbidden to
    touch — mark it `pending`, say so in `blocked_on`, and use outcome `blocked`.
@@ -134,13 +144,76 @@ REVIEW_SCHEMA = """\
   "notes": "anything the implementer missed, or risks worth recording"
 }"""
 
+GATE_SCHEMA = """\
+{
+  "decision": "pass" | "needs-repair" | "needs-decision",
+  "summary": "what you verified across the integrated work, and how",
+  "criteria": [
+    {
+      "number": 1,
+      "status": "passed" | "failed" | "pending",
+      "evidence": "what you ran or read to reach this conclusion"
+    }
+  ],
+  "findings": [
+    {
+      "category": "missing-integration" | "missing-coverage" | "contradiction" |
+                  "regression" | "weak-verification" | "ambiguity",
+      "severity": "blocking" | "advisory",
+      "requirement_ids": ["REQ-014"],
+      "summary": "one sentence: what is wrong",
+      "evidence": "the command and its output, or the two files that disagree",
+      "required_outcome": "what would have to be true for this to be closed",
+      "where": "component, file, or task id"
+    }
+  ],
+  "questions": [
+    {
+      "question": "only for decision needs-decision: what a human has to rule on",
+      "context": "what makes it undecidable from the documents"
+    }
+  ],
+  "notes": "risks, or anything the next gate attempt should know"
+}"""
+
+GATE_RULES = """\
+Rules for a gate review:
+1. You are judging integrated work, not one task. Read the requirements you were
+   given and check them against the code as it now stands. Do not check the task
+   list against itself: if the plan missed something the design asked for, the
+   tasks will all look complete and the requirement will still not hold.
+2. Run the project's verification yourself. A gate that passes on the strength of
+   task reports has verified nothing that was not already claimed.
+3. Check the seams specifically. Two tasks that each passed can still disagree:
+   a caller expecting a shape its callee does not produce, two modules with
+   incompatible assumptions about the same data, a value that is parsed and then
+   dropped before it reaches what needs it. That class of defect is invisible to
+   task review and is most of what a gate is for.
+4. `pass` requires that you personally confirmed every criterion. Report an entry
+   for each one, by its number. If you could not check one, it is `pending` and
+   the gate does not pass — and leaving it out of the report is read the same way,
+   so silence gains nothing.
+5. `needs-repair` is for work that is wrong or missing — something a further task
+   could fix. State a finding for each one: what is wrong, which requirement it
+   affects, the evidence, and what outcome would close it. A repair planner reads
+   only your findings, so a finding with no evidence produces a guess.
+6. `needs-decision` is for a question no amount of implementation answers: the
+   design is ambiguous, or two requirements contradict. Do not pick a reading and
+   pass.
+7. Do not modify the repository. You are reading and running, not fixing. Work you
+   think is needed goes in `findings`, not in the working tree.
+8. Be specific about what you are *not* saying. A finding names one defect; a
+   general unease about the architecture is a note, not a blocking finding."""
+
 REVIEW_RULES = """\
 Rules for the review:
 1. Verify independently. Re-run the tests and re-read the code; do not take the
    implementer's report as evidence for itself.
 2. Judge only the acceptance criteria of this task. Style you dislike and work
    belonging to another task are not grounds to reject.
-3. `accept` requires that you personally confirmed every criterion passes.
+3. `accept` requires that you personally confirmed every criterion passes, with
+   an entry for each one by its number. A criterion you leave out is read as
+   `pending`, which is a rejection.
 4. Reject if a criterion is unmet, if the evidence does not support the claim, or
    if the tests do not actually exercise the behaviour they name.
 5. Do not modify the repository. You are reading and running, not fixing.
@@ -178,6 +251,61 @@ class ProposedDecision:
 
 
 @dataclass
+class GateFinding:
+    """One defect a gate found in integrated work.
+
+    Richer than a task criterion on purpose. A criterion is judged against a bar
+    that already exists; a gate finding has to be enough for a repair planner that
+    was not there to decide what work would close it, so `required_outcome` — what
+    would have to become true — is as important as what is broken.
+    """
+
+    category: str
+    summary: str
+    severity: str = "blocking"
+    evidence: str = ""
+    required_outcome: str = ""
+    where: str = ""
+    requirement_ids: list[str] = field(default_factory=list)
+
+    @property
+    def blocking(self) -> bool:
+        return self.severity == "blocking"
+
+    def to_finding(self, *, scope: str):
+        """As a plan finding, so gates and Writ's own checks share one ledger."""
+        from .plancheck import Finding
+
+        message = self.summary
+        if self.evidence:
+            message = f"{message} (evidence: {_shorten(self.evidence)})"
+        return Finding(
+            severity="error" if self.blocking else "warning",
+            category=self.category,
+            message=message,
+            where=self.where,
+            suggested_action=self.required_outcome,
+            requirement_ids=list(self.requirement_ids),
+            source=scope,
+        )
+
+
+@dataclass
+class GateQuestion:
+    """Something a gate could not decide from the documents it was given."""
+
+    question: str
+    context: str = ""
+
+
+def _shorten(text: str, limit: int = 160) -> str:
+    collapsed = " ".join(str(text).split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[: limit - 1].rstrip() + "…"
+
+
+@dataclass
 class Verdict:
     """An agent's report on a task, validated but not yet applied."""
 
@@ -187,12 +315,17 @@ class Verdict:
     decisions: list[ProposedDecision] = field(default_factory=list)
     blocked_on: str | None = None
     notes: str | None = None
-    #: `agent` for the implementer, `reviewer` for an independent check
+    #: `agent` for the implementer, `reviewer` for an independent check,
+    #: `gate` for a review of integrated work
     role: str = "agent"
-    #: set for reviewer verdicts
+    #: set for reviewer and gate verdicts
     decision: str | None = None
     #: set when the headline claim contradicted the criteria and writ lowered it
     downgraded: str | None = None
+    #: gate verdicts only: what a repair would have to address
+    findings: list[GateFinding] = field(default_factory=list)
+    #: gate verdicts only: what a human would have to rule on
+    questions: list[GateQuestion] = field(default_factory=list)
 
     @property
     def passed(self) -> list[int]:
@@ -201,6 +334,10 @@ class Verdict:
     @property
     def unmet(self) -> list[int]:
         return [c.number for c in self.criteria if c.status != "passed"]
+
+    @property
+    def blocking_findings(self) -> list[GateFinding]:
+        return [finding for finding in self.findings if finding.blocking]
 
 
 FENCE = re.compile(r"```(?:json)?\s*(.+?)```", re.S)
@@ -412,6 +549,9 @@ def parse(text: str, *, role: str = "agent", where: str = "verdict") -> Verdict:
     summary = _text(raw.get("summary"))
     notes = _text(raw.get("notes")) or None
 
+    if role == "gate":
+        return _gate_verdict(raw, criteria, summary, notes, proposals, where)
+
     if role == "reviewer":
         decision = _one_of(raw.get("decision"), DECISIONS, "decision", where)
         downgraded = None
@@ -451,6 +591,158 @@ def parse(text: str, *, role: str = "agent", where: str = "verdict") -> Verdict:
         role="agent",
         downgraded=downgraded,
     )
+
+
+def _gate_verdict(
+    raw: dict[str, Any],
+    criteria: list[Criterion],
+    summary: str,
+    notes: str | None,
+    proposals: list[ProposedDecision],
+    where: str,
+) -> Verdict:
+    """Validate a gate's report.
+
+    Two rules are enforced here rather than trusted. A `pass` whose own criteria
+    are not all passed is lowered to `needs-repair`, the same way an implementer's
+    `complete` is lowered — a gate is the last thing standing between a plan and
+    "done", so it is the worst place to accept a headline that contradicts its own
+    detail. And `needs-repair` with no findings is refused outright: a repair
+    planner reads nothing but findings, so a bare request for repair would produce
+    an agent inventing work from a summary line.
+    """
+    decision = _one_of(raw.get("decision"), GATE_DECISIONS, "decision", where)
+    findings = _gate_findings(raw.get("findings"), where)
+    questions = _gate_questions(raw.get("questions"), where)
+    downgraded = None
+    unmet = [c.number for c in criteria if c.status != "passed"]
+    if decision == "pass" and unmet:
+        decision = "needs-repair"
+        downgraded = _mismatch(where, "decision", "pass", "needs-repair", unmet)
+        if not findings:
+            # It claimed a pass, so it wrote no findings; the unmet criteria are
+            # the finding. Synthesised rather than rejected, because the criteria
+            # it did report are real evidence and refusing the verdict would
+            # discard them.
+            findings = [
+                GateFinding(
+                    category="unmet-gate-criterion",
+                    summary=(
+                        f"gate criterion {criterion.number} is not met: "
+                        f"{criterion.status}"
+                    ),
+                    evidence=criterion.evidence,
+                    required_outcome="the criterion passes on the integrated code",
+                )
+                for criterion in criteria
+                if criterion.status != "passed"
+            ]
+    if decision == "needs-repair" and not findings:
+        raise WritError(
+            f"{where}: decision is 'needs-repair' but no findings were reported. "
+            "A repair planner is given nothing but these findings, so it cannot "
+            "act on a request that does not say what is wrong."
+        )
+    if decision == "needs-decision" and not questions:
+        raise WritError(
+            f"{where}: decision is 'needs-decision' but no questions were asked. "
+            "Say what a human has to rule on."
+        )
+    return Verdict(
+        outcome="complete" if decision == "pass" else "incomplete",
+        summary=summary,
+        criteria=criteria,
+        decisions=proposals,
+        notes=notes,
+        role="gate",
+        decision=decision,
+        downgraded=downgraded,
+        findings=findings,
+        questions=questions,
+    )
+
+
+GATE_FINDING_ALIASES = {
+    "category": ("category", "kind", "type"),
+    "summary": ("summary", "message", "finding", "description", "title"),
+    "severity": ("severity", "level"),
+    "evidence": ("evidence", "proof", "detail"),
+    "required_outcome": ("required_outcome", "outcome", "expected", "resolution"),
+    "where": ("where", "component", "location", "task", "affected_components"),
+}
+
+
+def _gate_findings(value: Any, where: str) -> list[GateFinding]:
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        value = [value]
+    if not isinstance(value, list):
+        raise WritError(f"{where}.findings must be a list")
+    findings: list[GateFinding] = []
+    for index, raw in enumerate(value):
+        at = f"{where}.findings[{index}]"
+        if isinstance(raw, str):
+            raw = {"summary": raw}
+        if not isinstance(raw, dict):
+            raise WritError(f"{at} must be an object")
+        summary = _text(_pick(raw, GATE_FINDING_ALIASES["summary"]))
+        if not summary:
+            raise WritError(f"{at}.summary is required; say what is wrong")
+        severity = (
+            _text(_pick(raw, GATE_FINDING_ALIASES["severity"])) or "blocking"
+        ).lower()
+        if severity not in FINDING_SEVERITIES:
+            severity = "blocking" if severity in ("error", "critical") else "advisory"
+        location = _pick(raw, GATE_FINDING_ALIASES["where"])
+        if isinstance(location, list):
+            location = ", ".join(str(item) for item in location)
+        findings.append(
+            GateFinding(
+                category=(
+                    _text(_pick(raw, GATE_FINDING_ALIASES["category"])) or "gate-finding"
+                ),
+                summary=summary,
+                severity=severity,
+                evidence=_text(_pick(raw, GATE_FINDING_ALIASES["evidence"])),
+                required_outcome=_text(
+                    _pick(raw, GATE_FINDING_ALIASES["required_outcome"])
+                ),
+                where=_text(location),
+                requirement_ids=[
+                    str(item)
+                    for item in (
+                        raw.get("requirement_ids")
+                        or raw.get("requirements")
+                        or []
+                    )
+                ],
+            )
+        )
+    return findings
+
+
+def _gate_questions(value: Any, where: str) -> list[GateQuestion]:
+    if value is None:
+        return []
+    if isinstance(value, (dict, str)):
+        value = [value]
+    if not isinstance(value, list):
+        raise WritError(f"{where}.questions must be a list")
+    questions: list[GateQuestion] = []
+    for index, raw in enumerate(value):
+        at = f"{where}.questions[{index}]"
+        if isinstance(raw, str):
+            raw = {"question": raw}
+        if not isinstance(raw, dict):
+            raise WritError(f"{at} must be an object")
+        text = _text(_pick(raw, ("question", "text", "summary", "ask")))
+        if not text:
+            raise WritError(f"{at}.question is required")
+        questions.append(
+            GateQuestion(question=text, context=_text(raw.get("context")))
+        )
+    return questions
 
 
 def _mismatch(
@@ -591,6 +883,85 @@ def check_scope(verdict: Verdict, task: dict[str, Any], where: str) -> None:
         )
 
 
+#: the headline each role claims when it is saying the work is done, and what
+#: that claim becomes when the report does not cover every criterion
+_PASSING = {
+    "agent": ("complete", "incomplete"),
+    "reviewer": ("accept", "reject"),
+    "gate": ("pass", "needs-repair"),
+}
+
+
+def check_coverage(verdict: Verdict, task: dict[str, Any], where: str) -> None:
+    """Lower a passing headline that left criteria unreported.
+
+    `parse` can only weigh the headline against the criteria the agent chose to
+    report, so silence passed. A verdict claiming `complete` while saying nothing
+    about criterion 3 was treated exactly like one that passed criterion 3, and the
+    empty case was the worst of it: a gate reporting no criteria at all had no
+    unmet criteria, so its `pass` always stood — the last check before "done"
+    confirming nothing. Every prompt already says a bar you could not check is
+    `pending`; this makes leaving it out mean the same thing, which is what the
+    agent would have had to write to reach this outcome honestly.
+
+    Needs the task, which is why it lives here and not in `parse`: which criteria a
+    verdict owed a report on is a fact about the task, not about the report.
+    """
+    total = len(task.get("acceptances", []))
+    if not total:
+        return
+    reported = {criterion.number for criterion in verdict.criteria}
+    missing = [number for number in range(1, total + 1) if number not in reported]
+    if not missing:
+        return
+    claimed, lowered = _PASSING[verdict.role]
+    if (verdict.decision or verdict.outcome) != claimed:
+        # Not a passing claim, so there is nothing to lower. Either the agent
+        # said so itself or `parse` already lowered it over a criterion it did
+        # report, and that first reason is the more specific one to keep.
+        return
+    verdict.downgraded = _unreported(where, verdict.role, claimed, lowered, missing)
+    verdict.outcome = "incomplete"
+    if verdict.role == "agent":
+        verdict.outcome = lowered
+    else:
+        verdict.decision = lowered
+    if verdict.role == "gate":
+        # A gate lowered to `needs-repair` has to carry findings or it is unusable:
+        # a repair planner reads nothing else. The unreported criteria are the
+        # finding, the same synthesis `_gate_verdict` does for unmet ones.
+        verdict.findings = list(verdict.findings) + [
+            GateFinding(
+                category="unchecked-gate-criterion",
+                summary=(
+                    f"gate criterion {number} was not reported on, so nothing "
+                    "confirmed it"
+                ),
+                evidence="the gate's own report is silent on this criterion",
+                required_outcome=(
+                    "the criterion is checked and passes on the integrated code"
+                ),
+                where=str(task.get("id", "")),
+            )
+            for number in missing
+        ]
+
+
+def _unreported(
+    where: str, role: str, claimed: str, applied: str, missing: list[int]
+) -> str:
+    """Describe a headline claim that its own report does not cover."""
+    listed = ", ".join(str(n) for n in missing)
+    field_name = "decision" if role in ("reviewer", "gate") else "outcome"
+    one = len(missing) == 1
+    return (
+        f"{where}: {field_name} was {claimed!r} but "
+        f"{'criterion' if one else 'criteria'} {listed} "
+        f"{'was' if one else 'were'} not reported on, so nothing confirmed "
+        f"{'it' if one else 'them'}; writ recorded {applied!r}"
+    )
+
+
 def apply(
     data: dict[str, Any],
     task: dict[str, Any],
@@ -629,6 +1000,37 @@ def apply(
         entry["evidence"] = criterion.evidence
         entry["judged_by"] = actor
         entry["judged_at"] = utcnow()
+
+    if verdict.role == "gate":
+        status = _apply_gate(data, task, verdict, actor=actor)
+        task["status"] = status
+        task["updated_at"] = utcnow()
+        task["last_verdict"] = {
+            "role": "gate",
+            "actor": actor,
+            "outcome": verdict.outcome,
+            "decision": verdict.decision,
+            "summary": verdict.summary,
+            "blocked_on": verdict.blocked_on,
+            "at": utcnow(),
+        }
+        add_evidence(task, _evidence_line(verdict, actor), actor=actor)
+        if verdict.downgraded:
+            add_evidence(task, verdict.downgraded, actor="writ")
+        if verdict.notes:
+            add_evidence(task, f"notes: {verdict.notes}", actor=actor)
+        for proposal in verdict.decisions:
+            decision_log.propose(
+                data,
+                title=proposal.title,
+                decision=proposal.decision,
+                context=proposal.context,
+                consequences=proposal.consequences,
+                proposed_by=actor,
+                tasks=[task["id"]],
+            )
+        refresh_milestones(data)
+        return status
 
     rejected = verdict.role == "reviewer" and verdict.decision == "reject"
     if verdict.outcome == "blocked":
@@ -692,6 +1094,169 @@ def apply(
         )
     refresh_milestones(data)
     return status
+
+
+def _apply_gate(
+    data: dict[str, Any], gate: dict[str, Any], verdict: Verdict, *, actor: str
+) -> str:
+    """Record a gate's judgement and decide what happens to the graph.
+
+    A pass completes the gate, which is what releases the work waiting behind it.
+    Anything else holds it: the gate does not fail, because a failed gate would
+    poison everything downstream permanently, and what has actually happened is
+    that the *plan* needs to change. So the findings are written to the plan's
+    ledger, a repair request is opened against them, and the gate sits at `blocked`
+    with its reason recorded until a repair lands and re-arms it.
+
+    The one case that does fail is an exhausted budget. A gate that has asked for
+    repair too many times, or whose findings keep coming back, has stopped being
+    evidence that another task would help — see `repair.exhausted`.
+    """
+    from . import gates, plans, repair
+    from .model import add_evidence
+
+    revision = plans.revision(data)
+    scope = f"gate:{gate['id']}"
+    recorded: list[str] = []
+    if verdict.findings:
+        written = plans.record_findings(
+            data,
+            [finding.to_finding(scope=scope) for finding in verdict.findings],
+            scope=scope,
+        )
+        recorded = [finding.id for finding in written]
+    gates.record_attempt(
+        gate,
+        decision=verdict.decision or "needs-repair",
+        actor=actor,
+        summary=verdict.summary,
+        findings=recorded,
+        revision=revision,
+    )
+    if verdict.decision == "pass":
+        for finding_id in _gate_finding_ids(data, scope):
+            plans.dispose(
+                data,
+                finding_id,
+                "resolved",
+                actor=actor,
+                change="the gate passed on the integrated code",
+            )
+        if gate.get("scope") == gates.FINAL_SCOPE:
+            plans.set_status(data, "complete")
+        return "completed"
+
+    if verdict.decision == "needs-decision":
+        for question in verdict.questions:
+            decision_log_propose_question(data, gate, question, actor=actor)
+        add_evidence(
+            gate,
+            "held for a human ruling: "
+            + "; ".join(question.question for question in verdict.questions),
+            actor="writ",
+        )
+        gate["held"] = {
+            "reason": "needs-decision",
+            "at": utcnow(),
+            "questions": [question.question for question in verdict.questions],
+        }
+        return "blocked"
+
+    blocking = [
+        finding.id
+        for finding in plans.findings(data, open_only=True, source=scope)
+        if finding.severity == "error"
+    ]
+    stop = repair.exhausted(data, gate)
+    if stop:
+        add_evidence(gate, stop, actor="writ")
+        gate["held"] = {"reason": "repair-exhausted", "at": utcnow(), "detail": stop}
+        return "failed"
+    if not blocking:
+        # Advisory findings only. Nothing is broken enough to hold the graph for,
+        # so the gate passes and the findings stay open for a reader.
+        add_evidence(
+            gate,
+            "advisory findings only, so the gate passed; they remain open on the "
+            "plan",
+            actor="writ",
+        )
+        return "completed"
+    request = repair.open_request(
+        data,
+        gate_id=gate["id"],
+        finding_ids=blocking,
+        summary=verdict.summary,
+        actor=actor,
+    )
+    add_evidence(
+        gate,
+        f"asked for plan repair ({request['id']}, round {request['round']}) over "
+        f"{len(blocking)} blocking finding"
+        f"{'s' if len(blocking) != 1 else ''}: {', '.join(blocking)}",
+        actor="writ",
+    )
+    gate["held"] = {
+        "reason": "awaiting-repair",
+        "at": utcnow(),
+        "request": request["id"],
+    }
+    return "blocked"
+
+
+#: dispositions a passing gate is entitled to close.
+#:
+#: `accepted` is in here because of what it means on a gate finding: a repair
+#: planner claiming it added work that closes the finding. That is a claim about
+#: the future, not a demonstrated outcome — the report's rule is that a finding
+#: closes when verification shows the required outcome, not when its repair task
+#: reports completion. The gate passing on the repaired code *is* that
+#: verification, so it is what promotes `accepted` to `resolved`.
+#:
+#: `declined` is not in here. A declined finding already has its resolution on the
+#: record — someone argued the finding was wrong, with a reason — and overwriting
+#: that with `resolved` would lose the disagreement.
+_UNVERIFIED = ("open", "accepted")
+
+
+def _gate_finding_ids(data: dict[str, Any], scope: str) -> list[str]:
+    from . import plans
+
+    return [
+        record["id"]
+        for record in plans.finding_records(data)
+        if record.get("source") == scope
+        and record.get("disposition", "open") in _UNVERIFIED
+    ]
+
+
+def decision_log_propose_question(
+    data: dict[str, Any], gate: dict[str, Any], question: "GateQuestion", *, actor: str
+) -> None:
+    """A gate's unanswerable question, in the log a human already reads.
+
+    Not a new kind of record: the decision log exists for exactly this — a choice
+    the documents did not make, proposed by an agent, inert until a person rules on
+    it. A gate asking "is the timeout per request or per operation?" is the same
+    shape, and putting it anywhere else would create a second queue of things
+    waiting on a human.
+    """
+    from . import decisions as decision_log
+
+    decision_log.propose(
+        data,
+        title=_shorten(question.question, 72),
+        decision=(
+            "Undecided: the gate could not rule on this from the documents and "
+            "stopped rather than guess."
+        ),
+        context=question.context or question.question,
+        consequences=(
+            f"{gate['id']} cannot pass until this is settled; work behind it is held."
+        ),
+        proposed_by=actor,
+        tasks=[gate["id"]],
+    )
 
 
 def _send_back(

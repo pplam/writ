@@ -19,6 +19,7 @@ import urllib.request
 
 import pytest
 
+from tests.conftest import LEGACY_PLAN
 from writ import server, state
 from writ.cli import build_parser
 
@@ -31,7 +32,7 @@ def served(writ, design, project, capfd):
     directly, so tests exercise the error handling the real command installs.
     """
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), *LEGACY_PLAN)
     handler = type("Handler", (server._Handler,), {"root": project})
     httpd = server._server_class()(("127.0.0.1", 0), handler)
     httpd.daemon_threads = True
@@ -269,7 +270,7 @@ def test_serve_binds_this_machine_only_by_default():
 
 def test_a_taken_port_is_a_message_not_a_traceback(writ, design, project, monkeypatch):
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), *LEGACY_PLAN)
 
     class _Fake:
         def __init__(self, *args, **kwargs):
@@ -285,7 +286,7 @@ def test_a_taken_port_is_a_message_not_a_traceback(writ, design, project, monkey
 def test_a_bad_host_does_not_suggest_another_port(writ, design, project, monkeypatch):
     """Confident, useless advice is worse than none."""
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), *LEGACY_PLAN)
 
     class _Fake:
         def __init__(self, *args, **kwargs):
@@ -301,7 +302,7 @@ def test_binding_beyond_loopback_warns_that_there_is_no_auth(
     writ, design, project, monkeypatch, capsys
 ):
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), *LEGACY_PLAN)
 
     class _Fake:
         server_port = 8731

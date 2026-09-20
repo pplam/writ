@@ -35,6 +35,11 @@ writ init
 writ plan docs/design.md --dry-run     # see what the planner will be asked
 writ plan docs/design.md               # an agent reads the doc and the repo
 
+writ check                             # what writ can prove about the plan
+writ coverage                          # every requirement, and what covers it
+writ critique                          # five agents read it and report findings
+writ approve                           # sign the plan off; `writ run` requires it
+
 writ status                            # progress, ready work, live runs
 writ list --ready                      # what can start now
 writ show M01-001                      # the task and its acceptance bars
@@ -118,7 +123,11 @@ instead of paying for another run.
 | `--extract` | skip the agent entirely (see below) |
 | `--timeout S` | kill the planner after S seconds (default 1800) |
 | `--quiet` | do not mirror the agent's output to the terminal |
-| `--parallel` | leave tasks independent instead of chaining them |
+| `--chain` | order unordered tasks linearly in plan order (old default) |
+| `--no-gates` | commit the plan without milestone or final gates |
+| `--critics [NAMES]` | after committing, have independent critics read it (all five if unnamed) |
+| `--critic-agent CMD` | agent for the critics (default: the planning agent) |
+| `--critic-model NAME` | model for the critics |
 | `--append` | plan additional work alongside an existing plan |
 | `--force` | replace the existing plan |
 | `-- <args>` | everything after `--` is passed to the agent |
@@ -126,10 +135,151 @@ instead of paying for another run.
 With `--append`, the prompt lists the tasks that already exist and their status,
 so the agent plans only what is missing and can depend on what is already there.
 
-Dependencies come from the plan. Tasks the plan left unordered fall back to a
-linear chain in plan order, since build order is usually load-bearing; use
-`--parallel` to leave them independent. Re-wire anything with
+Dependencies come from the plan, and only from the plan. A task the plan left
+unordered is left unordered — writ used to fall back to a linear chain in plan
+order, which meant an edge nobody stated looked exactly like an edge someone
+reasoned about, and a plan with a missing edge ran correctly by accident until the
+day it was parallelised. The planner is now told to state every edge it needs.
+`--chain` restores the old behaviour; re-wire anything with
 `writ task <id> --depends`.
+
+### The plan is a reviewed artifact
+
+A plan can be structurally perfect and still be wrong: complete in shape,
+infeasible in practice, or quietly missing an obligation the design stated. So
+committing a plan is not the same as accepting it.
+
+`writ plan` asks the agent for a **requirement inventory** before any task — every
+obligation the document states, one per entry, each with the heading it came from.
+Tasks then name the requirements they discharge. That is what makes coverage
+checkable rather than a matter of reading both documents side by side:
+
+```bash
+writ coverage                 # requirement → tasks → state
+writ coverage --uncovered     # only the holes
+```
+
+A requirement nothing implements is a finding. So is a criterion nothing could
+check (`"it works"`), a task named after the whole project, two unordered tasks
+owning the same file, a fence that contradicts itself, and a plan whose tasks
+never meet. `writ check` runs all of it:
+
+```bash
+writ check                    # re-check the committed plan
+writ check --all              # including findings already dealt with
+writ list findings --open     # the ledger
+```
+
+Findings carry a severity. Only an `error` blocks: the plan is held at
+`needs-approval` and `writ run` refuses to start it. Warnings and notes are
+recorded and readable and do not stop anything. A plan with no blocking findings
+approves itself; one with them waits for a person:
+
+```bash
+writ approve --by ada --reason "read it through"
+writ approve --force --reason "known gap, shipping the spike"
+```
+
+`--force` does not delete the objections. They stay in the ledger marked
+`accepted`, with who accepted them and why, so a later reader can see the plan ran
+with known gaps and which ones they were.
+
+The ledger keeps ids across re-checks: a finding that is still true keeps `F-0007`
+and its first-seen revision, one that has gone away is closed as `resolved` rather
+than vanishing, and one that comes back is reopened. "This has been objected to
+since revision 2" is a thing the plan can tell you.
+
+`--force` is the wholesale answer: every open finding at once, under one reason.
+For disagreeing with one of them, answer it on its own:
+
+```bash
+writ show F-0007                                    # what was said, and by whom
+writ set F-0007 accepted --reason "known, shipping" # stands, run anyway
+writ set F-0007 declined --reason "served by /stats" # the reviewer is wrong
+```
+
+Both answers need a reason — an accepted finding without one is the silent
+ignoring this is meant to prevent, and a declined one without one is an unargued
+assertion that the reviewer was wrong. Neither can be set `resolved`: that word is
+earned when a check or a gate demonstrates the outcome the finding asked for, so a
+person who wants the plan to proceed anyway says `accepted` and the record says why
+it moved.
+
+### Critics
+
+Writ's own checks are deterministic, which is their limit: they can prove a
+criterion names no command, but not that a task is the wrong task. "Add caching to
+the resolver" passes every structural check and may still be sized wrong, fenced
+wrong, and resting on an assumption the design never made.
+
+That needs a reader, and it must not be the author — a planner asked to review its
+own plan already made every call it would be checking. So `writ critique` runs five
+agents that did not write it, each with one question:
+
+| critic | asks |
+| --- | --- |
+| `coverage` | does this build what the design asked for, or something adjacent? |
+| `dependency` | does the graph's shape reflect real contracts between tasks? |
+| `scope` | is each task one bounded piece of work with a real fence? |
+| `acceptance` | could a second party tell, from the criteria alone, that a task is done? |
+| `feasibility` | does this plan survive contact with the repository? |
+
+```bash
+writ critique                             # all five, over the committed plan
+writ critique --critics coverage,scope    # just those
+writ plan design.md --critics             # plan and critique in one pass
+```
+
+Five narrow reviews find more than one general one: a reviewer asked about
+everything grades the plan as a whole and reports the first thing it notices, while
+a reviewer asked only about dependency edges has to go and look at every edge. Two
+critics flagging one task from different angles is signal a single verdict cannot
+produce.
+
+Critics report findings, not rewrites — same rule as a gate. Their findings go into
+the same ledger with the same severities and the same dispositions, so a blocking
+critic finding holds the plan exactly as a structural one does, and `writ check`,
+`writ set` and `writ approve` need no new vocabulary for them. A critic that fails
+does not fail the review; it is recorded as failed by name, rather than the review
+quietly reducing to whoever succeeded. Finding nothing is a legitimate result.
+
+A review is tied to the plan revision it read, so `writ check` can tell you the
+critics passed a plan that has since been repaired.
+
+### Gates, and repair
+
+Every task passing its own review does not mean the milestone works. The defects
+that survive a per-task review are the ones between tasks: an interface each side
+implemented differently, an obligation both assumed the other had.
+
+So a plan gets a **gate** per milestone and one at the end. A gate is an ordinary
+task with `kind: "gate"` — it lives in the same graph, the same scheduler walks it,
+the same dependency rules order it — except that it writes no code. It reads the
+requirement inventory and the seams, and returns `pass`, `needs-repair`, or
+`needs-decision`.
+
+```bash
+writ list gates               # what each gate has decided
+writ list repairs             # every time a gate asked for the plan to change
+```
+
+A gate that fails does not fail the graph. What has gone wrong is the *plan*, so
+its findings go to the ledger, writ asks a repair planner for a patch, and the
+gate waits. The patch may add tasks and add edges — nothing else. It cannot weaken
+an acceptance criterion, drop a requirement, delete a task, or touch a task an
+agent is working on; writ validates every one of those before applying any of it,
+and a refused patch is returned to the planner with its reasons.
+
+The repair tasks go **in front of** the gate: they depend on the completed work,
+and the gate gains a dependency on them. Downstream keeps waiting on the gate, the
+graph stays acyclic however many rounds it takes, and the gate is asked again on
+the repaired code. A finding closes when the gate passes on that code — not when
+its repair task reports completion.
+
+Both loops are bounded. A gate that has asked for repair twice, or whose findings
+keep coming back, stops for a human rather than cycling; so does a planner whose
+patches writ keeps refusing. `writ run` reports a held gate as waiting, not as
+failed, because the work behind it is not broken — it is parked on a decision.
 
 ### Extraction fallback
 
@@ -212,7 +362,9 @@ Writ validates it before applying it. A criterion marked `passed` with no
 evidence is rejected, as is a verdict about criteria the task does not have.
 Rejected verdicts leave the task untouched and print why. An `outcome` that the
 verdict's own criteria contradict is lowered to match them rather than rejected,
-since the criteria are the part carrying evidence.
+since the criteria are the part carrying evidence — and so is one that claims
+success while saying nothing about a criterion, because leaving a bar out is not a
+way of meeting it.
 
 It is read from the path the agent was given, or from JSON printed to stdout in a
 fenced block. Failing both, writ looks for a verdict-shaped file the run wrote
@@ -379,7 +531,7 @@ writ override M01-002 failed --reason "criterion 2 regressed" --accept 2=failed
 
 ## Commands
 
-Sixteen commands, organized by what you are doing rather than what type it
+Twenty-one commands, organized by what you are doing rather than what type it
 operates on.
 
 **Set up**
@@ -387,14 +539,18 @@ operates on.
 | Command | Purpose |
 |---|---|
 | `writ init [--force]` | create the project store |
-| `writ plan <doc>` | have an agent derive milestones, tasks, acceptance criteria |
+| `writ plan <doc>` | have an agent derive requirements, milestones, tasks, acceptance criteria |
+| `writ check [--all] [--quiet]` | re-check the committed plan and report what stands against it |
+| `writ critique [--critics NAMES] [--agent CMD] [--model M] [--timeout S] [--cwd D] [--quiet]` | independent critics read the plan and report findings |
+| `writ approve [--by WHO] [--reason R] [--force]` | sign the plan off, which is what `writ run` requires |
 
 **Look**
 
 | Command | Purpose |
 |---|---|
 | `writ status [--watch] [--interval S] [--until-idle]` | progress, ready work, live runs |
-| `writ list [tasks\|milestones\|runs\|decisions] [--status S] [--milestone M] [--task T] [--ready] [--awaiting-review] [--proposed] [--active] [--limit N]` | any collection |
+| `writ list [tasks\|milestones\|runs\|decisions\|findings\|requirements\|gates\|repairs] [--status S] [--milestone M] [--task T] [--ready] [--awaiting-review] [--proposed] [--open] [--uncovered] [--active] [--limit N]` | any collection |
+| `writ coverage [--uncovered] [--requirement ID]` | requirement → tasks → state |
 | `writ show <id> [--verbose] [--prompt]` | any single thing |
 | `writ graph [--levels] [--verbose] [--dot]` | the dependency DAG |
 | `writ serve [--port N] [--host H] [--no-open]` | a live web view of the whole project |
@@ -404,7 +560,7 @@ operates on.
 
 | Command | Purpose |
 |---|---|
-| `writ set <id> <status> [--evidence T] [--reason R] [--supersedes ID] [--force]` | a task's workflow status, or a ruling on a proposed decision |
+| `writ set <id> <status> [--evidence T] [--reason R] [--by WHO] [--supersedes ID] [--force]` | a task's workflow status, a ruling on a proposed decision, or a finding's disposition |
 | `writ override <id> <status> --reason R [--accept N[=STATUS]]` | human judgement, attributed to you |
 | `writ task [id] [--title T] [--milestone M] [--depends] [--acceptance] [--allow] [--forbid]` | create, or amend with an id |
 
@@ -534,16 +690,29 @@ read-only; following .writ/state.json  (^C to stop)
 Leave it open in one window and `writ run` in another. Nothing needs reloading:
 statuses change as agents work, live ones pulse, and the header counts move.
 
-Six views, reachable by number key:
+Seven views, reachable by number key:
 
 | View | What it answers |
 | --- | --- |
 | Overview | where the project stands, what is running, what waits on you |
+| Plan | whether the plan is approved, what stands against it, what every requirement has to show |
 | Graph | the shape of the work and what could run at once |
 | Tasks | every task, filterable, with full detail on click |
 | Milestones | progress against the plan's own structure |
 | Runs | every agent invocation, newest first |
 | Decisions | forks an agent hit that a human has not settled |
+
+The Plan view puts the three records that are really one question on one page: the
+plan's status says whether work may start, the findings say why not, and the
+requirement matrix says whether what is being built is what was asked for. Reading
+them apart is how a plan gets approved with a requirement nobody implemented — the
+status looked fine on its own. Gates held for a human come first when there are
+any, because that is the state where nothing is running, nothing is broken, and
+nothing will change until a person acts.
+
+It is read-only, like the rest of the dashboard. Disposing of a finding takes a
+reason, and a reason is something to type deliberately, so the page shows the
+command rather than offering a button.
 
 ### What an agent was actually told
 
@@ -624,6 +793,23 @@ outcome was 'complete' but criteria 4 are not passed, so writ recorded 'incomple
 Nothing the agent did not itself mark `passed` is ever credited, so the
 adjustment only lowers a claim. It is on the task's own log too, because the next
 agent to pick the task up is the one that needs to know.
+
+A criterion left out of the report is read the same way as one reported `pending`:
+
+```
+PROBLEM
+decision was 'pass' but criteria 1, 2, 3 were not reported on, so nothing
+confirmed them; writ recorded 'needs-repair'
+```
+
+Silence used to be the one way past this check. Writ compared the headline against
+the criteria in front of it, so a report that mentioned no criteria had none unmet
+and its claim stood — and the worst case was a gate, which could sign off a whole
+milestone with `"criteria": []`. The bars a verdict owes a report on are a fact
+about the task, not about the report, so writ now fills that in: an unreported
+criterion counts as unmet, a gate lowered this way gets a blocking finding per
+skipped criterion so a repair has something to act on, and the only way to claim
+`complete`, `accept` or `pass` is to say something about every bar.
 
 ### The graph, live
 

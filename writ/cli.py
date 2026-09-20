@@ -28,11 +28,12 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import commands
+from . import commands, critics
 from .server import DEFAULT_PORT
 from .decisions import SETTABLE_DECISION_STATUSES
 from .model import DEFAULT_MAX_REWORK, JUDGED_STATUSES, SETTABLE_STATUSES
 from .orchestrator import DEFAULT_ORDER, ORDERS
+from .plans import SETTABLE_DISPOSITIONS
 from .state import WritError
 
 DESCRIPTION = """\
@@ -61,6 +62,8 @@ ids are resolved by shape, so one command serves every kind of thing:
   writ show M01-001      a task, its gates, its runs
   writ show M01-001-2026…  one agent run
   writ show D-0001       one decision
+  writ show F-0001       one finding, and how to dispose of it
+  writ show RR-0001      one repair request, and every patch writ refused
 
 every command accepts --root <project> and --json.
 """
@@ -143,8 +146,43 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--parallel",
         action="store_true",
-        help="do not chain tasks the plan left independent",
+        help=argparse.SUPPRESS,  # now the default; kept so old invocations still work
     )
+    p.add_argument(
+        "--chain",
+        action="store_true",
+        help=(
+            "order tasks the plan left independent, each after the last. Off by "
+            "default: an omitted dependency stays omitted, so a plan that forgot "
+            "an edge fails visibly instead of running in plan order"
+        ),
+    )
+    p.add_argument(
+        "--gates",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "add a review gate per milestone and a final gate over the plan "
+            "(default: on). A gate judges integrated work against the "
+            "requirements and can ask for the plan to be repaired"
+        ),
+    )
+    p.add_argument(
+        "--critics",
+        nargs="*",
+        metavar="NAME",
+        help=(
+            "after committing, have independent critics read the plan and report "
+            "findings. Spends an agent run each, so it is opt-in: "
+            + ", ".join(critic.name for critic in critics.CRITICS)
+        ),
+    )
+    p.add_argument(
+        "--critic-agent",
+        metavar="CMD",
+        help="agent for the critics (default: --agent). A different one reviews better",
+    )
+    p.add_argument("--critic-model", metavar="NAME", help="model for the critics")
     p.add_argument("--append", action="store_true", help="add to an existing plan")
     p.add_argument("--force", action="store_true", help="replace the existing plan")
     p.add_argument(
@@ -159,6 +197,79 @@ def build_parser() -> argparse.ArgumentParser:
         help="print the planning prompt, or a previewed plan, without writing state",
     )
     p.set_defaults(func=commands.cmd_plan)
+
+    p = sub.add_parser(
+        "check",
+        help="what Writ can prove about the current plan, as findings",
+    )
+    p.add_argument(
+        "--all",
+        action="store_true",
+        help="include findings already accepted or resolved",
+    )
+    p.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        help="print nothing; exit 1 if anything blocking stands",
+    )
+    p.set_defaults(func=commands.cmd_check)
+
+    p = sub.add_parser(
+        "critique",
+        help="have independent critics read the plan and report findings",
+    )
+    p.add_argument(
+        "--agent", default="pi", help="critic agent command (default: pi)"
+    )
+    p.add_argument("--model", help="model for the critic agents")
+    p.add_argument(
+        "--timeout", type=int, default=1800, help="seconds before a critic is killed"
+    )
+    p.add_argument("--cwd", help="working directory for the agent (default: --root)")
+    p.add_argument(
+        "--critics",
+        nargs="*",
+        metavar="NAME",
+        help=(
+            "which critics to run (default: all). "
+            + ", ".join(critic.name for critic in critics.CRITICS)
+        ),
+    )
+    p.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        help="do not mirror the critics' output to the terminal",
+    )
+    p.set_defaults(func=commands.cmd_critique)
+
+    p = sub.add_parser(
+        "approve",
+        help="record that the plan may be executed",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="approve despite blocking findings, accepting them on the record",
+    )
+    p.add_argument("--reason", help="why (required with --force)")
+    p.add_argument(
+        "--by", default="operator", help="who is approving (default: operator)"
+    )
+    p.set_defaults(func=commands.cmd_approve)
+
+    p = sub.add_parser(
+        "coverage",
+        help="the requirement coverage matrix: what the design asked for, and where it went",
+    )
+    p.add_argument(
+        "--uncovered",
+        action="store_true",
+        help="only requirements nothing stands behind",
+    )
+    p.add_argument("--requirement", help="one requirement id")
+    p.set_defaults(func=commands.cmd_coverage)
 
     # ----------------------------------------------------------- inspection
     p = sub.add_parser(
@@ -182,18 +293,30 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "list",
-        help="list tasks (default), milestones, runs, or decisions",
+        help=(
+            "list tasks (default), milestones, runs, decisions, findings, "
+            "requirements, gates, or repairs"
+        ),
     )
     p.add_argument(
         "what",
         nargs="?",
         default="tasks",
-        choices=("tasks", "milestones", "runs", "decisions"),
+        choices=(
+            "tasks",
+            "milestones",
+            "runs",
+            "decisions",
+            "findings",
+            "requirements",
+            "gates",
+            "repairs",
+        ),
         help="what to list (default: tasks)",
     )
     p.add_argument("--status", help="filter by status")
     p.add_argument("--milestone", help="filter by milestone id")
-    p.add_argument("--task", help="filter by task id (runs, decisions)")
+    p.add_argument("--task", help="filter by task id (runs, decisions, repairs)")
     p.add_argument(
         "--ready", action="store_true", help="only tasks that can be dispatched now"
     )
@@ -206,6 +329,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--proposed",
         action="store_true",
         help="only decisions an agent proposed and nobody has ruled on",
+    )
+    p.add_argument(
+        "--open",
+        action="store_true",
+        help="only findings nobody has dispositioned",
+    )
+    p.add_argument(
+        "--uncovered",
+        action="store_true",
+        help="only requirements no task covers",
     )
     p.add_argument("--active", action="store_true", help="only live runs")
     p.add_argument("--limit", type=int, help="show at most N rows")
@@ -298,25 +431,38 @@ def build_parser() -> argparse.ArgumentParser:
     # -------------------------------------------------------------- mutation
     p = sub.add_parser(
         "set",
-        help="set the status of a task or a proposed decision",
+        help="set the status of a task, a proposed decision, or a finding",
         description=(
-            "Move a task around the board, or rule on a decision an agent "
-            f"proposed. Task statuses: {', '.join(SETTABLE_STATUSES)}. Decision "
-            f"statuses: {', '.join(SETTABLE_DECISION_STATUSES)}.\n\n"
+            "Move a task around the board, rule on a decision an agent proposed, "
+            "or dispose of a finding. Task statuses: "
+            f"{', '.join(SETTABLE_STATUSES)}. Decision statuses: "
+            f"{', '.join(SETTABLE_DECISION_STATUSES)}. Finding dispositions: "
+            f"{', '.join(SETTABLE_DISPOSITIONS)}.\n\n"
             "This cannot mark a task completed: completion is a judgement about "
             "acceptance criteria, made by the agent that did the work and "
             "checked by `writ review`. Use `writ override` if a human has to "
-            "decide."
+            "decide. Nor can it resolve a finding: a finding resolves when a "
+            "check or a gate demonstrates the outcome it asked for."
         ),
     )
-    p.add_argument("id", help="task id, or a D-NNNN decision id")
+    p.add_argument("id", help="task id, a D-NNNN decision, or an F-NNNN finding")
     p.add_argument(
         "status",
-        choices=sorted(set(SETTABLE_STATUSES + SETTABLE_DECISION_STATUSES)),
+        choices=sorted(
+            set(
+                SETTABLE_STATUSES
+                + SETTABLE_DECISION_STATUSES
+                + SETTABLE_DISPOSITIONS
+            )
+        ),
     )
     p.add_argument("--evidence", help="note recorded with the transition")
     p.add_argument(
-        "--reason", help="why a decision was rejected (required to reject)"
+        "--reason",
+        help="why: required to reject a decision or dispose of a finding",
+    )
+    p.add_argument(
+        "--by", help="who is answering a finding (default: operator)"
     )
     p.add_argument(
         "--supersedes", help="when confirming a decision, the id it replaces"

@@ -23,7 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from . import render, runner, state, verdict
+from . import orchestrator, plancheck, plans, render, repair, runner, state, verdict
 from .model import (
     acceptance_summary,
     blocked_on,
@@ -76,7 +76,83 @@ def overview(data: dict[str, Any]) -> dict[str, Any]:
             1 for d in data.get("decisions", []) if d.get("status") == "proposed"
         ),
         "throughput": _throughput(data),
+        # The plan's own standing. A dashboard that showed only task counts would
+        # read the same for a project executing an approved plan and one sitting at
+        # `needs-approval` with nothing dispatched, which are opposite situations.
+        "plan": plan(data),
     }
+
+
+def plan(data: dict[str, Any]) -> dict[str, Any]:
+    """Where the plan stands as an artifact: status, revision, what stands against it."""
+    record = plans.plan_status(data)
+    open_findings = plans.findings(data, open_only=True)
+    rows = plans.coverage(data)
+    held = orchestrator.held_gates(data)
+    return {
+        "status": record.get("status", "draft"),
+        "revision": int(record.get("revision", 0)),
+        "approved_by": record.get("approved_by") or "",
+        "approved_at": record.get("approved_at") or "",
+        "approval_note": record.get("approval_note") or "",
+        "forced": bool(record.get("forced")),
+        "runnable": plans.runnable(data),
+        "blocking": sum(1 for f in open_findings if f.severity == "error"),
+        "advisory": sum(1 for f in open_findings if f.severity == "warning"),
+        "requirements": len(rows),
+        "uncovered": [row["id"] for row in rows if row["state"] == "uncovered"],
+        "open_repairs": [r["id"] for r in repair.open_requests(data)],
+        "held_gates": [{"id": k, "reason": v} for k, v in sorted(held.items())],
+    }
+
+
+def findings(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """The one ledger, worst first: writ's own checks and the gates' reports."""
+    records = plancheck.sort_findings(plans.findings(data))
+    by_id = {r["id"]: r for r in plans.finding_records(data) if r.get("id")}
+    out = []
+    for finding in records:
+        stored = by_id.get(finding.id, {})
+        out.append(
+            {
+                "id": finding.id or "",
+                "severity": finding.severity,
+                "category": finding.category,
+                "message": finding.message,
+                "where": finding.where,
+                "suggested_action": finding.suggested_action,
+                "requirement_ids": list(finding.requirement_ids),
+                "source": finding.source,
+                "disposition": stored.get("disposition", "open"),
+                "reason": stored.get("reason", ""),
+                "change": stored.get("change", ""),
+                "first_seen_at": stored.get("first_seen_at", ""),
+            }
+        )
+    return out
+
+
+def coverage(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """The requirement matrix, derived from the current graph."""
+    return plans.coverage(data)
+
+
+def repairs(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every request a gate has made for the plan to change."""
+    return [
+        {
+            "id": request.get("id", ""),
+            "gate": request.get("gate", ""),
+            "status": request.get("status", ""),
+            "round": int(request.get("round", 1)),
+            "summary": request.get("summary", ""),
+            "findings": list(request.get("findings", [])),
+            "applied_tasks": list(request.get("applied_tasks", [])),
+            "refusals": len(request.get("refusals") or []),
+            "opened_at": request.get("opened_at", ""),
+        }
+        for request in repair.requests(data)
+    ]
 
 
 def _throughput(data: dict[str, Any]) -> dict[str, Any]:
@@ -170,6 +246,11 @@ def task_row(data: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
         "milestone": task.get("milestone", ""),
         "status": _status(data, task),
         "stored_status": task["status"],
+        # `task` or `gate`. A reader almost always wants one or the other, and a
+        # graph that drew them identically would hide the fact that the node
+        # holding up the milestone writes no code.
+        "kind": task.get("kind", "task"),
+        "requirement_ids": task.get("requirement_ids", []),
         "passed": counts["passed"],
         "total": counts["total"],
         "depends_on": [d for d in task.get("depends_on", []) if d in data["tasks"]],
@@ -231,6 +312,10 @@ def task(data: dict[str, Any], task_id: str) -> dict[str, Any]:
             ],
             "created_at": found.get("created_at", ""),
             "updated_at": found.get("updated_at", ""),
+            # For a gate: what it has decided, and why it is waiting if it is.
+            # Empty on an ordinary task, so one detail shape serves both.
+            "gate_attempts": found.get("gate_attempts", []),
+            "held": found.get("held") or None,
         }
     )
     return row
@@ -598,5 +683,8 @@ def everything(root: Path) -> dict[str, Any]:
         "decisions": decisions(data),
         "graph": graph(data),
         "activity": activity(data),
+        "findings": findings(data),
+        "coverage": coverage(data),
+        "repairs": repairs(data),
         "generated_at": state.utcnow(),
     }

@@ -48,6 +48,11 @@ class PlannedTask:
     depends_on: list[str] = field(default_factory=list)
     allowed: list[str] = field(default_factory=list)
     forbidden: list[str] = field(default_factory=list)
+    #: ids from the plan's requirement inventory that this task covers. The
+    #: traceability `design_section` only gestures at: a section says where the
+    #: work came from, a requirement id says which stated obligation it discharges,
+    #: and that is what makes coverage checkable rather than a matter of reading.
+    requirement_ids: list[str] = field(default_factory=list)
     #: whether `section` was claimed by the author or synthesized from titles
     stated_section: bool = False
 

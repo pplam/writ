@@ -1033,3 +1033,234 @@ def test_a_task_that_is_no_longer_blocked_reports_no_reason(planned, writ, proje
     # the header line specifically. The history below still carries the evidence
     # line from when it was blocked, and should: that happened.
     assert not any(line.startswith("blocked on:") for line in out.splitlines())
+
+
+# --------------------------------------------------------------------------
+# gate verdicts
+#
+# A gate's report is the one an agent has the most incentive to overstate: it is
+# the last thing between a plan and "done". So the parser's job is not to record
+# what the gate said but to hold it to its own detail.
+
+
+def gate_payload(**overrides):
+    payload = {
+        "decision": "pass",
+        "summary": "the milestone integrates",
+        "criteria": [
+            {"number": 1, "status": "passed", "evidence": "ran the suite"},
+            {"number": 2, "status": "passed", "evidence": "read the seam"},
+        ],
+    }
+    payload.update(overrides)
+    return json.dumps(payload)
+
+
+def test_a_gate_pass_is_parsed_as_a_pass():
+    result = verdict.parse(gate_payload(), role="gate")
+    assert result.decision == "pass"
+    assert result.outcome == "complete"
+    assert result.blocking_findings == []
+
+
+def test_a_gate_cannot_pass_with_an_unmet_criterion():
+    result = verdict.parse(
+        gate_payload(
+            criteria=[
+                {"number": 1, "status": "passed", "evidence": "ran the suite"},
+                {"number": 2, "status": "failed", "evidence": "the seam is broken"},
+            ]
+        ),
+        role="gate",
+    )
+    # Lowered, not accepted, and not thrown away either: the criteria it reported
+    # are real evidence, so they become the finding.
+    assert result.decision == "needs-repair"
+    assert result.downgraded
+    assert [f.summary for f in result.findings] == [
+        "gate criterion 2 is not met: failed"
+    ]
+
+
+def test_a_repair_request_with_no_findings_is_refused():
+    with pytest.raises(WritError, match="no findings"):
+        verdict.parse(
+            gate_payload(decision="needs-repair", criteria=[
+                {"number": 1, "status": "failed", "evidence": "x"},
+            ]),
+            role="gate",
+        )
+
+
+def test_a_decision_request_with_no_questions_is_refused():
+    with pytest.raises(WritError, match="no questions"):
+        verdict.parse(gate_payload(decision="needs-decision"), role="gate")
+
+
+def test_a_gate_finding_becomes_a_plan_finding():
+    result = verdict.parse(
+        gate_payload(
+            decision="needs-repair",
+            criteria=[{"number": 1, "status": "failed", "evidence": "x"}],
+            findings=[
+                {
+                    "severity": "blocking",
+                    "summary": "nothing writes the projection",
+                    "where": "store/projection.go",
+                    "requirement_ids": ["REQ-002"],
+                    "suggested_action": "add the writer",
+                    "evidence": "grep found no writer",
+                }
+            ],
+        ),
+        role="gate",
+    )
+    assert len(result.blocking_findings) == 1
+    finding = result.findings[0].to_finding(scope="gate:G-M01")
+    # The same shape writ's own checks produce, so one ledger holds both.
+    assert finding.severity == "error"
+    assert finding.where == "store/projection.go"
+    assert finding.requirement_ids == ["REQ-002"]
+    assert finding.source == "gate:G-M01"
+    assert "grep found no writer" in finding.message
+
+
+def test_an_advisory_gate_finding_does_not_block():
+    result = verdict.parse(
+        gate_payload(
+            findings=[
+                {
+                    "severity": "advisory",
+                    "summary": "the log format is noisier than it needs to be",
+                }
+            ]
+        ),
+        role="gate",
+    )
+    assert result.decision == "pass"
+    assert result.findings and result.blocking_findings == []
+    assert result.findings[0].to_finding(scope="gate:G-M01").severity == "warning"
+
+
+def test_an_unknown_gate_decision_is_refused():
+    with pytest.raises(WritError, match="decision"):
+        verdict.parse(gate_payload(decision="looks-fine"), role="gate")
+
+
+# --------------------------------------------------------------------------
+# a passing headline has to cover every criterion
+
+
+def unit(count=2, kind="task"):
+    """A task record with `count` acceptance criteria and nothing else."""
+    return {
+        "id": "M01-001" if kind == "task" else "G-M01",
+        "kind": kind,
+        "acceptances": [f"criterion {n}" for n in range(1, count + 1)],
+    }
+
+
+def test_a_gate_that_reports_no_criteria_does_not_pass():
+    """The hole this check exists to close.
+
+    `parse` derives "unmet" from the criteria it was given, so a gate reporting
+    none had none unmet and its `pass` stood: the last check before a plan is
+    called done, confirming nothing.
+    """
+    parsed = verdict.parse(
+        json.dumps({"decision": "pass", "summary": "the milestone integrates"}),
+        role="gate",
+    )
+    assert parsed.decision == "pass"  # nothing in the report contradicts it
+    verdict.check_coverage(parsed, unit(4, kind="gate"), "verdict.json")
+    assert parsed.decision == "needs-repair"
+    assert parsed.outcome == "incomplete"
+    assert "criteria 1, 2, 3, 4 were not reported on" in parsed.downgraded
+
+
+def test_a_gate_lowered_for_silence_carries_findings_a_repair_can_read():
+    """`needs-repair` with no findings is unusable; the omissions are the finding."""
+    parsed = verdict.parse(json.dumps({"decision": "pass"}), role="gate")
+    verdict.check_coverage(parsed, unit(2, kind="gate"), "verdict.json")
+    assert [f.category for f in parsed.findings] == ["unchecked-gate-criterion"] * 2
+    assert all(f.blocking for f in parsed.findings)
+    assert "criterion 1 was not reported on" in parsed.findings[0].summary
+    assert parsed.findings[0].required_outcome
+
+
+def test_an_agent_omitting_a_criterion_is_not_credited_with_it():
+    """Leaving a bar out means the same as reporting it `pending`."""
+    payload = json.dumps(
+        {
+            "outcome": "complete",
+            "criteria": [{"number": 1, "status": "passed", "evidence": "ran it"}],
+        }
+    )
+    parsed = verdict.parse(payload)
+    verdict.check_coverage(parsed, unit(2), "verdict.json")
+    assert parsed.outcome == "incomplete"
+    assert parsed.passed == [1]
+    assert "criterion 2 was not reported on" in parsed.downgraded
+    assert "recorded 'incomplete'" in parsed.downgraded
+
+
+def test_a_reviewer_omitting_a_criterion_cannot_accept():
+    parsed = verdict.parse(
+        json.dumps(
+            {
+                "decision": "accept",
+                "criteria": [{"number": 2, "status": "passed", "evidence": "re-ran"}],
+            }
+        ),
+        role="reviewer",
+    )
+    verdict.check_coverage(parsed, unit(2), "verdict.json")
+    assert parsed.decision == "reject"
+    assert parsed.outcome == "incomplete"
+    assert "criterion 1 was" in parsed.downgraded
+
+
+def test_a_report_on_every_criterion_is_left_alone():
+    parsed = verdict.parse(passing(count=2))
+    verdict.check_coverage(parsed, unit(2), "verdict.json")
+    assert parsed.outcome == "complete"
+    assert parsed.downgraded is None
+
+
+def test_an_incomplete_claim_is_not_lowered_for_silence():
+    """There is nothing to lower. The agent already said it is not done."""
+    parsed = verdict.parse(partial(passed=1, total=1))
+    verdict.check_coverage(parsed, unit(3), "verdict.json")
+    assert parsed.outcome == "incomplete"
+    assert parsed.downgraded is None
+
+
+def test_the_first_reason_for_a_downgrade_survives_a_second_one():
+    """A verdict with both faults keeps the more specific complaint.
+
+    `parse` already lowered this one over criterion 2, which it reported as
+    failed. Overwriting that with "criterion 3 was not reported on" would trade a
+    fact about the work for a fact about the paperwork.
+    """
+    parsed = verdict.parse(
+        json.dumps(
+            {
+                "outcome": "complete",
+                "criteria": [
+                    {"number": 1, "status": "passed", "evidence": "ran it"},
+                    {"number": 2, "status": "failed", "evidence": "nope"},
+                ],
+            }
+        )
+    )
+    first = parsed.downgraded
+    verdict.check_coverage(parsed, unit(3), "verdict.json")
+    assert parsed.downgraded == first
+    assert "are not passed" in first
+
+
+def test_a_task_with_no_criteria_asks_for_no_report():
+    parsed = verdict.parse(json.dumps({"outcome": "complete", "criteria": []}))
+    verdict.check_coverage(parsed, unit(0), "verdict.json")
+    assert parsed.outcome == "complete"
+    assert parsed.downgraded is None

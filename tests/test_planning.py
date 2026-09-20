@@ -71,6 +71,21 @@ def agent_writing(payload, *, exit_code=0, to_stdout=False):
 # plan validation
 
 
+def _work(data):
+    """Just the implementation tasks. Gates are in `tasks` too, by design.
+
+    A plan's size is the work it describes; the plan-level checks over that work
+    are writ's, not the planner's, and counting them would make every one of these
+    assertions a statement about how many gates writ installs.
+    """
+    return {
+        task_id: task
+        for task_id, task in data["tasks"].items()
+        if task.get("kind", "task") == "task"
+    }
+
+
+
 def test_load_plan_maps_every_field():
     milestones = planning.load_plan(json.dumps(PLAN))
     assert [m.title for m in milestones] == ["Storage foundations", "Interface"]
@@ -236,7 +251,7 @@ def test_plan_runs_the_agent_and_commits_its_plan(writ, project, design):
     assert "(agent)" in out
 
     data = state.load(project)
-    assert sorted(data["tasks"]) == ["M01-001", "M01-002", "M02-001"]
+    assert sorted(_work(data)) == ["M01-001", "M01-002", "M02-001"]
     log = data["tasks"]["M01-001"]
     assert log["title"] == "Add append-only event log writer"
     assert [a["text"] for a in log["acceptances"]] == [
@@ -269,7 +284,7 @@ def test_plan_accepts_json_printed_on_stdout(writ, project, design):
         "plan", str(design), "--agent", agent_writing(PLAN, to_stdout=True)
     )
     assert code == 0
-    assert len(state.load(project)["tasks"]) == 3
+    assert len(_work(state.load(project))) == 3
 
 
 def test_plan_dry_run_prints_the_prompt_and_runs_no_agent(writ, project, design):
@@ -402,7 +417,7 @@ def test_plan_from_artifact_reuses_a_previous_plan(writ, project, design, tmp_pa
     artifact.write_text(json.dumps(PLAN), encoding="utf-8")
     code, out, _ = writ("plan", str(design), "--from-plan", str(artifact))
     assert code == 0 and "created 2 milestones and 3 tasks" in out
-    assert len(state.load(project)["tasks"]) == 3
+    assert len(_work(state.load(project))) == 3
     # no agent was run
     assert not list(state.plans_dir(project).iterdir())
 
@@ -427,7 +442,7 @@ def test_plan_extract_still_works_without_an_agent(writ, project, design):
     writ("init")
     code, out, _ = writ("plan", str(design), "--extract")
     assert code == 0 and "(extracted)" in out
-    assert len(state.load(project)["tasks"]) == 4
+    assert len(_work(state.load(project))) == 4
 
 
 def test_plan_dry_run_previews_an_imported_plan(writ, design, tmp_path, project):
@@ -569,7 +584,7 @@ def test_streamed_plan_still_commits_correctly(writ, project, design):
     writ("init")
     code, _, _ = writ("plan", str(design), "--agent", chatty_agent(["working"]))
     assert code == 0
-    assert len(state.load(project)["tasks"]) == 3
+    assert len(_work(state.load(project))) == 3
 
 
 def test_a_planner_that_writes_a_lot_does_not_deadlock(writ, project, design):
@@ -579,4 +594,4 @@ def test_a_planner_that_writes_a_lot_does_not_deadlock(writ, project, design):
     code, out, _ = writ("plan", str(design), "--agent", noisy)
     assert code == 0
     assert "line 399" in out
-    assert len(state.load(project)["tasks"]) == 3
+    assert len(_work(state.load(project))) == 3

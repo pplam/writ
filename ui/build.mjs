@@ -40,6 +40,7 @@ const ORDER = [
   'views/runs.js',
   'views/decisions.js',
   'views/milestones.js',
+  'views/plan.js',
   'app.js',
 ];
 
@@ -67,6 +68,34 @@ function typecheckAndCompile() {
  * wins. That is not hypothetical — `overview` and `decisions` both had a `card`,
  * and the overview rendered decisions. So collisions are a build error.
  */
+/**
+ * Every module under src is in ORDER.
+ *
+ * ORDER is written by hand because concatenation needs a dependency order, and
+ * nothing else checks it. A file left out still typechecks, still gets hashed into
+ * the source stamp — so the staleness test reads as current — and is simply absent
+ * from the bundle: a whole view that renders nothing, with every check passing.
+ * That happened, which is why this is here.
+ */
+function assertEveryModuleIsOrdered() {
+  const found = [];
+  const walk = (dir, prefix = '') => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isDirectory()) walk(join(dir, entry.name), `${prefix}${entry.name}/`);
+      else if (entry.name.endsWith('.ts')) found.push(`${prefix}${entry.name.replace(/\.ts$/, '.js')}`);
+    }
+  };
+  walk(srcDir);
+  const missing = found.filter((name) => !ORDER.includes(name));
+  if (missing.length) {
+    console.error('these modules are under ui/src but not in ORDER, so they would be');
+    console.error('compiled and then silently left out of the bundle:');
+    for (const name of missing) console.error(`  ${name}`);
+    console.error('add each one to ORDER at the position its dependencies allow.');
+    process.exit(1);
+  }
+}
+
 function bundle() {
   const parts = [];
   const seen = new Map();
@@ -147,6 +176,7 @@ function main() {
 
   const script = bundle();
   const css = readFileSync(join(srcDir, 'style.css'), 'utf8');
+  assertEveryModuleIsOrdered();
   const stamp = sourceHash();
   const header = `/* built from ui/src (${stamp}) */\n`;
 

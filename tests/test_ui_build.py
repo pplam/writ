@@ -304,3 +304,39 @@ def test_a_detail_header_spaces_its_own_children():
     head = _rule(".detail-head")
     assert head["display"] == "flex"
     assert head["gap"] != "0"
+
+
+def test_every_source_module_is_in_the_bundle():
+    """A file under `ui/src` that `ORDER` omits is compiled and then dropped.
+
+    The stamp cannot catch this: it hashes the sources, so adding a module changes
+    it, a rebuild makes it match again, and the bundle is still missing the module.
+    Everything passes and a whole view renders nothing. `ui/build.mjs` fails on it
+    now; this asserts the same thing without needing node, because the failure is
+    invisible from the output alone.
+    """
+    order = re.search(r"const ORDER = \[(.*?)\];", (ROOT / "ui" / "build.mjs").read_text(), re.S)
+    assert order, "ui/build.mjs has no ORDER list"
+    listed = set(re.findall(r"'([^']+)'", order.group(1)))
+    modules = {
+        f"{path.relative_to(SRC).as_posix()[:-3]}.js"
+        for path in SRC.rglob("*.ts")
+    }
+    missing = sorted(modules - listed)
+    assert not missing, (
+        f"these modules are under ui/src but not in ui/build.mjs's ORDER, so their "
+        f"code is not in the bundle: {', '.join(missing)}"
+    )
+
+
+def test_each_view_reaches_the_bundle():
+    """The compiled output contains something from every view module.
+
+    A cheaper version of the check above, from the other end: `ORDER` naming a file
+    and the bundle containing its code are two different claims.
+    """
+    body = (STATIC / "app.js").read_text()
+    for path in sorted((SRC / "views").glob("*.ts")):
+        assert f"---- views/{path.stem}.js ----" in body, (
+            f"views/{path.stem}.js contributed nothing to writ/static/app.js"
+        )

@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import DESIGN
+from tests.conftest import DESIGN, LEGACY_PLAN
 from writ import api, state
 
 UI = Path(__file__).resolve().parent.parent / "ui" / "src"
@@ -26,7 +26,7 @@ UI = Path(__file__).resolve().parent.parent / "ui" / "src"
 def worked(writ, design, project):
     """A project with a finished task, a rejected one, and a live-looking run."""
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), *LEGACY_PLAN)
     return project
 
 
@@ -87,7 +87,7 @@ def test_snapshot_matches_the_typescript_interface(worked):
 
 def test_run_row_and_detail_match_the_typescript_interfaces(writ, design, project):
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), *LEGACY_PLAN)
     writ("dispatch", "M01-001", "--agent", "true")
     data = state.load(project)
     assert set(api.runs(data)[0]) == declared_fields("RunRow")
@@ -97,7 +97,7 @@ def test_run_row_and_detail_match_the_typescript_interfaces(writ, design, projec
 
 def test_decision_matches_the_typescript_interface(writ, design, project):
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), *LEGACY_PLAN)
     data = state.load(project)
     data["decisions"] = [
         {
@@ -130,7 +130,7 @@ def test_reading_everything_does_not_touch_the_store(worked):
 
 def test_reading_a_run_does_not_touch_its_directory(writ, design, project):
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), *LEGACY_PLAN)
     writ("dispatch", "M01-001", "--agent", "true")
     data = state.load(project)
     run_id = next(iter(data["runs"]))
@@ -157,7 +157,7 @@ def test_overview_counts_agree_with_the_store(worked):
 
 def test_progress_counts_completed_not_started(writ, design, project):
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), *LEGACY_PLAN)
     over = api.overview(state.load(project))
     assert over["completed"] == 0
     assert over["live"] == 0
@@ -179,7 +179,7 @@ def test_graph_columns_are_dependency_depth(worked):
 
 def test_graph_marks_which_edges_are_already_satisfied(writ, design, project):
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), *LEGACY_PLAN)
     writ("override", "M01-001", "completed", "--reason", "done by hand")
     edges = api.graph(state.load(project))["edges"]
     satisfied = {(e["from"], e["to"]): e["satisfied"] for e in edges}
@@ -196,7 +196,7 @@ def test_a_dangling_dependency_does_not_take_the_whole_page_down(writ, design, p
     rest still renders.
     """
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), *LEGACY_PLAN)
     data = state.load(project)
     data["tasks"]["M02-001"]["depends_on"] = ["M99-999"]
     state.save(project, data)
@@ -211,7 +211,7 @@ def test_a_dangling_dependency_does_not_take_the_whole_page_down(writ, design, p
 
 def test_task_detail_carries_the_evidence_an_agent_reported(writ, design, project):
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), *LEGACY_PLAN)
     data = state.load(project)
     task = data["tasks"]["M01-001"]
     task["acceptances"][0] = {
@@ -236,7 +236,7 @@ def test_task_detail_names_what_is_blocking_it(worked):
 
 def test_run_detail_includes_the_prompt_the_agent_was_given(writ, design, project):
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), *LEGACY_PLAN)
     writ("dispatch", "M01-001", "--agent", "true")
     data = state.load(project)
     run_id = next(iter(data["runs"]))
@@ -247,7 +247,7 @@ def test_run_detail_includes_the_prompt_the_agent_was_given(writ, design, projec
 
 def test_a_log_tail_reports_that_it_is_a_tail(writ, design, project, monkeypatch):
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), *LEGACY_PLAN)
     writ("dispatch", "M01-001", "--agent", "true")
     data = state.load(project)
     run_id = next(iter(data["runs"]))
@@ -260,7 +260,7 @@ def test_a_log_tail_reports_that_it_is_a_tail(writ, design, project, monkeypatch
 
 def test_a_missing_log_is_empty_not_an_error(writ, design, project):
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), *LEGACY_PLAN)
     writ("dispatch", "M01-001", "--agent", "true")
     data = state.load(project)
     run_id = next(iter(data["runs"]))
@@ -282,7 +282,7 @@ def test_an_unknown_id_raises_rather_than_returning_a_blank(worked):
 
 def test_activity_is_newest_first(writ, design, project):
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), *LEGACY_PLAN)
     writ("dispatch", "M01-001", "--agent", "true")
     events = api.activity(state.load(project))
     stamps = [event["at"] for event in events]
@@ -291,7 +291,7 @@ def test_activity_is_newest_first(writ, design, project):
 
 def test_activity_merges_runs_and_decisions(writ, design, project):
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), *LEGACY_PLAN)
     writ("dispatch", "M01-001", "--agent", "true")
     data = state.load(project)
     data["decisions"] = [
@@ -315,7 +315,7 @@ def test_activity_merges_runs_and_decisions(writ, design, project):
 def test_a_task_row_names_dependencies_that_do_not_exist(writ, design, project):
     """A silent omission would leave a task looking merely slow."""
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), *LEGACY_PLAN)
     data = state.load(project)
     data["tasks"]["M02-001"]["depends_on"] = ["M01-001", "M99-999"]
     state.save(project, data)
@@ -333,7 +333,7 @@ def test_a_run_that_wrote_no_verdict_says_so_on_the_record(writ, design, project
     dashboard, or `writ show` tomorrow — needs it stored.
     """
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), *LEGACY_PLAN)
     writ("dispatch", "M01-001", "--agent", "true")
     data = state.load(project)
     run_id = next(iter(data["runs"]))
@@ -357,7 +357,7 @@ def test_a_blocked_task_carries_its_reason_to_the_page(writ, design, project):
     sections.
     """
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), *LEGACY_PLAN)
     data = state.load(project)
     task = data["tasks"]["M01-001"]
     task["status"] = "blocked"
@@ -372,7 +372,7 @@ def test_a_blocked_task_carries_its_reason_to_the_page(writ, design, project):
 def test_a_task_that_is_not_blocked_carries_no_reason(writ, design, project):
     """`last_verdict` outlives the status it was written under."""
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), *LEGACY_PLAN)
     data = state.load(project)
     task = data["tasks"]["M01-001"]
     task["status"] = "completed"

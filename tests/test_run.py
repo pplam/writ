@@ -335,6 +335,9 @@ def test_a_rejected_task_does_not_stall_the_walk(planned, writ, project):
     assert data["tasks"]["M01-001"]["status"] == "failed"
     # the leaf depends on M01-001, so it cannot run; the summary must say so
     assert "blocked by failed work" in out
+    # ...and name the failure, not only what is waiting on it. Without the cause,
+    # the ids after "failed work" read as the things that failed.
+    assert "failed: M01-001" in out
 
 
 def test_failure_downstream_is_reported_transitively(planned, writ):
@@ -342,6 +345,12 @@ def test_failure_downstream_is_reported_transitively(planned, writ):
                      agent(REJECTOR))
     # M01-001 failed, so M02-001 -> M02-002 -> M03-001 are all parked
     assert "M02-001" in out and "M02-002" in out and "M03-001" in out
+    # The cause is the frontier only: a task parked behind a parked task is not
+    # where the reader should start looking.
+    line = next(line for line in out.splitlines() if "failed:" in line)
+    named = line.split("failed:")[1]
+    assert "M01-001" in named
+    assert "M02-001" not in named and "M03-001" not in named
 
 
 def test_max_tasks_limits_what_starts(planned, writ, project):

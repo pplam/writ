@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, IO, Iterable
 
-from . import agents, decisions, planner, state, verdict
+from . import agents, decisions, planner, plans, repair, state, verdict
 from .model import (
     DEFAULT_MAX_REWORK,
     add_evidence,
@@ -26,6 +26,9 @@ from .model import (
 from .state import WritError, utcnow
 
 ACTIVE_RUN_STATUSES = ("starting", "running")
+
+#: what a repair-planning run writes instead of a verdict
+PATCH_FILENAME = "patch.json"
 
 GUARDRAILS = """\
 Working rules (non-negotiable):
@@ -366,6 +369,345 @@ def build_review_prompt(
     return "\n".join(lines)
 
 
+GATE_GUARDRAILS = """\
+Working rules for a gate (non-negotiable):
+1. Change nothing. No source edits, no new files, no fixes, no formatting. If the
+   working tree differs when you finish, the gate is void.
+2. Verify by running. Read the code, then run the project's tests and whatever
+   commands the criteria name, and report what they actually printed.
+3. Judge the integrated tree as it is now, not the task reports about it.
+4. A bar you could not check is `pending`, not `passed`.
+"""
+
+
+def build_gate_prompt(
+    data: dict[str, Any],
+    task: dict[str, Any],
+    root: Path,
+    *,
+    verdict_path: Path | None = None,
+) -> str:
+    """Compose the prompt for a gate: judge integrated work against requirements.
+
+    Two things make this different from a task review, and both matter.
+
+    It is given the **requirement inventory**, not just the task list. A gate whose
+    only input is "here are the tasks and their criteria" can do no better than the
+    planner that wrote them: if the plan missed an obligation, every task passes and
+    the gate agrees. Reading the requirements directly is the only way the omission
+    becomes visible.
+
+    It is given the **seams**: which tasks it covers, what each one claimed, and
+    what interfaces they agreed on between them. The defects a gate exists to catch
+    live between tasks, so the prompt points at the boundaries rather than asking
+    for a general re-review of everything.
+    """
+    from . import gates, plans
+
+    scope = task.get("scope") or ""
+    final = scope == gates.FINAL_SCOPE
+    lines: list[str] = []
+    if final:
+        lines.append(
+            "You are the FINAL GATE on this project. Every implementation task is "
+            "complete and every milestone gate has passed. Your question is whether "
+            "the integrated product does what the design asked for."
+        )
+    else:
+        lines.append(
+            "You are a MILESTONE GATE. The tasks in this milestone are individually "
+            "complete and each was reviewed on its own. Your question is whether "
+            "they work as one thing."
+        )
+    lines.append("")
+    lines.append(
+        "You did not write this code, and you are not fixing it. You are judging "
+        "an integrated outcome and reporting what is wrong with it."
+    )
+    lines.append("")
+    docs = list(data.get("design_docs", []))
+    if docs:
+        lines.append("Authoritative documents — read these, not only the task list:")
+        lines.extend(f"- {doc}" for doc in docs)
+        lines.append("")
+    lines.append(f"Gate {task['id']}: {task['title']}")
+    if task.get("notes"):
+        lines.append(task["notes"])
+    lines.append("")
+    covered = [
+        dep for dep in task.get("depends_on", []) if dep in data.get("tasks", {})
+    ]
+    if covered:
+        lines.append("Work under this gate:")
+        for dep_id in covered:
+            dep = data["tasks"][dep_id]
+            kind = "gate" if dep.get("kind") == "gate" else "task"
+            lines.append(f"- {dep_id} [{kind}, {dep['status']}] {dep['title']}")
+            claim = (dep.get("last_verdict") or {}).get("summary", "")
+            if claim:
+                lines.append(f"    claimed: {_first_sentence(claim)}")
+        lines.append("")
+    requirements = _gate_requirements(data, task)
+    if requirements:
+        lines.append(
+            "Requirements this gate is answerable for. Check each against the code "
+            "as it stands, not against whether a task says it did it:"
+        )
+        for row in requirements:
+            head = f"- {row['id']} [{row['priority']}] {row['text']}"
+            lines.append(head)
+            if row.get("source"):
+                lines.append(f"    stated in: {row['source']}")
+            if row.get("tasks"):
+                lines.append(f"    implemented by: {', '.join(row['tasks'])}")
+            else:
+                lines.append(
+                    "    implemented by: nothing in the plan — if this requirement "
+                    "does not hold, that is a missing-coverage finding"
+                )
+        lines.append("")
+    interfaces = _agreed_decisions(data, covered)
+    if interfaces:
+        lines.append(
+            "Decisions made during this work. Two tasks that decided "
+            "incompatibly is exactly the defect this gate is for:"
+        )
+        lines.extend(f"- {item}" for item in interfaces)
+        lines.append("")
+    lines.append("Criteria this gate must establish:")
+    for index, item in enumerate(task.get("acceptances", []), start=1):
+        lines.append(f"  {index}. {item['text']}")
+    lines.append("")
+    previous = _previous_gate_attempts(task)
+    if previous:
+        lines.append(previous)
+        lines.append("")
+    lines.append(GATE_GUARDRAILS)
+    lines.append("")
+    lines.append(_gate_verdict_instructions(task, verdict_path))
+    return "\n".join(lines)
+
+
+def _gate_requirements(
+    data: dict[str, Any], task: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """The requirement rows this gate answers for, with their coverage."""
+    from . import plans
+
+    wanted = set(task.get("requirement_ids", []))
+    rows = plans.coverage(data)
+    if not wanted:
+        return rows
+    return [row for row in rows if row["id"] in wanted]
+
+
+def _agreed_decisions(data: dict[str, Any], task_ids: list[str]) -> list[str]:
+    """Decisions recorded by the work under this gate, as one-liners."""
+    wanted = set(task_ids)
+    found: list[str] = []
+    for record in data.get("decisions", []):
+        if not wanted.intersection(record.get("tasks", [])):
+            continue
+        origin = ", ".join(record.get("tasks", [])) or "unknown"
+        found.append(f"[{origin}] {record['title']}: {record['decision']}")
+    return found
+
+
+def _previous_gate_attempts(task: dict[str, Any]) -> str:
+    """What this gate objected to last time, so a re-review can check it closed."""
+    attempts = task.get("gate_attempts") or []
+    if not attempts:
+        return ""
+    lines = [
+        "You have reviewed this gate before. Repair work has landed since. Check "
+        "that what you objected to is actually closed, and do not assume the rest "
+        "is still fine — a repair can break what was working:"
+    ]
+    for number, attempt in enumerate(attempts, start=1):
+        lines.append(
+            f"  attempt {number}: {attempt.get('decision')} — "
+            f"{_first_sentence(attempt.get('summary', '')) or 'no summary'}"
+        )
+        if attempt.get("findings"):
+            lines.append(f"    findings: {', '.join(attempt['findings'])}")
+    return "\n".join(lines)
+
+
+def _gate_verdict_instructions(
+    task: dict[str, Any], verdict_path: Path | None
+) -> str:
+    path = verdict_path or Path(verdict.VERDICT_FILENAME)
+    total = len(task.get("acceptances", []))
+    return "\n".join(
+        [
+            "Report your verdict as JSON to this exact path:",
+            f"  {path}",
+            "",
+            "The file must contain JSON only — no prose, no code fence.",
+            "",
+            "Schema:",
+            verdict.GATE_SCHEMA,
+            "",
+            verdict.GATE_RULES,
+            "",
+            f"This gate has {total} criteria, numbered 1 to {total}.",
+            "",
+            "What happens next depends on what you write. `pass` releases the work "
+            "waiting behind this gate. `needs-repair` makes writ plan repair work "
+            "from your findings and re-run this gate afterwards — so your findings "
+            "are the entire brief for that repair. `needs-decision` stops and asks "
+            "a human. If you write nothing, the gate stays where it is.",
+            "",
+            "If you cannot write the file, print the same JSON to stdout inside a "
+            "single ```json fenced block instead.",
+        ]
+    )
+
+
+def build_repair_prompt(
+    data: dict[str, Any],
+    task: dict[str, Any],
+    root: Path,
+    *,
+    verdict_path: Path | None = None,
+    request: dict[str, Any] | None = None,
+    patch_path: Path | None = None,
+) -> str:
+    """Compose the prompt for planning a repair to the graph.
+
+    Bounded on purpose. The repair planner is not re-planning the project: it sees
+    the findings, the requirements they touch, the tasks that exist, and what
+    earlier repair rounds already tried. Handing it the whole design document again
+    invites it to rewrite the plan, which is how a repair loop turns into an
+    unbounded one.
+    """
+    from . import gates, plans, repair as repair_module
+
+    lines: list[str] = []
+    lines.append(
+        "You are planning a REPAIR to an executing plan. A gate reviewed the "
+        "integrated work and found it wrong. Your job is to propose the work that "
+        "makes it right — not to implement it, and not to re-plan the project."
+    )
+    lines.append("")
+    lines.append(f"Repository root: {root.resolve()}")
+    lines.append(f"Plan revision: {plans.revision(data)}")
+    lines.append("")
+    if request:
+        lines.append(
+            f"Repair request {request['id']} (round {request.get('round', 1)}) "
+            f"raised by gate {request['gate']}."
+        )
+        if request.get("summary"):
+            lines.append(f"The gate's account: {request['summary']}")
+        lines.append("")
+        findings = [
+            finding
+            for finding in plans.findings(data)
+            if finding.id in request.get("findings", [])
+        ]
+        if findings:
+            lines.append("Findings you must address:")
+            for finding in findings:
+                lines.append(f"- {finding.id} [{finding.severity}] {finding.message}")
+                if finding.requirement_ids:
+                    lines.append(
+                        f"    affects: {', '.join(finding.requirement_ids)}"
+                    )
+                if finding.suggested_action:
+                    lines.append(f"    required outcome: {finding.suggested_action}")
+            lines.append("")
+        previous = _previous_repairs(data, request)
+        if previous:
+            lines.append(previous)
+            lines.append("")
+    requirements = plans.coverage(data)
+    if requirements:
+        lines.append("Requirement inventory (you may not add to or weaken this):")
+        for row in requirements:
+            lines.append(
+                f"- {row['id']} [{row['priority']}, {row['state']}] {row['text']}"
+            )
+        lines.append("")
+    lines.append("The graph as it stands:")
+    for task_id in sorted(data.get("tasks", {})):
+        entry = data["tasks"][task_id]
+        kind = "gate" if entry.get("kind") == "gate" else "task"
+        fence = (
+            f" owns {', '.join(entry['allowed'])}" if entry.get("allowed") else ""
+        )
+        lines.append(
+            f"- {task_id} [{kind}, {entry['status']}] {entry['title']}{fence}"
+        )
+        if entry.get("depends_on"):
+            lines.append(f"    after: {', '.join(entry['depends_on'])}")
+    lines.append("")
+    lines.append(
+        "Read the repository and the failing behaviour before proposing anything. "
+        "A repair written from the findings alone, without confirming what the code "
+        "actually does, is a guess."
+    )
+    lines.append("")
+    lines.append("Write the patch as JSON to this exact path:")
+    lines.append(f"  {patch_path or 'patch.json'}")
+    lines.append("")
+    lines.append("The file must contain JSON only — no prose, no code fence.")
+    lines.append("")
+    lines.append("Schema:")
+    lines.append(repair_module.PATCH_SCHEMA)
+    lines.append("")
+    lines.append(repair_module.PATCH_RULES)
+    lines.append("")
+    lines.append(
+        f"Set `base_revision` to {plans.revision(data)}. Writ refuses a patch "
+        "planned against a revision the graph has moved past, so do not guess it."
+    )
+    lines.append("")
+    lines.append(
+        "Writ validates your patch before applying any of it: it will refuse one "
+        "that weakens an acceptance criterion, drops a requirement, changes a task "
+        "an agent is working on, or leaves a blocking finding with no disposition. "
+        "A refusal is returned to you with its reasons."
+    )
+    return "\n".join(lines)
+
+
+def _previous_repairs(data: dict[str, Any], request: dict[str, Any]) -> str:
+    """What earlier rounds on this gate tried, so a repair does not repeat one."""
+    from . import repair as repair_module
+
+    earlier = [
+        item
+        for item in repair_module.requests(data)
+        if item.get("gate") == request.get("gate") and item["id"] != request["id"]
+    ]
+    if not earlier:
+        return ""
+    lines = [
+        "Earlier repair rounds on this gate. The gate failed again after these, so "
+        "whatever they did was not enough — do not propose the same thing again:"
+    ]
+    for item in earlier:
+        lines.append(
+            f"  {item['id']} ({item.get('status')}): "
+            f"{_first_sentence(item.get('analysis') or item.get('summary', ''))}"
+        )
+        for task_id in item.get("applied_tasks", []):
+            entry = data.get("tasks", {}).get(task_id)
+            if entry:
+                lines.append(
+                    f"    added {task_id} [{entry['status']}] {entry['title']}"
+                )
+    return "\n".join(lines)
+
+
+def _first_sentence(text: str, limit: int = 160) -> str:
+    collapsed = " ".join(str(text).split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[: limit - 1].rstrip() + "…"
+
+
 def _design_excerpt(task: dict[str, Any], root: Path, limit: int = 4000) -> str:
     doc = task.get("design_doc")
     section = task.get("design_section")
@@ -607,7 +949,18 @@ def prepare(
                 f"{task_id} already has a running agent (run {active}). "
                 f"Wait for it, or stop it with `writ cancel {active}`."
             )
-        if role == "reviewer":
+        if role == "gate":
+            blockers = blocking_dependencies(data, task)
+            if blockers and not force:
+                raise WritError(
+                    f"{task_id} cannot review yet: {', '.join(blockers)} are not "
+                    "complete (use --force to gate it anyway)"
+                )
+        elif role == "repair":
+            request = repair.request_for_gate(data, task_id)
+            if request is None and not force:
+                raise WritError(f"{task_id} has no open repair request")
+        elif role == "reviewer":
             if task["status"] not in ("awaiting-review", "reviewing") and not force:
                 raise WritError(
                     f"{task_id} is {task['status']}, not awaiting review "
@@ -624,8 +977,32 @@ def prepare(
         directory = state.run_dir(root, run_id)
         directory.mkdir(parents=True, exist_ok=True)
         verdict_path = directory / verdict.VERDICT_FILENAME
-        builder = build_review_prompt if role == "reviewer" else build_prompt
-        prompt = builder(data, task, Path(root), verdict_path=verdict_path)
+        patch_path = directory / PATCH_FILENAME
+        if role == "repair":
+            request = repair.request_for_gate(data, task_id)
+            prompt = build_repair_prompt(
+                data,
+                task,
+                Path(root),
+                verdict_path=verdict_path,
+                request=request,
+                patch_path=patch_path,
+            )
+            if request is not None:
+                request["status"] = "planning"
+                request.setdefault("attempts", []).append(
+                    {"run": run_id, "at": utcnow()}
+                )
+        elif role == "gate":
+            prompt = build_gate_prompt(
+                data, task, Path(root), verdict_path=verdict_path
+            )
+        elif role == "reviewer":
+            prompt = build_review_prompt(
+                data, task, Path(root), verdict_path=verdict_path
+            )
+        else:
+            prompt = build_prompt(data, task, Path(root), verdict_path=verdict_path)
         (directory / "prompt.txt").write_text(prompt, encoding="utf-8")
         data["runs"][run_id] = {
             "id": run_id,
@@ -650,7 +1027,16 @@ def prepare(
             "dir": str(directory),
         }
         task.setdefault("runs", []).append(run_id)
-        task["status"] = "reviewing" if role == "reviewer" else "running"
+        if role == "repair":
+            # A repair planner does not hold the gate; the gate is already held,
+            # waiting for the work this run will propose. Moving it to `running`
+            # would say an agent is working *on the gate*, which no reader would
+            # read as "its repair is being planned".
+            pass
+        elif role in ("reviewer", "gate"):
+            task["status"] = "reviewing"
+        else:
+            task["status"] = "running"
         task["updated_at"] = utcnow()
         refresh_milestones(data)
     return run_id, directory, prompt, resolved
@@ -739,6 +1125,143 @@ def execute(root: Path, run_id: str, *, stream: bool = False, prefix: str = "") 
     return code
 
 
+def _finish_repair(
+    data: dict[str, Any],
+    run: dict[str, Any],
+    gate: dict[str, Any],
+    directory: Path,
+    actor: str,
+) -> None:
+    """Validate a proposed patch and apply it, or return it with its reasons.
+
+    Writ owns this, not the agent. The patch has already been written by something
+    that wants its own proposal accepted, so every invariant that matters — the
+    revision it targets, the bars it must not weaken, the tasks it must not touch —
+    is checked here, and a patch that fails any of them changes nothing.
+
+    A refused patch leaves the request open. The gate stays held, the findings stay
+    open, and the next round is given this attempt's refusal, so the loop is bounded
+    by `repair.exhausted` rather than by hoping the next patch is better.
+    """
+    from .model import add_evidence
+
+    request = repair.request_for_gate(data, gate["id"])
+    if request is None:
+        run["patch_error"] = "no open repair request for this gate"
+        return
+    text = _patch_text(directory)
+    if text is None:
+        run["patch_error"] = "the repair planner wrote no patch"
+        add_evidence(
+            gate,
+            f"{actor} planned no repair: it wrote no patch to "
+            f"{directory / PATCH_FILENAME}",
+            actor="writ",
+        )
+        request["status"] = "open"
+        return
+    try:
+        patch = repair.load_patch(text)
+    except WritError as exc:
+        run["patch_error"] = str(exc)
+        add_evidence(gate, f"unusable repair patch from {actor}: {exc}", actor="writ")
+        request["status"] = "open"
+        return
+    findings = repair.validate(data, patch, request)
+    blocking = [finding for finding in findings if finding.blocking]
+    run["patch_findings"] = [finding.to_dict() for finding in findings]
+    if blocking:
+        reasons = "; ".join(finding.message for finding in blocking)
+        run["patch_error"] = reasons
+        add_evidence(
+            gate,
+            f"writ refused {actor}'s patch: {reasons}",
+            actor="writ",
+        )
+        request["status"] = "open"
+        request.setdefault("refusals", []).append(
+            {
+                "at": utcnow(),
+                "run": run["id"],
+                "reasons": [finding.to_dict() for finding in blocking],
+            }
+        )
+        if not repair.patches_left(request):
+            # Out of patches. The gate stops for a human rather than cycling: what
+            # is wrong is not the wording of the patch but what is being asked of
+            # it, and another round would refuse for the same reason.
+            gate["held"] = {
+                "reason": "repair-refused",
+                "at": utcnow(),
+                "request": request["id"],
+            }
+            add_evidence(
+                gate,
+                f"writ refused {repair.refusals(request)} patches for "
+                f"{request['id']}; {gate['id']} is held for a human "
+                f"(writ show {request['id']})",
+                actor="writ",
+            )
+        return
+    if patch.empty and patch.questions:
+        # The planner could not repair this without a ruling. Same destination as a
+        # gate's own `needs-decision`: a human, through the decision log.
+        for question in patch.questions:
+            decisions.propose(
+                data,
+                title=str(question.get("question", ""))[:72] or "repair question",
+                decision=(
+                    "Undecided: the repair planner could not close the finding "
+                    "without a ruling."
+                ),
+                context=str(question.get("context", question.get("question", ""))),
+                consequences=f"{gate['id']} stays held until this is settled.",
+                proposed_by=actor,
+                tasks=[gate["id"]],
+            )
+        request["status"] = "proposed"
+        request["questions"] = list(patch.questions)
+        gate["held"] = {
+            "reason": "needs-decision",
+            "at": utcnow(),
+            "request": request["id"],
+        }
+        add_evidence(
+            gate,
+            f"{actor} raised {len(patch.questions)} question(s) rather than "
+            "proposing repair work; recorded in the decision log",
+            actor="writ",
+        )
+        return
+    applied = repair.apply_patch(data, patch, request, actor=actor)
+    run["patch_applied"] = applied
+    add_evidence(
+        gate,
+        f"repair {request['id']} applied: added {', '.join(applied['tasks'])}; "
+        f"this gate now waits for them (plan revision {applied['revision']})",
+        actor="writ",
+    )
+
+
+def _patch_text(directory: Path) -> str | None:
+    """The patch file, or JSON the planner printed to stdout instead."""
+    from .planning import extract_json
+
+    path = directory / PATCH_FILENAME
+    if path.exists():
+        text = path.read_text(encoding="utf-8").strip()
+        if text:
+            return text
+    stdout = directory / "stdout.log"
+    if not stdout.exists():
+        return None
+    embedded = extract_json(stdout.read_text(encoding="utf-8", errors="replace"))
+    if embedded is None:
+        return None
+    path.write_text(embedded + "\n", encoding="utf-8")
+    return embedded
+
+
 def _mark_running(root: Path, run_id: str, pid: int) -> None:
     with state.transaction(root) as data:
         run = data["runs"][run_id]
@@ -775,6 +1298,10 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
             return
         directory = Path(run["dir"])
         actor = _actor(run)
+        if role == "repair":
+            _finish_repair(data, run, task, directory, actor)
+            refresh_milestones(data)
+            return
         # The run's own start time bounds the search for a misplaced verdict, so
         # a file left by an earlier run cannot be mistaken for this one's.
         since = _started_epoch(run)
@@ -794,6 +1321,7 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
         if reported is not None:
             try:
                 verdict.check_scope(reported, task, str(directory))
+                verdict.check_coverage(reported, task, str(directory))
             except WritError as exc:
                 run["verdict_error"] = str(exc)
                 add_evidence(task, f"unusable verdict from {actor}: {exc}", actor="writ")

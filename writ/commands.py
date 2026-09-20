@@ -1,6 +1,7 @@
 """Command implementations. Each takes parsed args and prints a result."""
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import shutil
@@ -12,11 +13,16 @@ from typing import Any
 
 from . import (
     agents,
+    critics,
     decisions,
+    gates,
     orchestrator,
+    plancheck,
     planner,
     planning,
+    plans,
     render,
+    repair,
     runner,
     server,
     state,
@@ -71,13 +77,15 @@ def cmd_plan(args) -> int:
     plan_path: Path | None = None
     if args.from_plan:
         plan_path = Path(args.from_plan).expanduser()
-        milestones = planning.read_plan(plan_path)
+        document = planning.read_document(plan_path)
         source = f"plan {plan_path.name}"
     elif args.extract:
-        milestones = planner.parse(
-            doc.read_text(encoding="utf-8"),
-            milestone_level=args.level,
-            split_subsections=not args.flat,
+        document = planning.PlanDocument(
+            milestones=planner.parse(
+                doc.read_text(encoding="utf-8"),
+                milestone_level=args.level,
+                split_subsections=not args.flat,
+            )
         )
         source = f"{doc.name} (extracted)"
     else:
@@ -111,7 +119,7 @@ def cmd_plan(args) -> int:
                 print("  " + "─" * 60)
             sys.stdout.flush()
 
-        milestones, plan_path, code = planning.generate(
+        document, plan_path, code = planning.generate(
             root=root,
             doc=doc,
             agent=args.agent,
@@ -129,18 +137,27 @@ def cmd_plan(args) -> int:
         print(f"planning agent exited {code}; plan: {plan_path}")
         source = f"{doc.name} (agent)"
 
+    milestones = document.milestones
     summary = planner.summarize(milestones)
     missing = planning.unresolved_sections(milestones, doc)
 
     if args.dry_run:
-        _print_plan(milestones, summary, missing)
+        _print_plan(document, summary, missing)
+        _print_findings(
+            plancheck.check(
+                plancheck.from_plan(
+                    milestones, document.requirements, root=root.resolve()
+                )
+            ),
+            preamble="what Writ would object to:",
+        )
         return 0
 
-    created = _commit_plan(
+    created, findings = _commit_plan(
         args,
         root=root,
         doc=doc,
-        milestones=milestones,
+        document=document,
         plan_path=plan_path,
         source=source,
     )
@@ -148,18 +165,53 @@ def cmd_plan(args) -> int:
         f"created {summary['milestones']} milestones and {created} tasks "
         f"from {source}"
     )
+    if document.requirements:
+        print(
+            f"requirement inventory: {len(document.requirements)} entries "
+            "(writ coverage)"
+        )
     for section in missing:
         print(f"note: no section titled {section!r} in {doc.name}", file=sys.stderr)
-    print("next: writ status")
+    _print_findings(findings)
+    if getattr(args, "critics", None) is not None:
+        # `--critics` absent is None and runs nothing; `--critics` with no names is
+        # `[]` and means all of them. The distinction matters because the flag is
+        # opt-in — it spends an agent run per critic — so the empty list is a
+        # request, not the absence of one.
+        _run_critics(
+            args,
+            root=root,
+            doc=doc,
+            chosen=_chosen_critics(args),
+            plan_path=plan_path,
+        )
+    data = state.load(root)
+    if plans.runnable(data):
+        print("plan approved: no blocking findings")
+        print("next: writ run")
+    else:
+        counts = plancheck.tally(plans.findings(data, open_only=True))
+        print(
+            f"plan held at {plans.plan_status(data)['status']}: "
+            f"{counts['error']} blocking, {counts['warning']} advisory"
+        )
+        print("next: writ check   (then writ approve, or re-plan)")
     return 0
 
 
 def _print_plan(
-    milestones: list[planner.PlannedMilestone],
+    document: planning.PlanDocument,
     summary: dict[str, Any],
     missing: list[str],
 ) -> None:
-    for milestone in milestones:
+    for requirement in document.requirements:
+        flag = requirement.priority
+        if requirement.status != "planned":
+            flag = f"{flag}, {requirement.status}"
+        print(f"{requirement.id} [{flag}] {requirement.text}")
+    if document.requirements:
+        print()
+    for milestone in document.milestones:
         print(milestone.title)
         if milestone.notes:
             print(f"    {milestone.notes}")
@@ -167,6 +219,8 @@ def _print_plan(
             print(f"  - {task.title}")
             if task.notes:
                 print(f"      {task.notes}")
+            if task.requirement_ids:
+                print(f"      covers: {', '.join(task.requirement_ids)}")
             for item in task.acceptances:
                 print(f"      · {item}")
             if task.depends_on:
@@ -188,10 +242,19 @@ def _commit_plan(
     *,
     root: Path,
     doc: Path,
-    milestones: list[planner.PlannedMilestone],
+    document: planning.PlanDocument,
     plan_path: Path | None,
     source: str,
-) -> int:
+) -> tuple[int, list[plancheck.Finding]]:
+    """Write the plan to state, then check it and set the plan's status.
+
+    Committed before it is approved, on purpose. The alternative — hold the plan
+    outside the graph until a human signs it off — means the one view that would
+    let them judge it (`writ graph`, `writ show`, `writ coverage`) cannot see it
+    yet. So the tasks land, the objections land beside them, and what approval
+    actually gates is `writ run`.
+    """
+    milestones = document.milestones
     with state.transaction(root) as data:
         if data["tasks"] and not (args.append or args.force):
             raise WritError(
@@ -201,15 +264,17 @@ def _commit_plan(
         if args.force:
             data["tasks"] = {}
             data["milestones"] = {}
+            data["findings"] = []
         offset = len(data["milestones"])
         doc_path = str(doc.resolve())
         if doc_path not in data["design_docs"]:
             data["design_docs"].append(doc_path)
 
+        plans.set_requirements(data, document.requirements, replace=bool(args.force))
         built = planner.build_ids(milestones, offset)
         translate = planner.ref_map(built)
         previous: str | None = None
-        if args.append:
+        if args.chain:
             existing = sorted(data["tasks"])
             previous = existing[-1] if existing else None
         created = 0
@@ -222,7 +287,7 @@ def _commit_plan(
             )
             for task_id, task in tasks:
                 depends = _resolve_depends(
-                    task, translate, data, previous, chain=not args.parallel
+                    task, translate, data, previous, chain=args.chain
                 )
                 add_task(
                     data,
@@ -235,6 +300,8 @@ def _commit_plan(
                     forbidden=task.forbidden,
                     design_section=task.section,
                     design_doc=doc_path,
+                    requirement_ids=task.requirement_ids,
+                    notes=task.notes,
                 )
                 if task.notes:
                     add_evidence(data["tasks"][task_id], f"plan: {task.notes}")
@@ -242,16 +309,22 @@ def _commit_plan(
                 previous = task_id
         check_dag(data)
         refresh_milestones(data)
+        if args.gates:
+            gates.install(data, milestones=[m_id for m_id, _, _ in built])
         data.setdefault("plans", []).append(
             {
                 "source": source,
                 "design_doc": doc_path,
                 "artifact": str(plan_path) if plan_path else None,
                 "milestones": [milestone_id for milestone_id, _, _ in built],
+                "requirements": [req.id for req in document.requirements],
                 "created_at": state.utcnow(),
             }
         )
-    return created
+        plans.bump(data)
+        plans.set_status(data, "draft")
+        findings = plans.run_check(data, root=root.resolve())
+    return created, findings
 
 
 def _resolve_depends(
@@ -266,9 +339,16 @@ def _resolve_depends(
 
     A generated plan refers to tasks by the ids it invented, and may also refer
     to tasks that already exist. Anything we cannot resolve is an error, not a
-    silently dropped edge. When the plan states no dependencies at all we fall
-    back to the historical behaviour: chain onto the previous task unless
-    `--parallel` said to leave tasks independent.
+    silently dropped edge.
+
+    An omitted dependency stays omitted. Writ used to chain a task with no stated
+    `depends_on` onto whatever task came before it in the plan, which looks
+    conservative and is not: it manufactures an ordering the plan never claimed,
+    so a plan that forgot "C needs A" still runs — C after some unrelated B — and
+    the omission surfaces as a task failing for no visible reason rather than as a
+    plan that is wrong. Independent by default means a missing edge shows up as
+    what it is. `--chain` restores the old behaviour for a plan that really is
+    meant to be a single line of work.
     """
     if not task.depends_on:
         return [previous] if chain and previous else []
@@ -283,6 +363,324 @@ def _resolve_depends(
         if target not in resolved:
             resolved.append(target)
     return resolved
+
+
+def _print_findings(
+    findings: list[plancheck.Finding],
+    *,
+    preamble: str = "",
+    limit: int = 12,
+) -> None:
+    """Print findings worst-first, with what would close each one.
+
+    Capped, because a plan with forty warnings is one nobody reads to the end, and
+    the ones that matter are at the top. The count says what was withheld.
+
+    The whole list goes to one stream, chosen by whether anything in it blocks.
+    Routing each finding by its own severity splits one list across stdout and
+    stderr: the reader sees a tally of four blocking findings with three notes
+    above it and the blocking ones nowhere, and neither stream reads as a list.
+    """
+    if not findings:
+        return
+    counts = plancheck.tally(findings)
+    stream = sys.stderr if counts["error"] else sys.stdout
+    if preamble:
+        print(preamble, file=stream)
+    for finding in findings[:limit]:
+        print(f"  {finding.line()}", file=stream)
+        if finding.suggested_action:
+            print(f"      → {finding.suggested_action}", file=stream)
+    if len(findings) > limit:
+        print(f"  … {len(findings) - limit} more (writ check)", file=stream)
+    print(
+        f"  {counts['error']} blocking, {counts['warning']} advisory, "
+        f"{counts['note']} notes",
+        file=stream,
+    )
+
+
+def cmd_check(args) -> int:
+    """Re-check the committed plan and report what stands against it."""
+    root = Path(args.root)
+    with state.transaction(root) as data:
+        found = plans.run_check(data, root=root.resolve())
+        record = dict(plans.plan_status(data))
+        listed = plans.findings(data, open_only=not args.all)
+        coverage_rows = plans.coverage(data)
+        # Which critics have not read the plan as it now stands. Structural checks
+        # re-run here for free; a critic is an agent and does not, so the most this
+        # can do is say that what a critic passed is not what is now committed.
+        stale = critics.unreviewed(data)
+    blocking = plancheck.blocking(listed)
+    if args.json:
+        render.emit_json(
+            {
+                "plan": record,
+                "findings": [finding.to_dict() for finding in listed],
+                "tally": plancheck.tally(listed),
+                "coverage": coverage_rows,
+                "unreviewed": stale,
+            }
+        )
+        return 1 if blocking else 0
+    if args.quiet:
+        return 1 if blocking else 0
+    print(f"plan {record['status']} at revision {record['revision']}")
+    if coverage_rows:
+        satisfied = sum(1 for row in coverage_rows if row["state"] == "satisfied")
+        uncovered = [row["id"] for row in coverage_rows if row["state"] == "uncovered"]
+        print(
+            f"requirements: {len(coverage_rows)} total, {satisfied} satisfied"
+            + (f", {len(uncovered)} uncovered" if uncovered else "")
+        )
+    if not listed:
+        print("no findings stand against this plan")
+        _print_stale(stale)
+        if record["status"] not in plans.RUNNABLE_STATUSES:
+            print("next: writ approve")
+        return 0
+    _print_findings(plancheck.sort_findings(listed), limit=40)
+    _print_stale(stale)
+    if blocking:
+        print()
+        print(
+            "fix the plan and re-plan, answer them one at a time with "
+            "`writ set F-NNNN accepted|declined --reason ...`, or accept them all "
+            "with `writ approve --force --reason ...`"
+        )
+        return 1
+    if record["status"] not in plans.RUNNABLE_STATUSES:
+        print("next: writ approve")
+    return 0
+
+
+def _print_stale(stale: list[str]) -> None:
+    """Say which critics have not read the plan as it stands.
+
+    Not a finding. Writ cannot tell whether an unreviewed plan is wrong — that is
+    the entire reason it asks agents — so this states the absence of a review rather
+    than objecting to the plan, and does not block anything.
+    """
+    if not stale:
+        return
+    if len(stale) == len(critics.CRITICS):
+        print("no critic has read this plan   (writ critique)")
+        return
+    print(f"not reviewed at this revision: {', '.join(stale)}   (writ critique)")
+
+
+def cmd_critique(args) -> int:
+    """Have independent critics read the committed plan and report on it.
+
+    Deliberately separate from `writ check`. Check is deterministic and free: it
+    runs every time the plan changes. This spends agents, so it is asked for.
+    """
+    root = Path(args.root)
+    data = state.load(root)
+    if not data["tasks"]:
+        raise WritError("there is no plan to review (run `writ plan` first)")
+    chosen = _chosen_critics(args)
+    reports = _run_critics(args, root=root, doc=None, chosen=chosen, plan_path=None)
+    if args.json:
+        render.emit_json(
+            {
+                "reports": [
+                    {
+                        "critic": report.critic,
+                        "summary": report.summary,
+                        "confidence": report.confidence,
+                        "error": report.error,
+                        "findings": [f.to_dict() for f in report.findings],
+                    }
+                    for report in reports
+                ],
+                "plan": dict(plans.plan_status(state.load(root))),
+            }
+        )
+    blocking = sum(report.blocking for report in reports if report.ok)
+    return 1 if blocking or any(not report.ok for report in reports) else 0
+
+
+def _chosen_critics(args) -> list[critics.Critic]:
+    """Which critics to run: the ones named, or all of them."""
+    named = getattr(args, "critics", None)
+    return critics.by_name(named) if named else list(critics.CRITICS)
+
+
+def _run_critics(args, *, root, doc, chosen, plan_path):
+    """Run the critics over the committed plan and merge what they found.
+
+    The plan they read is rebuilt from committed state rather than from the
+    planner's artifact, so the critics review the ids and edges that actually
+    exist — which are what will be executed, and not always what the plan proposed.
+    """
+    data = state.load(root)
+    plan_text = _plan_json(data)
+    found = plans.findings(data, open_only=True)
+    directory = state.store_dir(root) / "reviews" / f"r{plans.revision(data)}"
+
+    def announce(critic, resolved) -> None:
+        if not args.json:
+            print(f"critic {critic.name}: {critic.brief}")
+            print(f"  running: {resolved.display}")
+            sys.stdout.flush()
+
+    def report_back(report) -> None:
+        if args.json:
+            return
+        if not report.ok:
+            print(f"  {report.critic} failed: {report.error}", file=sys.stderr)
+            return
+        counts = plancheck.tally(report.findings)
+        print(
+            f"  {counts['error']} blocking, {counts['warning']} advisory"
+            + (f", confidence {report.confidence}" if report.confidence else "")
+        )
+        if report.summary:
+            print(f"  {_first_line(report.summary)}")
+
+    reports = critics.review(
+        root=root,
+        doc=doc,
+        plan_text=plan_text,
+        directory=directory,
+        chosen=chosen,
+        agent=getattr(args, "critic_agent", None) or args.agent,
+        model=getattr(args, "critic_model", None) or args.model,
+        timeout=args.timeout,
+        cwd=args.cwd,
+        found=found,
+        stream=not args.quiet,
+        on_start=announce,
+        on_finish=report_back,
+    )
+    with state.transaction(root) as live:
+        written = critics.record(live, reports, root=root.resolve())
+    if not args.json:
+        _print_findings(
+            plancheck.sort_findings(written),
+            preamble=f"what the critics found ({len(written)} recorded):",
+        )
+        if not written:
+            print("the critics found nothing to report")
+    return reports
+
+
+def _plan_json(data: dict[str, Any]) -> str:
+    """The committed plan as the critics read it: ids, edges, fences, bars."""
+    return json.dumps(
+        {
+            "requirements": [
+                dict(record) for record in plans.requirements(data).values()
+            ],
+            "tasks": [
+                {
+                    "id": task["id"],
+                    "title": task.get("title", ""),
+                    "kind": task.get("kind", "task"),
+                    "milestone": task.get("milestone"),
+                    "notes": task.get("notes", ""),
+                    "design_section": task.get("design_section"),
+                    "requirement_ids": task.get("requirement_ids", []),
+                    "depends_on": task.get("depends_on", []),
+                    "allowed": task.get("allowed", []),
+                    "forbidden": task.get("forbidden", []),
+                    "acceptances": [
+                        item.get("text", "") for item in task.get("acceptances", [])
+                    ],
+                }
+                for task in sorted(data["tasks"].values(), key=lambda t: t["id"])
+            ],
+        },
+        indent=2,
+    )
+
+
+def cmd_approve(args) -> int:
+    """Record human approval, which is what `writ run` actually requires."""
+    root = Path(args.root)
+    with state.transaction(root) as data:
+        if not data["tasks"]:
+            raise WritError("there is no plan to approve (run `writ plan` first)")
+        result = plans.approve(
+            data,
+            actor=args.by,
+            reason=args.reason or "",
+            force=bool(args.force),
+        )
+        record = dict(result["plan"])
+        accepted = result["accepted"]
+    print(f"plan {record['status']} at revision {record['revision']}")
+    if accepted:
+        print(
+            f"accepted {len(accepted)} open finding"
+            f"{'s' if len(accepted) != 1 else ''} on the record: "
+            f"{', '.join(accepted)}"
+        )
+        print(f"reason: {record['approval_note']}")
+    print("next: writ run")
+    return 0
+
+
+def cmd_coverage(args) -> None:
+    """Print the requirement coverage matrix."""
+    data = state.load(Path(args.root))
+    rows = plans.coverage(data)
+    if args.requirement:
+        rows = [row for row in rows if row["id"] == args.requirement]
+        if not rows:
+            raise WritError(f"unknown requirement: {args.requirement}")
+    if args.uncovered:
+        rows = [row for row in rows if row["state"] in ("uncovered", "unevidenced")]
+    if args.json:
+        render.emit_json(rows)
+        return
+    if not rows:
+        if not plans.requirements(data):
+            print(
+                "this plan states no requirement inventory, so there is nothing to "
+                "trace. A plan from `writ plan` without --extract records one."
+            )
+            return
+        print("nothing matched")
+        return
+    width = max(len(row["id"]) for row in rows)
+    for row in rows:
+        marker = _COVERAGE_MARKS.get(row["state"], "?")
+        print(
+            f"{marker} {row['id']:<{width}} [{row['priority']}/{row['state']}] "
+            f"{_first_line(row['text'], 78)}"
+        )
+        if row["tasks"]:
+            done = f"{row['complete']}/{len(row['tasks'])} complete"
+            print(f"    tasks: {', '.join(row['tasks'])} ({done})")
+        if row["gates"]:
+            print(f"    gates: {', '.join(row['gates'])}")
+        if row["evidence"]:
+            print(f"    evidence: {row['evidence']}")
+        if row["reason"]:
+            print(f"    reason: {row['reason']}")
+        if row["state"] == "uncovered":
+            print("    nothing implements this")
+    states: dict[str, int] = {}
+    for row in rows:
+        states[row["state"]] = states.get(row["state"], 0) + 1
+    print()
+    print(", ".join(f"{count} {state}" for state, count in sorted(states.items())))
+
+
+#: one character per coverage state, so a long matrix can be skimmed
+_COVERAGE_MARKS = {
+    "satisfied": "✓",
+    "in-progress": "~",
+    "planned": "·",
+    "at-risk": "!",
+    "uncovered": "✗",
+    "unevidenced": "✗",
+    "out-of-scope": "–",
+    "deferred": "–",
+}
 
 
 # --------------------------------------------------------------------------
@@ -302,6 +700,10 @@ def cmd_list(args) -> None:
         "milestones": _list_milestones,
         "runs": _list_runs,
         "decisions": _list_decisions,
+        "findings": _list_findings,
+        "requirements": _list_requirements,
+        "gates": _list_gates,
+        "repairs": _list_repairs,
     }[args.what]
     headers, rows, payload = handler(data, args)
     if args.limit:
@@ -341,9 +743,14 @@ def _list_tasks(data, args):
             {
                 "id": task_id,
                 "status": status,
+                # A reader filtering this listing almost always wants one or the
+                # other — the work, or the checks over it — and without `kind` the
+                # only way to tell them apart is the shape of the id.
+                "kind": task.get("kind", "task"),
                 "title": task["title"],
                 "milestone": task.get("milestone"),
                 "depends_on": task.get("depends_on", []),
+                "requirement_ids": task.get("requirement_ids", []),
                 "acceptances": counts,
             }
         )
@@ -420,6 +827,113 @@ def _list_decisions(data, args):
     return ["ID", "STATUS", "BY", "TITLE"], rows, list(items)
 
 
+def _list_findings(data, args):
+    """Everything wrong with the plan that anyone has recorded.
+
+    One ledger for writ's own checks and the gates' reports, because the reader's
+    question is "what is wrong with this plan", not "which component noticed".
+    """
+    items = plans.finding_records(data)
+    if args.status:
+        items = [item for item in items if item.get("disposition") == args.status]
+    if getattr(args, "open", False):
+        items = [item for item in items if item.get("disposition") == "open"]
+    if args.task:
+        items = [item for item in items if args.task in (item.get("where") or "")]
+    rows = [
+        [
+            render.mark("failed" if i.get("severity") == "error" else "blocked"),
+            i.get("id") or "-",
+            i.get("severity", ""),
+            i.get("disposition", ""),
+            i.get("where") or "-",
+            i.get("message", ""),
+        ]
+        for i in items
+    ]
+    return ["", "ID", "SEVERITY", "STATE", "WHERE", "FINDING"], rows, list(items)
+
+
+def _list_requirements(data, args):
+    """The inventory, with what covers each entry.
+
+    The coverage column is the point: a requirement with no task against it is the
+    hole this whole inventory exists to make visible, and a list that showed only
+    the text would hide it behind having been written down.
+    """
+    rows, payload = [], []
+    for entry in plans.coverage(data):
+        state_ = entry["state"]
+        if getattr(args, "uncovered", False) and state_ != "uncovered":
+            continue
+        if args.status and state_ != args.status:
+            continue
+        rows.append(
+            [
+                _COVERAGE_MARKS.get(state_, "?"),
+                entry["id"],
+                entry.get("priority", ""),
+                state_,
+                ",".join(entry.get("tasks", [])) or "-",
+                entry.get("text", ""),
+            ]
+        )
+        payload.append(entry)
+    return ["", "ID", "PRI", "COVERAGE", "TASKS", "REQUIREMENT"], rows, payload
+
+
+def _list_gates(data, args):
+    """The plan-level checks, and what each has decided so far."""
+    items = gates.gates(data)
+    rows, payload = [], []
+    held = orchestrator.held_gates(data)
+    for gate in items:
+        status = effective_status(data, gate)
+        if args.status and status != args.status:
+            continue
+        attempts = gates.attempts(gate)
+        last = attempts[-1] if attempts else {}
+        rows.append(
+            [
+                render.mark(status),
+                gate["id"],
+                gate.get("scope") or "-",
+                status,
+                last.get("decision") or "-",
+                str(len(attempts)),
+                held.get(gate["id"], "") or gate.get("title", ""),
+            ]
+        )
+        payload.append({**gate, "effective_status": status})
+    return ["", "ID", "SCOPE", "STATUS", "LAST", "RUNS", "NOTE"], rows, payload
+
+
+def _list_repairs(data, args):
+    """Every time a gate has asked for the plan to change, and what came of it."""
+    items = repair.requests(data)
+    if args.status:
+        items = [item for item in items if item.get("status") == args.status]
+    if args.task:
+        items = [item for item in items if item.get("gate") == args.task]
+    rows = [
+        [
+            i.get("id", ""),
+            i.get("gate", ""),
+            i.get("status", ""),
+            str(i.get("round", 1)),
+            str(len(i.get("refusals") or [])),
+            ",".join(i.get("findings") or []) or "-",
+            _first_line(i.get("summary", ""), 48),
+        ]
+        for i in items
+    ]
+    return (
+        ["ID", "GATE", "STATUS", "ROUND", "REFUSED", "FINDINGS", "SUMMARY"],
+        rows,
+        list(items),
+    )
+
+
 def cmd_show(args) -> None:
     """Show any one thing, whatever kind of id it is.
 
@@ -449,8 +963,110 @@ def cmd_show(args) -> None:
         ),
         "run": lambda: _render_run(item),
         "decision": lambda: _render_decision(item),
+        "finding": lambda: _render_finding(data, item),
+        "repair": lambda: _render_repair(data, item),
     }[kind]
     print(renderer())
+
+
+def _render_finding(data: dict[str, Any], record: dict[str, Any]) -> str:
+    """One finding: what was said, who said it, and what became of it."""
+    disposition = record.get("disposition", "open")
+    lines = [f"{record['id']} — {record.get('category', 'unspecified')}"]
+    lines.append(f"severity: {record.get('severity', 'warning')}")
+    lines.append(f"disposition: {disposition}")
+    lines.append(f"raised by: {record.get('source', 'writ')}")
+    if record.get("where"):
+        lines.append(f"about: {record['where']}")
+    if record.get("requirement_ids"):
+        lines.append(f"requirements: {', '.join(record['requirement_ids'])}")
+    if record.get("first_seen_at"):
+        lines.append(
+            f"first seen: {record['first_seen_at']} "
+            f"(revision {record.get('revision', '?')})"
+        )
+    if int(record.get("seen_count", 1)) > 1:
+        # A finding re-raised by later checks is one the plan keeps reproducing,
+        # which is worth more than the fact that it exists.
+        lines.append(
+            f"raised again since: {record['seen_count']} checks, last "
+            f"{record.get('seen_at', '')}"
+        )
+    lines.append(f"\n{record.get('message', '')}")
+    if record.get("suggested_action"):
+        lines.append(f"\nsuggested:\n{record['suggested_action']}")
+    if disposition != "open":
+        # How it was answered is the point of reading a closed finding. A plan that
+        # ran with a known objection is legible only if the reason it was overruled
+        # is here, next to the objection, rather than in an approval note somewhere.
+        who = record.get("disposed_by", "?")
+        when = record.get("disposed_at", "")
+        lines.append(f"\n{disposition} by {who}{f' ({when})' if when else ''}")
+        if record.get("reason"):
+            lines.append(f"reason: {record['reason']}")
+        if record.get("change"):
+            lines.append(f"change: {record['change']}")
+    asked = [
+        request
+        for request in repair.requests(data)
+        if record["id"] in (request.get("findings") or [])
+    ]
+    if asked:
+        listed = ", ".join(request["id"] for request in asked)
+        lines.append(f"\nrepair requested: {listed}   (writ show <id>)")
+    if disposition == "open" and record.get("severity") == "error":
+        # An open blocking finding is the reason a plan will not run, so the reader
+        # is here to decide what to do about it, not only to read it.
+        lines.append(
+            f"\nblocking. answer it, with a reason either way:"
+            f"\n  writ set {record['id']} accepted --reason ...   # stands, run anyway"
+            f"\n  writ set {record['id']} declined --reason ...   # the reviewer is wrong"
+        )
+    return "\n".join(lines)
+
+
+def _render_repair(data: dict[str, Any], record: dict[str, Any]) -> str:
+    """One repair request: what a gate asked for, and every answer it got.
+
+    The refusals are the substance when a gate is held as `repair-refused` — they
+    are why writ would not apply what the planner proposed, and a reader sent here
+    by that hold is here for exactly that.
+    """
+    lines = [f"{record['id']} — repair requested by {record.get('gate', '?')}"]
+    lines.append(f"status: {record.get('status', 'open')}")
+    lines.append(f"round: {record.get('round', 1)}")
+    lines.append(
+        f"opened: {record.get('opened_at', '')} by {record.get('opened_by', '?')}"
+    )
+    lines.append(f"plan revision when opened: {record.get('base_revision', '?')}")
+    if record.get("closed_at"):
+        lines.append(f"closed: {record['closed_at']}")
+    if record.get("findings"):
+        lines.append(f"findings to close: {', '.join(record['findings'])}")
+    if record.get("summary"):
+        lines.append(f"\nwhat the gate asked for:\n{record['summary']}")
+    if record.get("note"):
+        lines.append(f"\nnote:\n{record['note']}")
+    for number, refusal in enumerate(record.get("refusals") or [], start=1):
+        lines.append(
+            f"\nrefused patch {number} ({refusal.get('at', '')}, "
+            f"run {refusal.get('run', '?')}):"
+        )
+        for reason in refusal.get("reasons") or []:
+            lines.append(f"  · {reason.get('message', '')}")
+    for attempt in record.get("attempts") or []:
+        lines.append(
+            f"\napplied {attempt.get('at', '')}: "
+            f"{_first_line(str(attempt.get('summary', '')), 64)}"
+        )
+    gate = data["tasks"].get(record.get("gate", ""))
+    if gate is not None and gate.get("held"):
+        held = gate["held"]
+        lines.append(
+            f"\n{gate['id']} is held ({held.get('reason', '')}) and will not "
+            f"re-run until a human moves it."
+        )
+    return "\n".join(lines)
 
 
 def _run_prompt(run: dict[str, Any]) -> str:
@@ -999,18 +1615,24 @@ def _dot_escape(text: str) -> str:
 def cmd_set(args) -> None:
     """Set a status on whatever the id points at.
 
-    Tasks and decisions both have statuses a human may legitimately move, and
-    which one you meant is already in the id, so one verb covers both.
+    Tasks, decisions and findings all have a state a human may legitimately move,
+    and which one you meant is already in the id, so one verb covers all three.
+    What each of them refuses to accept differs, and says something about where
+    authority sits: a task cannot be set `completed` (the reviewer judges that), and
+    a finding cannot be set `resolved` (a check or a gate demonstrates that).
     """
     with state.transaction(args.root) as data:
         kind, _ = find(data, args.id)
         if kind == "decision":
             _set_decision(args, data)
             return
+        if kind == "finding":
+            _set_finding(args, data)
+            return
         if kind != "task":
             raise WritError(
-                f"{args.id} is a {kind}; only tasks and decisions have a "
-                "status you can set"
+                f"{args.id} is a {kind}; only tasks, decisions and findings have "
+                "a status you can set"
             )
         if args.status not in SETTABLE_STATUSES:
             raise WritError(
@@ -1021,6 +1643,60 @@ def cmd_set(args) -> None:
             data, args.id, args.status, evidence=args.evidence, force=args.force
         )
     print(f"{args.id} -> {args.status}")
+
+
+def _set_finding(args, data) -> None:
+    """Dispose of one finding, rather than accepting every one of them.
+
+    `writ approve --force` is the wholesale lever: it accepts every open finding
+    under a single reason. That is the wrong instrument for disagreeing with one
+    finding, because it also silently accepts the ones the reader never looked at.
+    Here each finding gets its own answer and its own reason, which is what makes
+    the ledger an audit trail instead of a list that was once overruled in bulk.
+    """
+    if args.status not in plans.SETTABLE_DISPOSITIONS:
+        if args.status == "resolved":
+            raise WritError(
+                f"{args.id} cannot be set resolved by hand: a finding resolves when "
+                "a check or a gate demonstrates the outcome it asked for. To let the "
+                "plan proceed with this finding standing, accept it."
+            )
+        raise WritError(
+            f"{args.status!r} is not a finding disposition "
+            f"(findings accept {', '.join(plans.SETTABLE_DISPOSITIONS)})"
+        )
+    if not args.reason:
+        # Both answers need one. An accepted finding without a reason is the
+        # silent ignoring the report is against, and a declined one without a
+        # reason is an assertion that the reviewer was wrong, unargued.
+        verb = {"accepted": "accept", "declined": "decline"}[args.status]
+        raise WritError(
+            f"--reason is required to {verb} a finding: say why {args.id} "
+            "does not block the plan"
+        )
+    record = plans.dispose(
+        data,
+        args.id,
+        args.status,
+        actor=getattr(args, "by", None) or "operator",
+        reason=args.reason,
+        change=args.evidence or "",
+    )
+    print(f"{record['id']} {args.status}: {_first_line(record.get('message', ''), 64)}")
+    print(f"reason: {record['reason']}")
+    blocking = [
+        finding
+        for finding in plans.findings(data, open_only=True)
+        if finding.severity == "error"
+    ]
+    if blocking:
+        listed = ", ".join(finding.id for finding in blocking)
+        print(f"still blocking: {listed}")
+    elif not plans.runnable(data):
+        # Disposing of the last blocker does not itself approve the plan. The
+        # status comes from a check, so point at the one that will grant it rather
+        # than leaving the reader to guess why `writ run` still refuses.
+        print("no blocking findings left — next: writ check")
 
 
 def _set_decision(args, data) -> None:
@@ -1458,6 +2134,21 @@ def cmd_run(args) -> int:
     if args.dry_run:
         return _run_preview(data, args)
 
+    # An unapproved plan does not execute. Checked before the session is claimed
+    # and before anything is reaped, so a project held at `needs-approval` reads
+    # as a plan waiting for review rather than as a run that failed.
+    if not plans.runnable(data):
+        message = plans.not_runnable_message(data)
+        if not data.get("tasks"):
+            # An empty project is not a refusal, it is an empty project. Exit 0
+            # with the next command, the same as a project with nothing ready.
+            if args.json:
+                render.emit_json({"event": "idle", "reason": message})
+            else:
+                print(message)
+            return 0
+        raise WritError(message)
+
     existing = orchestrator.active_session(root)
     if existing and not args.force:
         raise WritError(
@@ -1586,6 +2277,16 @@ def _nothing_to_run(data) -> str:
         return "no tasks (run `writ plan <doc>` first)"
     if all(task["status"] == "completed" for task in tasks.values()):
         return "every task is complete"
+    held = orchestrator.held_gates(data)
+    if held:
+        # A held gate is the commonest reason a project with unfinished tasks has
+        # nothing to run, and it is the one the old message described worst: the
+        # work is not failed, it is waiting, and what it waits for is named here.
+        listed = ", ".join(f"{gate} ({reason})" for gate, reason in sorted(held.items()))
+        return (
+            f"nothing can start: {listed}. See `writ list gates` and "
+            "`writ list repairs`"
+        )
     stalled = orchestrator._stalled(data)
     if stalled:
         return (

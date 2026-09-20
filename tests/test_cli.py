@@ -10,9 +10,33 @@ def test_init_then_plan_builds_the_dag(writ, design):
 
     code, out, _ = writ("--json", "list")
     tasks = json.loads(out)
-    assert [t["id"] for t in tasks] == ["M01-001", "M02-001", "M02-002", "M03-001"]
-    assert tasks[0]["depends_on"] == []
-    assert tasks[1]["depends_on"] == ["M01-001"]
+    # Gates are part of the graph, so they are in the listing. The implementation
+    # tasks are the four the design stated; the rest are the plan-level checks.
+    assert [t["id"] for t in tasks if t["kind"] == "task"] == [
+        "M01-001", "M02-001", "M02-002", "M03-001"
+    ]
+    assert [t["id"] for t in tasks if t["kind"] == "gate"] == [
+        "G-FINAL", "G-M01", "G-M02", "G-M03"
+    ]
+    # No implicit chain: a task depends on what the plan said it depends on, which
+    # for an extracted plan is nothing.
+    assert all(t["depends_on"] == [] for t in tasks if t["kind"] == "task")
+
+
+def test_chain_restores_the_implicit_milestone_order(writ, design):
+    writ("init")
+    writ("plan", str(design), "--extract", "--chain")
+    _, out, _ = writ("--json", "list")
+    tasks = {t["id"]: t for t in json.loads(out)}
+    assert tasks["M01-001"]["depends_on"] == []
+    assert tasks["M02-001"]["depends_on"] == ["M01-001"]
+
+
+def test_gates_can_be_left_out(writ, design):
+    writ("init")
+    writ("plan", str(design), "--extract", "--no-gates")
+    _, out, _ = writ("--json", "list", "gates")
+    assert json.loads(out) == []
 
 
 def test_plan_dry_run_writes_nothing(writ, design):
@@ -43,8 +67,9 @@ def test_plan_append_extends_numbering(writ, design):
 
 
 def test_plan_parallel_leaves_tasks_independent(writ, design):
+    """`--parallel` is now the default, and still parses for anyone passing it."""
     writ("init")
-    writ("plan", str(design), "--extract", "--parallel")
+    writ("plan", str(design), "--extract", "--parallel", "--no-gates")
     _, out, _ = writ("--json", "list")
     assert all(t["depends_on"] == [] for t in json.loads(out))
 

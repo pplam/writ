@@ -84,8 +84,23 @@ def empty_state() -> dict[str, Any]:
         "tasks": {},
         "runs": {},
         "plans": [],
+        # what the design asks for, keyed by requirement id, and the plan-level
+        # record of whether the graph covering it has been reviewed. Tasks are
+        # the work; these two are what the work is answerable to.
+        "requirements": {},
+        "plan": {
+            "status": "draft",
+            "revision": 0,
+            "checked_at": None,
+            "approved_at": None,
+            "approved_by": None,
+            "approval_note": None,
+            "forced": False,
+        },
+        "findings": [],
+        "repairs": [],
         "decisions": [],
-        "counters": {"decision": 0},
+        "counters": {"decision": 0, "finding": 0, "repair": 0, "gate": 0},
     }
 
 
@@ -123,7 +138,32 @@ def load(root: str | os.PathLike[str]) -> dict[str, Any]:
             f"state schema {version!r} is not supported by this Writ build "
             f"(expected {SCHEMA_VERSION})"
         )
+    # Defaults rather than a schema bump: every one of these is additive, and a
+    # project planned by an older Writ stays readable and runnable without a
+    # migration step that could fail halfway.
     data.setdefault("plans", [])
+    data.setdefault("requirements", {})
+    data.setdefault("findings", [])
+    data.setdefault("repairs", [])
+    data.setdefault(
+        "plan",
+        {
+            "status": "draft",
+            "revision": 0,
+            "checked_at": None,
+            "approved_at": None,
+            "approved_by": None,
+            "approval_note": None,
+            "forced": False,
+        },
+    )
+    for task in data.get("tasks", {}).values():
+        # Every task written before gates existed is implementation work. Defaulted
+        # here rather than at each read so that `kind` is something callers can rely
+        # on being present, which is what makes `task["kind"] == "gate"` safe to
+        # write anywhere in the codebase.
+        task.setdefault("kind", "task")
+        task.setdefault("requirement_ids", [])
     return data
 
 

@@ -109,12 +109,78 @@ export function renderTaskDetail(
     // four other sections, while Dependencies showed everything satisfied — so the
     // page looked like writ had stopped for no reason it could name.
     blockedSection(task),
+    // A held gate reads as `blocked` and has no unmet dependency, so without this
+    // the page shows a stopped project with nothing saying why. Above the criteria
+    // for the same reason `blockedSection` is: it is the only question being asked.
+    heldSection(task),
     acceptanceSection(task),
+    gateSection(task),
     task.notes ? section('Notes', null, el('p', { class: 'prose' }, task.notes)) : null,
     dependencySection(task),
     guardrailSection(task),
     runSection(task, handlers),
     evidenceSection(task),
+  );
+}
+
+/**
+ * Why a gate is parked, and what would move it.
+ *
+ * Distinct from `blockedSection`, which reports an agent's own account of what
+ * stopped it. This is writ declining to spend more agents: the repair loop is out
+ * of rounds, or the gate asked a question only a person can answer. The remedy is
+ * never "wait" — it is reading the record named here.
+ */
+function heldSection(task: Task): HTMLElement | null {
+  const held = task.held;
+  if (!held) return null;
+  const advice: Record<string, string> = {
+    'awaiting-repair': 'A repair is being planned. The gate will be asked again on the repaired code.',
+    'needs-decision': 'The gate asked something only a person can settle. Rule on it in the decision log.',
+    'repair-exhausted': 'The repair loop ran out of rounds. What is wrong is the plan, not the wording of a patch.',
+    'repair-refused': 'Writ turned down every patch the planner proposed. Read the refusals before re-planning.',
+  };
+  return section(
+    'Held',
+    held.at ? ago(held.at) : null,
+    el('div', { class: 'meta-row' }, el('span', { class: 'pill needs-repair' }, held.reason)),
+    el('p', { class: 'prose' }, advice[held.reason] ?? 'This gate will not re-run on its own.'),
+    held.detail ? el('p', { class: 'prose' }, held.detail) : null,
+    held.questions?.length
+      ? el('ul', { class: 'held-questions' }, ...held.questions.map((q) => el('li', {}, q)))
+      : null,
+    held.request ? el('pre', { class: 'command' }, `writ show ${held.request}`) : null,
+  );
+}
+
+/**
+ * What a gate has decided, oldest first.
+ *
+ * A gate is asked again after every repair, so its history is the record of the
+ * plan converging — or not. Read in order it says whether each round closed
+ * something or found the same thing again, which one attempt cannot say.
+ */
+function gateSection(task: Task): HTMLElement | null {
+  if (task.kind !== 'gate' || !task.gate_attempts.length) return null;
+  return section(
+    'Gate reviews',
+    String(task.gate_attempts.length),
+    el('ol', { class: 'gate-attempts' }, ...task.gate_attempts.map((attempt) => el(
+      'li',
+      { class: classes('gate-attempt', attempt.decision) },
+      el(
+        'div',
+        { class: 'meta-row' },
+        el('span', { class: classes('pill', attempt.decision) }, attempt.decision),
+        el('span', { class: 'muted small' }, `revision ${attempt.revision}`),
+        attempt.actor ? el('span', { class: 'muted small' }, attempt.actor) : null,
+        attempt.at ? el('span', { class: 'muted small', title: attempt.at }, ago(attempt.at)) : null,
+      ),
+      attempt.summary ? el('p', { class: 'prose' }, attempt.summary) : null,
+      attempt.findings.length
+        ? el('div', { class: 'meta-row' }, el('span', {}, 'raised '), ...attempt.findings.map(code))
+        : null,
+    ))),
   );
 }
 

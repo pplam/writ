@@ -60,6 +60,10 @@ export interface TaskRow {
   milestone: string;
   status: TaskStatus;
   stored_status: TaskStatus;
+  /** `gate` nodes review an integrated outcome and write no code. */
+  kind: 'task' | 'gate';
+  /** Requirement ids from the plan's inventory that this node answers for. */
+  requirement_ids: string[];
   passed: number;
   total: number;
   depends_on: string[];
@@ -137,6 +141,98 @@ export interface Task extends TaskRow {
   run_list: RunRow[];
   created_at: string;
   updated_at: string;
+  /** A gate's review history. Empty on an implementation task. */
+  gate_attempts: GateAttempt[];
+  /** Why a gate is waiting rather than deciding. Null unless it is held. */
+  held: GateHold | null;
+}
+
+export interface GateAttempt {
+  at: string;
+  decision: 'pass' | 'needs-repair' | 'needs-decision';
+  actor: string;
+  summary: string;
+  /** Finding ids this review recorded. */
+  findings: string[];
+  /** The plan revision the reviewed code belonged to. */
+  revision: number;
+}
+
+export interface GateHold {
+  reason: 'awaiting-repair' | 'needs-decision' | 'repair-exhausted' | 'repair-refused';
+  at: string;
+  request?: string;
+  detail?: string;
+  questions?: string[];
+}
+
+/** Where the plan stands as a reviewed artifact, not as a set of tasks. */
+export interface Plan {
+  status: 'draft' | 'needs-approval' | 'approved' | 'executing' | 'complete';
+  revision: number;
+  approved_by: string;
+  approved_at: string;
+  approval_note: string;
+  /** Approved with blocking findings outstanding, on the record. */
+  forced: boolean;
+  runnable: boolean;
+  blocking: number;
+  advisory: number;
+  requirements: number;
+  uncovered: string[];
+  open_repairs: string[];
+  held_gates: HeldGate[];
+}
+
+export interface HeldGate {
+  id: string;
+  reason: string;
+}
+
+/** One objection to the plan, from writ's own checks or from a gate. */
+export interface Finding {
+  id: string;
+  severity: 'error' | 'warning' | 'note';
+  category: string;
+  message: string;
+  where: string;
+  suggested_action: string;
+  requirement_ids: string[];
+  /** `writ`, `plan`, or `gate:<id>`. */
+  source: string;
+  disposition: 'open' | 'accepted' | 'declined' | 'resolved';
+  reason: string;
+  change: string;
+  first_seen_at: string;
+}
+
+/** One requirement and what covers it, derived from the current graph. */
+export interface Coverage {
+  id: string;
+  text: string;
+  priority: 'must' | 'should' | 'may';
+  declared: 'planned' | 'existing' | 'out-of-scope' | 'deferred';
+  source: string;
+  evidence: string;
+  reason: string;
+  tasks: string[];
+  gates: string[];
+  state: string;
+  complete: number;
+}
+
+/** A gate's request for the plan to change, and what came of it. */
+export interface Repair {
+  id: string;
+  gate: string;
+  status: string;
+  round: number;
+  summary: string;
+  findings: string[];
+  applied_tasks: string[];
+  /** Patches writ turned down for this request. */
+  refusals: number;
+  opened_at: string;
 }
 
 export interface RunRow {
@@ -249,6 +345,7 @@ export interface Overview {
   active_runs: RunRow[];
   proposed_decisions: number;
   throughput: Throughput;
+  plan: Plan;
 }
 
 /** Everything the server pushes, and everything the app renders from. */
@@ -260,5 +357,8 @@ export interface Snapshot {
   decisions: Decision[];
   graph: Graph;
   activity: ActivityEvent[];
+  findings: Finding[];
+  coverage: Coverage[];
+  repairs: Repair[];
   generated_at: string;
 }

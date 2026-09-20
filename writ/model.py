@@ -5,6 +5,9 @@ from typing import Any, Iterable
 
 from .state import WritError, utcnow
 
+#: what a node in the graph is. See `add_task`.
+TASK_KINDS = ("task", "gate")
+
 TASK_STATUSES = (
     "planned",
     "ready",
@@ -77,13 +80,22 @@ def get_milestone(data: dict[str, Any], milestone_id: str) -> dict[str, Any]:
     return milestone
 
 
+#: every kind of id `find` resolves, for the error when it resolves none of them.
+FINDABLE = "task, milestone, run, decision, finding, or repair request"
+
+
 def find(data: dict[str, Any], item_id: str) -> tuple[str, dict[str, Any]]:
-    """Resolve an id of any kind: task, milestone, run, or decision.
+    """Resolve an id of any kind.
 
     Ids are distinguishable by shape (`M01`, `M01-001`, `M01-001-<stamp>`,
-    `D-0001`), so the caller does not have to say which kind it holds. Checked
-    most-specific first: a run id starts with its task id, so tasks would
-    otherwise shadow it.
+    `D-0001`, `F-0001`, `RR-0001`), so the caller does not have to say which kind
+    it holds. Checked most-specific first: a run id starts with its task id, so
+    tasks would otherwise shadow it.
+
+    Findings and repair requests are in here because writ sends people to them by
+    id — a held gate's evidence says `writ show RR-0001`, and a blocking finding is
+    reported as `F-0004`. An id writ prints as the place to look has to be an id
+    writ can look up.
     """
     if item_id in data["tasks"]:
         return "task", data["tasks"][item_id]
@@ -94,7 +106,13 @@ def find(data: dict[str, Any], item_id: str) -> tuple[str, dict[str, Any]]:
     for record in data.get("decisions", []):
         if record["id"] == item_id:
             return "decision", record
-    raise WritError(f"unknown id: {item_id} (not a task, milestone, run, or decision)")
+    for record in data.get("findings", []):
+        if record.get("id") == item_id:
+            return "finding", record
+    for record in data.get("repairs", []):
+        if record.get("id") == item_id:
+            return "repair", record
+    raise WritError(f"unknown id: {item_id} (not a {FINDABLE})")
 
 
 def blocking_dependencies(data: dict[str, Any], task: dict[str, Any]) -> list[str]:
@@ -351,6 +369,10 @@ def add_task(
     forbidden: Iterable[str] = (),
     design_section: str | None = None,
     design_doc: str | None = None,
+    requirement_ids: Iterable[str] = (),
+    kind: str = "task",
+    scope: str | None = None,
+    notes: str = "",
 ) -> dict[str, Any]:
     if task_id in data["tasks"]:
         raise WritError(f"task {task_id} already exists")
@@ -360,11 +382,23 @@ def add_task(
     for dep in deps:
         if dep not in data["tasks"]:
             raise WritError(f"unknown dependency: {dep}")
+    if kind not in TASK_KINDS:
+        raise WritError(
+            f"unknown task kind {kind!r}; choose from {', '.join(TASK_KINDS)}"
+        )
     task = {
         "id": task_id,
         "title": title,
         "milestone": milestone,
         "status": "planned",
+        # `task` is implementation work; `gate` is a review of an integrated
+        # outcome that writes no code. Both live in `tasks` because both are
+        # nodes the same scheduler walks and the same dependency rules order —
+        # see writ/gates.py for why that is the whole trick.
+        "kind": kind,
+        "scope": scope,
+        "notes": notes,
+        "requirement_ids": list(requirement_ids),
         "depends_on": deps,
         "acceptances": [
             {"text": text, "status": "pending"} for text in acceptances

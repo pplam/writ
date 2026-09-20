@@ -67,8 +67,34 @@ def writ(project: Path):
     return invoke
 
 
+#: the flags that reproduce writ's older planning contract.
+#:
+#: `--chain` puts the implicit milestone-to-milestone edges back, and `--no-gates`
+#: leaves the plan-level checks out. Tests about graph shape, dispatch order and
+#: the read model want a graph with depth and nothing else in it; naming the flags
+#: here means the reason appears once instead of in forty call sites.
+LEGACY_PLAN = ("--extract", "--chain", "--no-gates")
+
+
 @pytest.fixture
 def planned(writ, design: Path):
+    """A plan under writ's older contract: chained milestones, no gates.
+
+    Pinned deliberately. Most tests that use this fixture are about something
+    else — graph rendering, dispatch, the API — and they need *a* graph with
+    depth in it, not today's defaults. Both flags are still supported paths, so
+    keeping the fixture here keeps them covered while the tests that are actually
+    about the current defaults say so themselves (`approved`, below, and
+    tests/test_gates.py).
+    """
+    writ("init")
+    writ("plan", str(design), *LEGACY_PLAN)
+    return writ
+
+
+@pytest.fixture
+def approved(writ, design: Path):
+    """A plan as `writ plan` builds one now: stated edges only, gates installed."""
     writ("init")
     writ("plan", str(design), "--extract")
     return writ

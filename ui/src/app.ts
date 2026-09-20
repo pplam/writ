@@ -18,10 +18,11 @@ import { renderDecisions } from './views/decisions.js';
 import { fitTitles, renderGraph } from './views/graph.js';
 import { renderMilestones } from './views/milestones.js';
 import { renderOverview } from './views/overview.js';
+import { FINDING_FILTERS, renderPlan } from './views/plan.js';
 import { renderRunDetail, renderRunList, RUN_FILTERS } from './views/runs.js';
 import { FILTERS, renderTaskDetail, renderTaskList } from './views/tasks.js';
 
-type ViewName = 'overview' | 'graph' | 'tasks' | 'milestones' | 'runs' | 'decisions';
+type ViewName = 'overview' | 'plan' | 'graph' | 'tasks' | 'milestones' | 'runs' | 'decisions';
 
 /**
  * Whether a click that landed outside the drawer should dismiss it.
@@ -67,6 +68,7 @@ export function dismissesOnFocus(context: {
 
 const VIEWS: { name: ViewName; label: string }[] = [
   { name: 'overview', label: 'Overview' },
+  { name: 'plan', label: 'Plan' },
   { name: 'graph', label: 'Graph' },
   { name: 'tasks', label: 'Tasks' },
   { name: 'milestones', label: 'Milestones' },
@@ -85,6 +87,9 @@ class App {
   private route: Route = { view: 'overview' };
   private taskFilter = 'all';
   private runFilter = 'all';
+  // Findings default to `open`: the ones already answered are history, and the
+  // question this view exists to answer is what stands against the plan now.
+  private findingFilter = 'open';
   private query = '';
 
   private nav = el('nav', { class: 'tabs', role: 'tablist' });
@@ -403,6 +408,29 @@ class App {
             el('span', { class: 'muted small' }, `${plural(snapshot.runs.length, 'run')}, newest first`),
           ),
           list,
+        );
+        break;
+      }
+      case 'plan': {
+        const holder = el('div', { class: 'grid one' });
+        renderPlan(
+          holder,
+          snapshot.overview.plan,
+          snapshot.findings,
+          snapshot.coverage,
+          snapshot.repairs,
+          { filter: this.findingFilter },
+          { onTask: handlers.onTask },
+        );
+        this.body.replaceChildren(
+          this.toolbar(
+            this.filterBar(Object.keys(FINDING_FILTERS), this.findingFilter, (name) => {
+              this.findingFilter = name;
+              this.render();
+            }),
+            el('span', { class: 'muted small' }, `revision ${snapshot.overview.plan.revision}`),
+          ),
+          holder,
         );
         break;
       }
