@@ -458,6 +458,7 @@ def run(
     model: str | None,
     reviewer: str | None = None,
     reviewer_model: str | None = None,
+    reviewer_timeout: int | None = None,
     parallel: int = 1,
     max_tasks: int | None = None,
     order: str = DEFAULT_ORDER,
@@ -516,6 +517,7 @@ def run(
                         model=model,
                         reviewer=reviewer,
                         reviewer_model=reviewer_model,
+                        reviewer_timeout=reviewer_timeout,
                         timeout=timeout,
                         cwd=cwd,
                         agent_args=agent_args or [],
@@ -601,6 +603,7 @@ def _prepare(
     model: str | None,
     reviewer: str | None,
     reviewer_model: str | None,
+    reviewer_timeout: int | None,
     timeout: int | None,
     cwd: str | None,
     agent_args: list[str],
@@ -608,23 +611,27 @@ def _prepare(
 ) -> tuple[str, agents.ResolvedAgent]:
     """Claim the task by marking it running, and write its prompt.
 
-    `--reviewer-model` applies whether or not `--reviewer` was given, so that
-    review can use a different model of the same agent. Without a reviewer model
-    the review falls back to the implementation model.
+    The reviewer's command, model and timeout each apply whether or not the others
+    were given, so review can be a different model of the same agent, or the same
+    agent on a longer leash. Each one falls back to the implementation setting,
+    which is the convenient default and the weaker one — a model checking its own
+    work agrees with itself more than it should.
     """
     if job.role == "reviewer":
         command = reviewer or agent
         chosen_model = reviewer_model or model
+        chosen_timeout = reviewer_timeout if reviewer_timeout is not None else timeout
     else:
         command = agent
         chosen_model = model
+        chosen_timeout = timeout
     run_id, _, _, resolved = runner.prepare(
         root,
         job.task_id,
         command,
         agent_args if job.role == "agent" else [],
         model=chosen_model,
-        timeout=timeout,
+        timeout=chosen_timeout,
         cwd=cwd,
         force=False,
         role=job.role,

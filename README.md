@@ -25,7 +25,7 @@ start a plan nobody has signed off.
 
 **Contents** — [Install](#install) · [Quick start](#quick-start) ·
 [Storage](#storage) · [Planning](#planning) · [Task lifecycle](#task-lifecycle) ·
-[Commands](#commands) · [Watching it work](#watching-it-work) ·
+[Configuration](#configuration) · [Commands](#commands) · [Watching it work](#watching-it-work) ·
 [Running the whole graph](#running-the-whole-graph) · [Dispatch](#dispatch) ·
 [Agent invocation](#agent-invocation) · [Tests](#tests)
 
@@ -83,6 +83,8 @@ writ review M01-001 --agent codex      # a different agent checks the claim
   state.json          the whole project: the plan and its status, requirements,
                       milestones, tasks and gates, runs, findings, repair
                       requests, decisions
+  config.json         your defaults: which agent fills each role, and how
+                      `writ run` behaves. Optional, and writ never writes it
   decisions.md        human-readable mirror of the decision log
   run.session         the pid of the active `writ run`, if any
   plans/<plan-id>/
@@ -561,6 +563,88 @@ writ override M01-001 completed --reason "verified on staging" --accept 1 --acce
 writ override M01-002 failed --reason "criterion 2 regressed" --accept 2=failed
 ```
 
+## Configuration
+
+Every agent and model writ uses can be given on the command line, and the ones
+that matter are the ones easiest to forget. `--reviewer` above all: leave it off
+and the review runs on the model that wrote the code.
+
+So a project can write its choices down once, in `.writ/config.json`:
+
+```json
+{
+  "agents": {
+    "planner":     {"command": "claude", "model": "opus", "timeout": 1800},
+    "critic":      {"command": "codex",  "model": "gpt-5-codex"},
+    "implementer": {"command": "claude", "model": "sonnet"},
+    "reviewer":    {"command": "codex",  "model": "gpt-5-codex"}
+  },
+  "run": {"parallel": 3, "order": "depth", "max_rework": 2}
+}
+```
+
+Then `writ run` with no flags uses all of it. `config.example.json` in this
+repository is the same thing with every option commented; copy it across and
+edit.
+
+Four roles, because that is how many writ actually distinguishes:
+
+| role | used by | falls back to |
+|---|---|---|
+| `planner` | `writ plan` | `pi` |
+| `critic` | `writ critique`, `writ plan --critics` | the planning agent |
+| `implementer` | `writ run`, `writ dispatch`, **and gates and repair planners** | `pi` |
+| `reviewer` | `writ review`, `writ run` | the implementing agent |
+
+Each takes `command`, `model`, and `timeout`. Under `run`: `parallel`, `order`,
+and `max_rework`, which `writ review` honours too since it is the same budget.
+
+Note where gates sit. A gate judges whether integrated work adds up, which is a
+review, but it runs on the implementing agent — so the model that wrote the code
+is the one asked whether the milestone holds. Pass `--reviewer` and it still only
+affects task review. Worth knowing until it is worth changing.
+
+**A flag always wins.** The config says what this project decided; a flag says
+what you are doing right now. `writ agents` prints what is in effect:
+
+```
+ROLE         COMMAND                   MODEL        TIMEOUT
+-----------  ------------------------  -----------  -------
+planner      claude                    opus         1800
+critic       codex                     gpt-5-codex  -
+implementer  claude                    sonnet       -
+reviewer     codex                     gpt-5-codex  1800
+
+from .writ/config.json; a flag overrides any of it
+```
+
+**An unknown key is an error, not a shrug.** A config is hand-edited, so a typo
+in one is as likely as a typo in a flag — and a silently ignored `"reviewr"` would
+leave review running on the implementing model while the file on disk says it does
+not. So it is refused, with the name it was probably reaching for:
+
+```
+writ: .writ/config.json: unknown role 'reviewr' (did you mean 'reviewer'?);
+known roles: planner, critic, implementer, reviewer
+```
+
+That happens before any agent starts, not three tasks into a run.
+
+Any key beginning with `_` is a comment, since JSON has nowhere else to put one —
+useful for the reason behind a choice, which outlives the choice:
+
+```json
+{"agents": {
+  "_reviewer": "codex caught the seam bugs claude kept missing",
+  "reviewer": {"command": "codex"}
+}}
+```
+
+Writ does not write this file. `writ init` does not create one and `init --force`
+does not delete it: it says how this project runs agents, which is still true of
+the next plan written in it. Note that `.writ/` is usually gitignored, so this is
+a per-checkout file rather than a shared one.
+
 ## Commands
 
 Twenty commands, organized by what you are doing rather than what type it
@@ -600,7 +684,7 @@ operates on.
 
 | Command | Purpose |
 |---|---|
-| `writ run [--parallel N] [--order id\|depth\|unlocks] [--max-tasks N] [--max-rework N] [--agent CMD] [--model M] [--reviewer CMD] [--reviewer-model M] [--timeout S] [--cwd D] [--force] [--quiet] [--dry-run]` | walk the whole graph until it is done or stuck |
+| `writ run [--parallel N] [--order id\|depth\|unlocks] [--max-tasks N] [--max-rework N] [--agent CMD] [--model M] [--reviewer CMD] [--reviewer-model M] [--reviewer-timeout S] [--timeout S] [--cwd D] [--force] [--quiet] [--dry-run]` | walk the whole graph until it is done or stuck |
 | `writ dispatch <id> [--agent CMD] [--model M] [--detach] [--force] [--timeout S] [--cwd D] [--quiet] [--dry-run] [-- args]` | an agent implements the task and reports a verdict |
 | `writ review [id] [--agent CMD] [--model M] [--timeout S] [--cwd D] [--max-rework N] [--force] [--quiet] [--dry-run]` | a second agent verifies and signs off; no id reviews all awaiting |
 | `writ cancel [run-id]` | stop a run, or reap dead ones when given no id |
@@ -921,6 +1005,10 @@ writ run --parallel 3 \
 
 `--reviewer` defaults to `--agent`, which is convenient and weaker: a model
 checking its own work agrees with itself more than it should.
+`--reviewer-model` and `--reviewer-timeout` each apply whether or not `--reviewer`
+was given, so review can be a different model of the same agent, or the same agent
+on a longer leash. Set them once in
+[`.writ/config.json`](#configuration) rather than on every invocation.
 
 ### How a task reaches an agent
 
@@ -1399,5 +1487,5 @@ checking.
 uv run --with pytest python -m pytest
 ```
 
-694 tests, hermetic — the "agents" under test are short `python -c` commands, so
+723 tests, hermetic — the "agents" under test are short `python -c` commands, so
 nothing touches the network.

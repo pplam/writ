@@ -28,7 +28,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import commands, critics
+from . import commands, config, critics
 from .server import DEFAULT_PORT
 from .decisions import SETTABLE_DECISION_STATUSES
 from .model import DEFAULT_MAX_REWORK, JUDGED_STATUSES, SETTABLE_STATUSES
@@ -66,6 +66,11 @@ ids are resolved by shape, so one command serves every kind of thing:
   writ show RR-0001      one repair request, and every patch writ refused
 
 every command accepts --root <project> and --json.
+
+defaults marked `agents.x` or `run.x` come from <root>/.writ/config.json, so a
+project's planner, reviewer and parallelism are chosen once rather than retyped.
+A flag always overrides it; `writ agents` prints what is in effect. The repository
+ships a commented config.example.json.
 """
 
 
@@ -111,7 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("design", help="path to a markdown design document")
     p.add_argument(
-        "--agent", default="pi", help="planning agent command (default: pi)"
+        "--agent", help="planning agent command (default: agents.planner, else pi)"
     )
     p.add_argument(
         "--model",
@@ -122,7 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="extra guidance for the planning agent (scope, priorities, constraints)",
     )
     p.add_argument(
-        "--timeout", type=int, default=1800, help="seconds before the planner is killed"
+        "--timeout", type=int, help="seconds before the planner is killed"
     )
     p.add_argument("--cwd", help="working directory for the agent (default: --root)")
     p.add_argument(
@@ -220,11 +225,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="have independent critics read the plan and report findings",
     )
     p.add_argument(
-        "--agent", default="pi", help="critic agent command (default: pi)"
+        "--agent",
+        help="critic agent command (default: agents.critic, else the planner)",
     )
     p.add_argument("--model", help="model for the critic agents")
     p.add_argument(
-        "--timeout", type=int, default=1800, help="seconds before a critic is killed"
+        "--timeout", type=int, help="seconds before a critic is killed"
     )
     p.add_argument("--cwd", help="working directory for the agent (default: --root)")
     p.add_argument(
@@ -482,9 +488,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("id", nargs="?", help="task to review (default: all awaiting)")
-    p.add_argument("--agent", default="pi", help="reviewer command (default: pi)")
+    p.add_argument(
+        "--agent", help="reviewer command (default: agents.reviewer, else pi)"
+    )
     p.add_argument("--model", help="model for the reviewer")
-    p.add_argument("--timeout", type=int, default=1800, help="seconds before kill")
+    p.add_argument("--timeout", type=int, help="seconds before kill")
     p.add_argument("--cwd", help="directory to run the reviewer in")
     p.add_argument(
         "--force", action="store_true", help="review a task that is not awaiting review"
@@ -496,7 +504,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-rework",
         type=int,
-        default=DEFAULT_MAX_REWORK,
         metavar="N",
         help=(
             f"times a rejected task is re-dispatched with the review attached "
@@ -565,7 +572,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--parallel",
         "-p",
         type=int,
-        default=1,
         metavar="N",
         help="agents to run at once (default: 1)",
     )
@@ -579,7 +585,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-rework",
         type=int,
-        default=DEFAULT_MAX_REWORK,
         metavar="N",
         help=(
             f"times a rejected task is re-dispatched with the review attached "
@@ -590,20 +595,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--order",
         choices=ORDERS,
-        default=DEFAULT_ORDER,
         help=(
             "which ready task to start first: id follows the plan's numbering "
             "(default), depth prefers the longest remaining chain, unlocks "
             "prefers the task the most others wait on"
         ),
     )
-    p.add_argument("--agent", default="pi", help="agent command (default: pi)")
+    p.add_argument(
+        "--agent", help="agent command (default: agents.implementer, else pi)"
+    )
     p.add_argument("--model", help="model for the implementing agent")
     p.add_argument(
         "--reviewer",
-        help="reviewer command (default: --agent), so review can be independent",
+        help=(
+            "reviewer command (default: agents.reviewer, else --agent), so review "
+            "can be independent"
+        ),
     )
     p.add_argument("--reviewer-model", help="model for the reviewer")
+    p.add_argument(
+        "--reviewer-timeout",
+        type=int,
+        metavar="S",
+        help="seconds before killing a reviewer (default: --timeout)",
+    )
     p.add_argument(
         "--timeout", type=int, default=None, help="seconds before killing an agent"
     )
@@ -623,7 +638,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("dispatch", help="hand one task to a coding agent")
     p.add_argument("id")
-    p.add_argument("--agent", default="pi", help="agent command (default: pi)")
+    p.add_argument(
+        "--agent", help="agent command (default: agents.implementer, else pi)"
+    )
     p.add_argument(
         "--model", help="model for the agent (translated to its own flag)"
     )
@@ -687,6 +704,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parser.parse_args(head)
         args.agent_args = agent_args
+        # Between parsing and running: the flags say what this invocation wants,
+        # and anything they left unset comes from the project's own defaults. A
+        # malformed config fails here, before an agent is started, rather than
+        # three tasks into a run.
+        args.resolved_from = config.apply(args, config.load(args.root))
         result = args.func(args)
     except WritError as exc:
         print(f"writ: {exc}", file=sys.stderr)

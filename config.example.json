@@ -1,0 +1,55 @@
+{
+  "_": [
+    "Per-project defaults for writ. Copy to .writ/config.json and edit.",
+    "",
+    "Every key is optional, a command-line flag overrides anything here, and",
+    "whatever you leave out falls back to writ's own default. Writ never writes",
+    "this file: nothing will be reformatted or changed behind you.",
+    "",
+    "Any key starting with _ is a comment, since JSON has nowhere else to put one.",
+    "Unknown keys are refused rather than ignored — a misspelled 'reviewer' would",
+    "otherwise leave review running on the implementing model while this file",
+    "claims it does not.",
+    "",
+    "`writ agents` prints what your config currently resolves to."
+  ],
+
+  "agents": {
+    "planner": {
+      "command": "claude",
+      "model": "opus",
+      "timeout": 1800
+    },
+
+    "_critic": "defaults to the planning agent when not set",
+    "critic": {
+      "command": "codex",
+      "model": "gpt-5-codex",
+      "timeout": 1800
+    },
+
+    "_implementer": "no timeout by default: the honest one depends on the task",
+    "implementer": {
+      "command": "claude",
+      "model": "sonnet"
+    },
+
+    "_reviewer": [
+      "Worth setting deliberately. Without it, review falls back to the",
+      "implementing agent, and a model checking its own work agrees with itself",
+      "more than it should."
+    ],
+    "reviewer": {
+      "command": "codex",
+      "model": "gpt-5-codex",
+      "timeout": 1800
+    }
+  },
+
+  "run": {
+    "_": "defaults for `writ run`, all overridable per invocation",
+    "parallel": 3,
+    "order": "id",
+    "max_rework": 2
+  }
+}

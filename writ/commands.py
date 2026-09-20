@@ -13,6 +13,7 @@ from typing import Any
 
 from . import (
     agents,
+    config,
     critics,
     decisions,
     gates,
@@ -2019,12 +2020,78 @@ def cmd_agents(args) -> None:
                 "note": profile.note,
             }
         )
+    configured = _configured_roles(args.root)
     if args.json:
-        render.emit_json(payload)
+        render.emit_json({"agents": payload, "roles": configured})
         return
     print(render.table(["AGENT", "FOUND", "HEADLESS INVOCATION", "MODEL FLAG"], rows))
     print("\nany other command is passed through unchanged; add its own")
     print("non-interactive flag to --agent so it does not wait on a terminal")
+    _print_roles(configured, args.root)
+
+
+def _configured_roles(root) -> list[dict[str, Any]]:
+    """What this project has settled on for each role, and where that came from.
+
+    Reported even when nothing is configured, because the default worth knowing
+    about is the reviewer's: with no config and no `--reviewer`, review runs on the
+    implementing agent, and the table saying so is how that stops being a surprise.
+    """
+    try:
+        loaded = config.load(root)
+    except WritError as exc:
+        # A broken config is worth saying here rather than raising: this command
+        # exists to explain what writ will run, and "your config is unreadable" is
+        # the most useful thing it can say when that is true.
+        return [{"role": "-", "error": str(exc)}]
+    out = []
+    for role, purpose in config.ROLES.items():
+        entry = (loaded.get("agents") or {}).get(role) or {}
+        out.append(
+            {
+                "role": role,
+                "purpose": purpose,
+                "command": entry.get("command"),
+                "model": entry.get("model"),
+                "timeout": entry.get("timeout"),
+                "source": config.FROM_CONFIG if entry else config.FROM_BUILTIN,
+            }
+        )
+    return out
+
+
+#: what a role falls back to when the config does not name it
+ROLE_FALLBACKS = {
+    "planner": "pi",
+    "critic": "the planning agent",
+    "implementer": "pi",
+    "reviewer": "the implementing agent",
+}
+
+
+def _print_roles(configured: list[dict[str, Any]], root) -> None:
+    broken = next((row for row in configured if row.get("error")), None)
+    if broken:
+        print(f"\nwarning: {broken['error']}", file=sys.stderr)
+        return
+    rows = [
+        [
+            row["role"],
+            row["command"] or f"({ROLE_FALLBACKS[row['role']]})",
+            row["model"] or "-",
+            str(row["timeout"]) if row["timeout"] else "-",
+        ]
+        for row in configured
+    ]
+    print()
+    print(render.table(["ROLE", "COMMAND", "MODEL", "TIMEOUT"], rows))
+    path = config.config_file(root)
+    if any(row["source"] == config.FROM_CONFIG for row in configured):
+        print(f"\nfrom {path}; a flag overrides any of it")
+    else:
+        print(f"\nno {path}; bracketed values are what writ falls back to.")
+        print("A reviewer that is the implementing agent is the weakest of these:")
+        print("a model checking its own work agrees with itself more than it should.")
 
 
 def cmd_supervise(args) -> int:
@@ -2196,6 +2263,7 @@ def cmd_run(args) -> int:
             model=args.model,
             reviewer=args.reviewer,
             reviewer_model=args.reviewer_model,
+            reviewer_timeout=getattr(args, "reviewer_timeout", None),
             parallel=parallel,
             max_tasks=args.max_tasks,
             order=args.order,
