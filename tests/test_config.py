@@ -16,8 +16,10 @@ from pathlib import Path
 
 import pytest
 
-from writ import config, state
+from writ import config, orchestrator, state
 from writ.cli import build_parser
+from writ.config import AGENT_TIMEOUT as DEFAULT_AGENT_TIMEOUT
+from writ.model import DEFAULT_MAX_REWORK
 from writ.state import WritError
 
 
@@ -62,6 +64,161 @@ def test_the_shipped_example_validates():
     loaded = config.validate(json.loads(example.read_text()))
     assert sorted(loaded["agents"]) == ["critic", "implementer", "planner", "reviewer"]
     assert loaded["run"] == {"parallel": 3, "order": "id", "max_rework": 2}
+
+
+def test_init_writes_a_starter_config(writ, project):
+    """`writ init` leaves a config behind, because an unknown default is unset."""
+    code, out, _ = writ("init")
+    assert code == 0
+    assert "config.json" in out
+    assert config.config_file(project).exists()
+
+
+def test_the_starter_config_holds_writs_own_defaults(writ, project):
+    """Every field is present, and every value is what writ would have done.
+
+    Both halves matter. Present, so the file is a list of what can be set rather
+    than a list of what someone already set. Unchanged, so `writ init` does not
+    quietly decide this project's agents on the way past.
+    """
+    writ("init")
+    loaded = config.load(project)
+    assert loaded["agents"] == {
+        "planner": {"command": "pi", "timeout": DEFAULT_AGENT_TIMEOUT},
+        "critic": {"timeout": DEFAULT_AGENT_TIMEOUT},
+        "implementer": {"command": "pi"},
+        # the two that matter: unset, so review still falls back to the
+        # implementing agent rather than being pinned to `pi` by a generated file
+        "reviewer": {},
+    }
+    assert loaded["run"] == {
+        "parallel": 1,
+        "order": orchestrator.DEFAULT_ORDER,
+        "max_rework": DEFAULT_MAX_REWORK,
+    }
+
+
+def test_the_starter_config_names_every_field_writ_accepts():
+    """The file is the schema, so a field writ accepts has to appear in it.
+
+    Otherwise the list is a subset nobody can tell is a subset, and the setting
+    left out is the one a reader concludes does not exist.
+    """
+    raw = json.loads(config.default_document())
+    for role in config.ROLES:
+        assert sorted(raw["agents"][role]) == sorted(config.ROLE_KEYS)
+    assert sorted(k for k in raw["run"] if not k.startswith("_")) == sorted(
+        config.RUN_KEYS
+    )
+
+
+def test_the_comment_block_is_the_only_comment():
+    """All of it in `_` at the top, and nothing scattered down the file.
+
+    A note that drifted beside a field would put the explanation and the values
+    in each other's way — whichever a reader came for ends up interleaved with
+    the one they did not.
+    """
+    raw = json.loads(config.default_document())
+    assert [key for key in raw if config.is_comment(key)] == ["_"]
+    for section in ("agents", "run"):
+        for key in raw[section]:
+            assert not config.is_comment(key)
+        for settings in raw[section].values():
+            if isinstance(settings, dict):
+                assert not any(config.is_comment(key) for key in settings)
+
+
+def test_every_role_and_run_setting_has_a_line():
+    """One line per role, one per run setting, each named once.
+
+    Per role rather than per field: command, model and timeout mean the same
+    thing in all four, and repeating that buries what actually differs.
+    """
+    lines = json.loads(config.default_document())["_"]
+    for name in (*config.ROLES, *config.RUN_KEYS):
+        matching = [line for line in lines if f"{name} " in line and " - " in line]
+        assert len(matching) == 1, name
+    assert "Note:" in lines[0]
+    assert "Agents:" in lines
+    assert "Run:" in lines
+
+
+def test_no_documented_default_is_typed_by_hand():
+    """Every default the comments mention is a token, filled from the code.
+
+    This is the drift the generated file exists to prevent, and asserting that
+    the rendered text contains writ's defaults cannot catch it — the text is
+    rendered *from* those defaults, so it agrees with them by construction. What
+    can be caught is the next writer typing `1800` into a line instead of
+    `@AGENT_T@`, which reads identically today and is wrong the moment the
+    builtin moves. So the check is on the source table, not the output.
+    """
+    written = [*config.ROLE_DOCS.values(), *config.RUN_DOCS.values(), *config.NOTE]
+    # Values only. The order *names* are exempt: `@ORDERS@` renders the list, but
+    # the line saying what "depth" actually prefers has to name it to say it, and
+    # a renamed order would be caught by the parser refusing the config anyway.
+    literals = [
+        str(config.AGENT_TIMEOUT),
+        str(config.DEFAULTS["plan"]["agent"].builtin),
+    ]
+    for line in written:
+        for literal in literals:
+            assert literal not in line, f"{literal!r} hardcoded in {line!r}"
+
+
+def test_the_rendered_document_names_every_default_and_flag():
+    """And once filled, the tokens have to have produced something."""
+    doc = config.default_document()
+    assert str(config.DEFAULTS["plan"]["agent"].builtin) in doc
+    assert str(config.AGENT_TIMEOUT) in doc
+    for flag in config.RUN_KEYS.values():
+        assert flag in doc
+    for order in orchestrator.ORDERS:
+        assert order in doc
+
+
+def test_the_starter_config_documents_the_reviewer_fallback():
+    """The one default a reader has to be told, because it is the weakest.
+
+    Unset, review runs on the agent that wrote the code. A file listing
+    `"reviewer": {"command": null}` without saying what the null resolves to
+    would be schema with the point left out.
+    """
+    lines = json.loads(config.default_document())["_"]
+    start = next(i for i, line in enumerate(lines) if line.strip().startswith("reviewer"))
+    # the entry plus its continuation lines, which is where the wrap put half of it
+    about = " ".join(line.strip() for line in lines[start:] if line.strip())
+    assert "null: the implementer" in about
+    assert "wrote the code reviews it" in about
+
+
+def test_a_null_field_means_the_default(project):
+    """Writing null is the same as leaving the key out.
+
+    Which is what lets the generated config name a field whose default is not a
+    value at all: an unset reviewer timeout is *no* timeout, and there is no
+    number that says so.
+    """
+    write_config(
+        project,
+        {
+            "agents": {"reviewer": {"command": None, "model": None, "timeout": None}},
+            "run": {"parallel": None, "order": None, "max_rework": None},
+        },
+    )
+    assert config.load(project) == {"agents": {"reviewer": {}}, "run": {}}
+
+
+def test_init_does_not_overwrite_a_config(writ, project):
+    """This file is hand-edited and recoverable from nothing else in .writ."""
+    writ("init")
+    path = config.config_file(project)
+    path.write_text('{"run": {"parallel": 7}}', encoding="utf-8")
+    code, out, _ = writ("init", "--force")
+    assert code == 0
+    assert "kept your existing" in out
+    assert config.load(project)["run"] == {"parallel": 7}
 
 
 def test_comments_are_ignored_at_every_level():

@@ -32,10 +32,17 @@ model while the file on disk says otherwise. Writ would then be lying about
 something it explicitly warns about, so a misspelled key fails loudly, naming
 what it should have been.
 
-**Writ does not write this file.** It is yours. `writ init` does not create one,
-nothing edits it, and the example lives in the repository as
-`config.example.json` rather than being generated into your project — a config
-writ writes is a config writ can silently change.
+**Writ writes it once, then leaves it alone.** `writ init` drops a starter config
+into a new project, because a default nobody knows about is a default nobody
+sets, and the setting most worth making — `reviewer` — is the easiest to never
+think about. It names every field writ accepts, each one holding the value writ
+would have used anyway, so a fresh config behaves exactly like no config at all
+and editing it is a matter of changing a value rather than finding out what can
+be set. Where writ's default is not a value — an unset reviewer, which means the
+implementing agent — the field is `null`, and one comment line says what that
+resolves to. After that the file is yours: nothing writ does will reformat it,
+edit it, or overwrite it, and `init --force` resets project state while keeping
+it, since how this project runs agents is as true of the next plan as the last.
 """
 from __future__ import annotations
 
@@ -78,6 +85,200 @@ SECTIONS = ("agents", "run")
 
 def config_file(root: str | Path) -> Path:
     return store_dir(root) / CONFIG_FILENAME
+
+
+#: every field of the config, in the order it is written, and its default.
+#:
+#: `None` means writ has no value there, which is not the same as having no
+#: default: an unset reviewer command resolves to the implementing agent. The
+#: comment block says which, since only a comment can. @TOKENS@ are filled from
+#: the code that defines them, so a written default cannot drift from the real one.
+DEFAULT_VALUES: dict[str, Any] = {
+    "agents.planner.command": "@PI@",
+    "agents.planner.model": None,
+    "agents.planner.timeout": "@AGENT_T@",
+    "agents.critic.command": None,
+    "agents.critic.model": None,
+    "agents.critic.timeout": "@AGENT_T@",
+    "agents.implementer.command": "@PI@",
+    "agents.implementer.model": None,
+    "agents.implementer.timeout": None,
+    "agents.reviewer.command": None,
+    "agents.reviewer.model": None,
+    "agents.reviewer.timeout": None,
+    "run.parallel": "@PARALLEL@",
+    "run.order": "@ORDER@",
+    "run.max_rework": "@REWORK@",
+}
+
+#: one line per role: what it is answerable for, and what an unset one falls to.
+#:
+#: One line, not one per field. `command`, `model` and `timeout` mean the same
+#: thing in all four, so spelling that out four times buries the part that
+#: differs — which is what each role is for, and what writ does without it.
+ROLE_DOCS: dict[str, str] = {
+    "planner": "turns the design doc into the plan (writ plan)",
+    "critic": "reports findings against the plan (writ critique). null: the planner",
+    "implementer": "writes a task's code, and runs gates and repairs (writ run,"
+    " writ dispatch). null timeout: no limit",
+    "reviewer": "checks a finished task (writ review, writ run). null: the"
+    " implementer, so the model that wrote the code reviews it",
+}
+
+#: one line per run setting. Spelled out where the roles are not, because these
+#: are three unrelated knobs rather than one shape repeated.
+RUN_DOCS: dict[str, str] = {
+    "parallel": "tasks worked at once (@PARALLEL_FLAG@); dependencies still bound it",
+    "order": "which ready task goes first (@ORDER_FLAG@): @ORDERS@",
+    "max_rework": "times a rejected task goes back before writ leaves it for a"
+    " human (@REWORK_FLAG@); 0 fails on the first rejection",
+}
+
+#: the prose above the two lists
+NOTE: tuple[str, ...] = (
+    "Per-project defaults for writ. Every value below is writ's own default, so"
+    " this file as written changes nothing; edit one and it becomes this"
+    " project's default. A command-line flag still overrides anything here, and"
+    " `writ agents` prints what is in effect.",
+    "Each agent takes a command, a model and a timeout in seconds, and each of"
+    " the three falls back on its own. null means writ's default, the same as"
+    " deleting the key — for some fields that is another role's setting rather"
+    " than a value, noted below.",
+    "Writ wrote this file once, at `writ init`, and will not touch it again:"
+    " nothing here is reformatted or edited behind you, and `init --force`"
+    " resets project state while leaving it alone. Any key starting with _ is a"
+    " comment; an unknown key is refused rather than ignored, so a misspelled"
+    " 'reviewer' fails loudly instead of leaving review on the model that wrote"
+    " the code while this file claims otherwise.",
+)
+
+#: how wide the generated comment lines are allowed to get
+STARTER_WIDTH = 88
+
+
+def _fill(text: str) -> str:
+    """Substitute every documented default from the code that defines it."""
+    from .orchestrator import ORDERS
+
+    return (
+        text.replace("@PI@", str(DEFAULTS["plan"]["agent"].builtin))
+        .replace("@AGENT_T@", str(AGENT_TIMEOUT))
+        .replace("@PARALLEL_FLAG@", RUN_KEYS["parallel"])
+        .replace("@ORDER_FLAG@", RUN_KEYS["order"])
+        .replace("@REWORK_FLAG@", RUN_KEYS["max_rework"])
+        .replace("@ORDERS@", ", ".join(ORDERS))
+        .replace("@PARALLEL@", str(DEFAULTS["run"]["parallel"].builtin))
+        .replace("@ORDER@", _builtin_order())
+        .replace("@REWORK@", str(_builtin_rework()))
+    )
+
+
+#: how far every continuation and list line is indented past the left edge.
+#:
+#: One width for all of it, rather than each label carrying its own. Labels differ
+#: in length, and indenting to `len(label)` would step the list items in and out
+#: under each heading for no reason a reader benefits from.
+INDENT = " " * 6
+
+
+def _entries(docs: dict[str, str]) -> list[str]:
+    """`name - what it does`, names padded so the descriptions line up."""
+    import textwrap
+
+    width = max(len(name) for name in docs)
+    lines = []
+    for name, purpose in docs.items():
+        lead = f"{name:<{width}} - "
+        lines.extend(
+            textwrap.wrap(
+                _fill(purpose),
+                width=STARTER_WIDTH - len(INDENT),
+                initial_indent=lead,
+                subsequent_indent=" " * len(lead),
+            )
+        )
+    return [f"{INDENT}{line}" for line in lines]
+
+
+def _comment_block() -> list[str]:
+    """The whole `_` key: prose, then the roles, then the run settings.
+
+    Three labels down the left edge — Note, Agents, Run — with everything else
+    indented under one of them, so the shape of the file is legible before any of
+    it is read.
+    """
+    import textwrap
+
+    lines: list[str] = []
+    for paragraph in NOTE:
+        wrapped = textwrap.wrap(_fill(paragraph), width=STARTER_WIDTH - len(INDENT))
+        if lines:
+            # a continuation paragraph: indented under Note, with no second label
+            lines.append("")
+            lines.extend(f"{INDENT}{line}" for line in wrapped)
+            continue
+        lines.append(f"Note: {wrapped[0]}")
+        lines.extend(f"{INDENT}{line}" for line in wrapped[1:])
+    for label, docs in (("Agents", ROLE_DOCS), ("Run", RUN_DOCS)):
+        lines.extend(["", f"{label}:", *_entries(docs)])
+    return lines
+
+
+def _defaults_tree() -> dict[str, Any]:
+    """The field table as the nested document it describes."""
+    tree: dict[str, Any] = {}
+    for path, default in DEFAULT_VALUES.items():
+        node = tree
+        parts = path.split(".")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        value = _fill(default) if isinstance(default, str) else default
+        if isinstance(value, str) and value.isdigit():
+            value = int(value)
+        node[parts[-1]] = value
+    return tree
+
+
+def default_document() -> str:
+    """The starter config: writ's defaults, and one comment block explaining them.
+
+    Generated from the tables above rather than typed out, so the file `writ init`
+    leaves in a project cannot drift from what writ does — not the values in it,
+    and not the defaults its comments describe. A config still explaining that an
+    unset reviewer falls back to the implementing agent, after that had stopped
+    being true, would be worse than no config at all.
+
+    One comment block, at the top. A reader opening this file wants either the
+    explanation or the values, and interleaving them puts whichever one they came
+    for twice as far apart as it needs to be.
+    """
+    body = json.dumps(_defaults_tree(), indent=2, ensure_ascii=False)
+    # spliced in rather than dumped with the rest, so the block keeps its line
+    # breaks instead of becoming one unreadable string
+    rendered = (
+        "[\n"
+        + ",\n".join(
+            f"    {json.dumps(line, ensure_ascii=False)}" for line in _comment_block()
+        )
+        + "\n  ]"
+    )
+    return body.replace("{\n", '{\n  "_": ' + rendered + ",\n", 1) + "\n"
+
+
+def ensure(root: str | Path) -> tuple[Path, bool]:
+    """Write the starter config if the project has none. Never overwrites one.
+
+    Returns the path and whether this call created it. The no-overwrite rule is
+    not politeness: this file is hand-edited, holds the reason behind each choice
+    in its comments, and is not recoverable from anything else in `.writ`. So
+    `--force`, which resets state, deliberately stops short of it.
+    """
+    path = config_file(root)
+    if path.exists():
+        return path, False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(default_document(), encoding="utf-8")
+    return path, True
 
 
 def load(root: str | Path) -> dict[str, Any]:
@@ -131,11 +332,16 @@ def _agents(value: Any, where: str) -> dict[str, dict[str, Any]]:
             )
         _reject_unknown(settings, ROLE_KEYS, at, "key")
         entry: dict[str, Any] = {}
-        if "command" in settings:
+        # `null` is how a field says "writ's default", which for some of these is
+        # not a value at all — an unset reviewer timeout means no timeout, and an
+        # unset reviewer command means the implementer's. That is what lets the
+        # config `writ init` writes name every field instead of only the ones with
+        # a value to name, and it is the same as leaving the key out.
+        if settings.get("command") is not None:
             entry["command"] = _command(settings["command"], f"{at}.command")
-        if "model" in settings:
+        if settings.get("model") is not None:
             entry["model"] = _text(settings["model"], f"{at}.model")
-        if "timeout" in settings:
+        if settings.get("timeout") is not None:
             entry["timeout"] = _positive_int(settings["timeout"], f"{at}.timeout")
         out[role] = entry
     return out
@@ -148,9 +354,10 @@ def _run(value: Any, where: str) -> dict[str, Any]:
     from .orchestrator import ORDERS
 
     out: dict[str, Any] = {}
-    if "parallel" in value:
+    # as in a role: `null` means writ's default, the same as an absent key
+    if value.get("parallel") is not None:
         out["parallel"] = _positive_int(value["parallel"], f"{where}.parallel")
-    if "order" in value:
+    if value.get("order") is not None:
         order = _text(value["order"], f"{where}.order")
         if order not in ORDERS:
             raise WritError(
@@ -158,7 +365,7 @@ def _run(value: Any, where: str) -> dict[str, Any]:
                 f"choose from {', '.join(ORDERS)}"
             )
         out["order"] = order
-    if "max_rework" in value:
+    if value.get("max_rework") is not None:
         # Zero is meaningful here — it is `--max-rework 0`, fail on first
         # rejection — so this one is not `_positive_int`.
         rework = value["max_rework"]

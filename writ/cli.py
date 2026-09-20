@@ -69,8 +69,9 @@ every command accepts --root <project> and --json.
 
 defaults marked `agents.x` or `run.x` come from <root>/.writ/config.json, so a
 project's planner, reviewer and parallelism are chosen once rather than retyped.
-A flag always overrides it; `writ agents` prints what is in effect. The repository
-ships a commented config.example.json.
+A flag always overrides it; `writ agents` prints what is in effect. `writ init`
+writes that file holding writ's own defaults, with a note explaining each role
+and run setting, so changing one is an edit rather than a lookup.
 """
 
 
@@ -106,8 +107,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # ---------------------------------------------------------------- setup
-    p = sub.add_parser("init", help="create a Writ project in --root")
-    p.add_argument("--force", action="store_true", help="overwrite existing state")
+    p = sub.add_parser(
+        "init", help="create a Writ project, and a default config.json, in --root"
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="reset existing state; your config.json is kept either way",
+    )
     p.set_defaults(func=commands.cmd_init)
 
     p = sub.add_parser(

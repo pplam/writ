@@ -84,7 +84,8 @@ writ review M01-001 --agent codex      # a different agent checks the claim
                       milestones, tasks and gates, runs, findings, repair
                       requests, decisions
   config.json         your defaults: which agent fills each role, and how
-                      `writ run` behaves. Optional, and writ never writes it
+                      `writ run` behaves. Written once by `writ init` holding
+                      writ's own defaults, and never touched again
   decisions.md        human-readable mirror of the decision log
   run.session         the pid of the active `writ run`, if any
   plans/<plan-id>/
@@ -583,9 +584,13 @@ So a project can write its choices down once, in `.writ/config.json`:
 }
 ```
 
-Then `writ run` with no flags uses all of it. `config.example.json` in this
-repository is the same thing with every option commented; copy it across and
-edit.
+Then `writ run` with no flags uses all of it. `writ init` writes this file for
+you, holding every field writ accepts at writ's own default, so editing it is a
+matter of changing a value rather than working out what can be set. A comment
+block at the top explains it: one line per agent, one per `run` setting, and what
+each `null` falls back to — so the table below is in the project rather than only
+here.
+`config.example.json` in this repository is a filled-in example.
 
 Four roles, because that is how many writ actually distinguishes:
 
@@ -630,6 +635,11 @@ known roles: planner, critic, implementer, reviewer
 
 That happens before any agent starts, not three tasks into a run.
 
+**`null` means writ's default**, the same as leaving the key out. That is what
+lets the generated config name every field: an unset `implementer.timeout` means
+*no* timeout, and an unset `reviewer.command` means the implementing agent, and
+neither has a value that says so.
+
 Any key beginning with `_` is a comment, since JSON has nowhere else to put one —
 useful for the reason behind a choice, which outlives the choice:
 
@@ -640,10 +650,15 @@ useful for the reason behind a choice, which outlives the choice:
 }}
 ```
 
-Writ does not write this file. `writ init` does not create one and `init --force`
-does not delete it: it says how this project runs agents, which is still true of
-the next plan written in it. Note that `.writ/` is usually gitignored, so this is
-a per-checkout file rather than a shared one.
+`writ init` creates this file, and that is the only time writ writes it. Every
+value in the generated file is the one writ would have used anyway, so a project
+that never opens it runs exactly as it would with no config at all — including
+the reviewer, which is `null` rather than pinned to an agent, because its real
+default is the implementing agent and no value says that. After that it is
+yours: nothing reformats or edits it, and `init --force` resets project state
+while keeping it — how this project runs agents is still true of the next plan
+written in it. Note that `.writ/` is usually gitignored, so this is a
+per-checkout file rather than a shared one.
 
 ## Commands
 

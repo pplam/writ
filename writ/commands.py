@@ -58,6 +58,13 @@ from .state import WritError
 def cmd_init(args) -> None:
     location = state.initialize(args.root, force=args.force)
     print(f"initialized Writ project at {location}")
+    # Written here rather than in `state.initialize` because it is not state: it
+    # is a file the project owns, and the store can be reset without it.
+    path, created = config.ensure(args.root)
+    if created:
+        print(f"wrote {path.name} — writ's defaults, with a note explaining them")
+    else:
+        print(f"kept your existing {path.name}")
     print("next: writ plan <design.md>")
 
 
@@ -2089,8 +2096,14 @@ def _print_roles(configured: list[dict[str, Any]], root) -> None:
     if any(row["source"] == config.FROM_CONFIG for row in configured):
         print(f"\nfrom {path}; a flag overrides any of it")
     else:
-        print(f"\nno {path}; bracketed values are what writ falls back to.")
-        print("A reviewer that is the implementing agent is the weakest of these:")
+        print(f"\nno {path}; bracketed values are what writ falls back to")
+    # Keyed on the reviewer rather than on whether anything is configured. Since
+    # `writ init` writes every field, "this project has a config" stopped implying
+    # "this project chose a reviewer" — and the unset reviewer is the whole reason
+    # this warning exists.
+    reviewer = next(row for row in configured if row["role"] == "reviewer")
+    if not reviewer["command"]:
+        print("\nreviewer is the implementing agent, the weakest of these:")
         print("a model checking its own work agrees with itself more than it should.")
 
 
