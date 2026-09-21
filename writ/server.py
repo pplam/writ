@@ -43,6 +43,11 @@ from .state import WritError
 
 DEFAULT_PORT = 8731
 
+#: the interface `writ serve` binds. This machine only, because the page has no
+#: authentication and needs none while nothing else can reach it. Named here so
+#: the flag, the help text and the generated config all read it from one place.
+DEFAULT_HOST = "127.0.0.1"
+
 #: How often the watcher stats `state.json`. Agent turns take tens of seconds, so
 #: this is far finer than what it observes; it is cheap because a tick is a stat
 #: and the file is only parsed when the mtime moves.

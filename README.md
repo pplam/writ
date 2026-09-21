@@ -633,29 +633,58 @@ So a project can write its choices down once, in `.writ/config.json`:
     "implementer": {"command": "claude", "model": "sonnet"},
     "reviewer":    {"command": "codex",  "model": "gpt-5-codex"}
   },
-  "run": {"parallel": 3, "order": "depth", "max_rework": 2}
+  "run": {"parallel": 3, "order": "depth", "max_rework": 2},
+  "plan": {"stages": true, "gates": true, "critics": true}
 }
 ```
 
 Then `writ run` with no flags uses all of it. `writ init` writes this file for
 you, holding every field writ accepts at writ's own default, so editing it is a
 matter of changing a value rather than working out what can be set. A comment
-block at the top explains it: one line per agent, one per `run` setting, and what
-each `null` falls back to — so the table below is in the project rather than only
-here.
+block at the top explains it: one line per setting, grouped by section, and what
+each `null` falls back to — so the tables below are in the project rather than
+only here.
 `config.example.json` in this repository is a filled-in example.
 
-Four roles, because that is how many writ actually distinguishes:
+Five roles, because that is how many writ actually distinguishes:
 
 | role | used by | falls back to |
 |---|---|---|
-| `planner` | `writ plan` — its analysis stages and its synthesis | `pi` |
+| `planner` | `writ plan` — its synthesis | `pi` |
 | `critic` | `writ critique`, `writ plan --critics` | the planning agent |
+| `stage` | the analysis stages of `writ plan` | the planning agent |
 | `implementer` | `writ run`, `writ dispatch`, **and gates and repair planners** | `pi` |
 | `reviewer` | `writ review`, `writ run` | the implementing agent |
 
-Each takes `command`, `model`, and `timeout`. Under `run`: `parallel`, `order`,
-and `max_rework`, which `writ review` honours too since it is the same budget.
+Each takes `command`, `model`, and `timeout`.
+
+**Every flag that is a standing decision is in the file**, not just the agents.
+The sections mirror the commands:
+
+| section | what it holds |
+|---|---|
+| `run` | `parallel`, `order`, `max_rework` (which `writ review` honours too, being the same budget), `max_tasks` |
+| `plan` | `stages`, `gates`, `chain`, `critics`, `auto_approve`, `refresh`, `instructions`, `extract`, `level`, `flat` |
+| `critique` | `critics` — which of them run |
+| `dispatch` | `detach` |
+| `check`, `coverage` | `all`, `uncovered` |
+| `status` | `watch`, `interval`, `until_idle`, `clear` |
+| `list`, `show`, `graph`, `logs` | what each one prints by default |
+| `serve` | `port`, `host`, `open` |
+| `common` | `cwd`, `quiet`, `json`, `dry_run`, applied wherever a command takes them |
+
+`plan.stages` is the one most worth knowing about. `--no-stages` swaps the staged
+pipeline for the older single-shot planner, which makes every judgement the three
+analyses make in one response — a decision about how this project plans, and so
+exactly the kind that belongs in a file rather than in a flag you have to remember.
+`plan.critics` is the other: critics cost an agent run each, which is why writ does
+not run them unasked, and a project that wants them on every plan says so once here.
+
+**What is deliberately not configurable**, because a default would make writ
+misreport the project: anything naming one piece of work (a design document, a task
+id, `--stage`, `--plan-id`), the filters on `list` and `coverage` — a standing
+`--uncovered` would show a subset while looking like it showed everything — and
+every `--force`, each of which overrides a check writ exists to make.
 
 Note where gates sit. A gate judges whether integrated work adds up, which is a
 review, but it runs on the implementing agent — so the model that wrote the code
@@ -670,11 +699,17 @@ ROLE         COMMAND                   MODEL        TIMEOUT
 -----------  ------------------------  -----------  -------
 planner      claude                    opus         1800
 critic       codex                     gpt-5-codex  -
+stage        -                         -            -
 implementer  claude                    sonnet       -
 reviewer     codex                     gpt-5-codex  1800
 
 from .writ/config.json; a flag overrides any of it
 ```
+
+A flag wins in both directions, including for the settings spelled negatively:
+`--gates/--no-gates`, and `--open`/`--clear` against `serve.open` and
+`status.clear`. A boolean in a config you cannot argue with for one run would not
+be a default.
 
 **An unknown key is an error, not a shrug.** A config is hand-edited, so a typo
 in one is as likely as a typo in a flag — and a silently ignored `"reviewr"` would
@@ -683,7 +718,7 @@ not. So it is refused, with the name it was probably reaching for:
 
 ```
 writ: .writ/config.json: unknown role 'reviewr' (did you mean 'reviewer'?);
-known roles: planner, critic, implementer, reviewer
+known roles: planner, critic, stage, implementer, reviewer
 ```
 
 That happens before any agent starts, not three tasks into a run.

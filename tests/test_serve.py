@@ -20,7 +20,7 @@ import urllib.request
 import pytest
 
 from tests.conftest import LEGACY_PLAN
-from writ import server, state
+from writ import config, server, state
 from writ.cli import build_parser
 
 
@@ -260,11 +260,17 @@ def test_graph_no_longer_carries_a_serve_flag():
     assert "--serve" not in flags
 
 
-def test_serve_binds_this_machine_only_by_default():
-    parser = build_parser()
-    action = next(a for a in parser._actions if a.dest == "command")
-    args = action.choices["serve"].parse_args([])
-    assert args.host == "127.0.0.1"
+def test_serve_binds_this_machine_only_by_default(project):
+    """Loopback unless a project says otherwise, since the page has no auth.
+
+    Checked after the config is applied rather than straight off the parser: the
+    flag parses as None so that `serve.host` in a config can be overridden by it,
+    which means the default now lives in `config.DEFAULTS` and the parser alone no
+    longer knows it.
+    """
+    args = build_parser().parse_args(["--root", str(project), "serve"])
+    config.apply(args, config.load(project))
+    assert args.host == server.DEFAULT_HOST == "127.0.0.1"
     assert args.port == server.DEFAULT_PORT
 
 

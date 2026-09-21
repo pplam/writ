@@ -6,6 +6,10 @@
     "whatever you leave out falls back to writ's own default. Writ never writes",
     "this file: nothing will be reformatted or changed behind you.",
     "",
+    "This is a filled-in example, not the full schema — it sets the things a",
+    "project usually cares about. `writ init` generates a file holding every",
+    "field writ accepts at writ's own default, with a line explaining each one.",
+    "",
     "Any key starting with _ is a comment, since JSON has nowhere else to put one.",
     "Unknown keys are refused rather than ignored — a misspelled 'reviewer' would",
     "otherwise leave review running on the implementing model while this file",
@@ -25,6 +29,17 @@
     "critic": {
       "command": "codex",
       "model": "gpt-5-codex",
+      "timeout": 1800
+    },
+
+    "_stage": [
+      "The three analyses — requirements, inventory, verification. Reading a",
+      "document and a repository is cheaper work than synthesising a plan from",
+      "them, so it is worth pointing somewhere cheaper. Unset: the planner."
+    ],
+    "stage": {
+      "command": "claude",
+      "model": "sonnet",
       "timeout": 1800
     },
 
@@ -51,5 +66,32 @@
     "parallel": 3,
     "order": "id",
     "max_rework": 2
+  },
+
+  "plan": {
+    "_stages": [
+      "The staged pipeline: three analyses write artifacts before a synthesis",
+      "agent decomposes the work from them. false is the older single-shot",
+      "planner, which makes all of those judgements in one response."
+    ],
+    "stages": true,
+    "gates": true,
+
+    "_critics": [
+      "Run the critics over every plan straight after committing it. Costs an",
+      "agent run each, which is why writ does not do it unasked; this project",
+      "has decided it is worth it."
+    ],
+    "critics": true
+  },
+
+  "critique": {
+    "_": "which critics run, here and for plan.critics. Unset means all of them.",
+    "critics": ["coverage", "dependency", "acceptance", "feasibility"]
+  },
+
+  "serve": {
+    "_host": "loopback by default; the page has no authentication",
+    "port": 8731
   }
 }

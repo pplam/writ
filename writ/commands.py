@@ -232,7 +232,7 @@ def cmd_plan(args) -> int:
     for section in missing:
         print(f"note: no section titled {section!r} in {doc.name}", file=sys.stderr)
     _print_findings(findings)
-    if getattr(args, "critics", None) is not None:
+    if _critics_requested(args):
         # `--critics` absent is None and runs nothing; `--critics` with no names is
         # `[]` and means all of them. The distinction matters because the flag is
         # opt-in — it spends an agent run per critic — so the empty list is a
@@ -292,6 +292,7 @@ def _run_stages(
     )
     agent = getattr(args, "stage_agent", None) or args.agent
     model = getattr(args, "stage_model", None) or args.model
+    timeout = getattr(args, "stage_timeout", None) or args.timeout
     # Resolve before the pipeline creates anything. An unknown --model is a
     # WritError from `agents.resolve`, and raising it after the plan directory
     # exists leaves a project littered with empty pipelines that never ran.
@@ -327,7 +328,7 @@ def _run_stages(
         agent=agent,
         agent_args=list(getattr(args, "agent_args", []) or []),
         model=model,
-        timeout=args.timeout,
+        timeout=timeout,
         cwd=args.cwd,
         instructions=args.instructions,
         context=context,
@@ -766,10 +767,37 @@ def cmd_critique(args) -> int:
     return 1 if blocking or any(not report.ok for report in reports) else 0
 
 
+def _critics_requested(args) -> bool:
+    """Whether the critics should read the plan `writ plan` just committed.
+
+    Three states reach here, because `--critics` has three and the config has the
+    same three: absent (None) runs nothing, since each critic costs an agent run
+    and writ does not spend those unasked; `--critics` with no names, or
+    `plan.critics: true`, runs the configured set; and a list runs exactly those.
+    `False` has to be distinguished from `None` by value rather than truth — a
+    config that turns critics off looks identical to an absent flag otherwise.
+    """
+    requested = getattr(args, "critics", None)
+    if requested is None or requested is False:
+        return False
+    return True
+
+
 def _chosen_critics(args) -> list[critics.Critic]:
-    """Which critics to run: the ones named, or all of them."""
+    """Which critics to run: the ones named, the ones configured, or all of them.
+
+    `--critics coverage` names them outright. A bare `--critics`, or
+    `plan.critics: true`, defers to `critique.critics` — so a project that has
+    settled on a subset states it once rather than in both places — and with
+    neither, all of them.
+    """
     named = getattr(args, "critics", None)
-    return critics.by_name(named) if named else list(critics.CRITICS)
+    if isinstance(named, list) and named:
+        return critics.by_name(named)
+    configured = getattr(args, "critic_names", None)
+    if configured:
+        return critics.by_name(configured)
+    return list(critics.CRITICS)
 
 
 def _run_critics(args, *, root, doc, chosen, plan_path):
@@ -2327,6 +2355,7 @@ def _configured_roles(root) -> list[dict[str, Any]]:
 ROLE_FALLBACKS = {
     "planner": "pi",
     "critic": "the planning agent",
+    "stage": "the planning agent",
     "implementer": "pi",
     "reviewer": "the implementing agent",
 }

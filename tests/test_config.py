@@ -62,8 +62,11 @@ def test_the_shipped_example_validates():
     """
     example = Path(__file__).resolve().parent.parent / "config.example.json"
     loaded = config.validate(json.loads(example.read_text()))
-    assert sorted(loaded["agents"]) == ["critic", "implementer", "planner", "reviewer"]
+    assert sorted(loaded["agents"]) == sorted(config.ROLES)
     assert loaded["run"] == {"parallel": 3, "order": "id", "max_rework": 2}
+    # a filled-in example, so it exercises the sections beyond agents and run too
+    assert loaded["plan"] == {"stages": True, "gates": True, "critics": True}
+    assert loaded["critique"]["critics"]
 
 
 def test_init_writes_a_starter_config(writ, project):
@@ -87,6 +90,8 @@ def test_the_starter_config_holds_writs_own_defaults(writ, project):
         "planner": {"command": "pi", "timeout": DEFAULT_AGENT_TIMEOUT},
         "critic": {"timeout": DEFAULT_AGENT_TIMEOUT},
         "implementer": {"command": "pi"},
+        # the analysis stages: unset, so they run on the planner's own setting
+        "stage": {},
         # the two that matter: unset, so review still falls back to the
         # implementing agent rather than being pinned to `pi` by a generated file
         "reviewer": {},
@@ -129,19 +134,53 @@ def test_the_comment_block_is_the_only_comment():
                 assert not any(config.is_comment(key) for key in settings)
 
 
-def test_every_role_and_run_setting_has_a_line():
-    """One line per role, one per run setting, each named once.
+def entry_names(lines: list[str]) -> list[str]:
+    """The `name - what it does` entries of the comment block, by name.
 
-    Per role rather than per field: command, model and timeout mean the same
-    thing in all four, and repeating that buries what actually differs.
+    Parsed from the left of each line rather than matched as a substring, because
+    the descriptions contain the names too: the line for `chain` opens "order tasks
+    the plan left independent", which a substring check reads as a second entry for
+    `order`.
+    """
+    names = []
+    for line in lines:
+        head, sep, _ = line.strip().partition(" - ")
+        if sep and head and " " not in head.strip():
+            names.append(head.strip())
+    return names
+
+
+def test_every_field_writ_accepts_has_a_line():
+    """One line per setting, each named once, under a heading for its section.
+
+    The agents section is documented per role rather than per field: command, model
+    and timeout mean the same thing in all five, and repeating that fifteen times
+    would bury the part that differs, which is what each role is for.
     """
     lines = json.loads(config.default_document())["_"]
-    for name in (*config.ROLES, *config.RUN_KEYS):
-        matching = [line for line in lines if f"{name} " in line and " - " in line]
-        assert len(matching) == 1, name
+    names = entry_names(lines)
+    expected = list(config.ROLES) + [
+        path.split(".", 1)[1]
+        for path in config.FIELDS
+        if not path.startswith("agents.")
+    ]
+    assert sorted(names) == sorted(expected)
     assert "Note:" in lines[0]
-    assert "Agents:" in lines
-    assert "Run:" in lines
+    for section in config.SECTIONS:
+        assert any(line.startswith(f"{section} — ") for line in lines), section
+
+
+def test_every_section_and_role_is_documented():
+    """A section or role with no line would be a setting nobody is told about."""
+    for section in config.SECTIONS:
+        assert config.SECTION_DOCS.get(section), section
+    for role in config.ROLES:
+        assert config.ROLE_DOCS.get(role), role
+    for path, entry in config.FIELDS.items():
+        if path.startswith("agents."):
+            continue  # documented per role
+        assert entry.doc, path
+        assert entry.flag, path
 
 
 def test_no_documented_default_is_typed_by_hand():
@@ -507,3 +546,259 @@ def test_resetting_the_project_does_not_discard_its_config(writ, project):
     write_config(project, {"run": {"parallel": 4}})
     writ("init", "--force")
     assert config.load(project) == {"run": {"parallel": 4}}
+
+
+# --------------------------------------------------------------------------
+# covering every flag
+
+
+def test_every_configurable_flag_is_read_by_some_command():
+    """A field the file accepts but nothing resolves would be a silent lie.
+
+    The same failure as an ignored typo, one level up: `writ init` would write the
+    key, validation would accept it, a reader would set it, and no command would
+    ever look. So the two tables have to correspond exactly in both directions.
+    """
+    referenced = {
+        default.path
+        for command in config.DEFAULTS.values()
+        for default in command.values()
+    }
+    assert sorted(referenced) == sorted(config.FIELDS)
+
+
+def test_no_written_default_is_guessed_where_commands_disagree():
+    """A path two commands default differently has to say which writ writes.
+
+    `agents.reviewer.command` is the case: `writ review` falls back to `pi`, and
+    under `writ run` an unset reviewer is the implementing agent. Deriving one of
+    those silently would put a value in the generated file that is right for one
+    command and wrong for the other, so `_written_default` raises instead.
+    """
+    for path in config.FIELDS:
+        config._written_default(path)  # the guard is in here; no path may trip it
+
+    ambiguous = config.Field(kind="text", doc="x", flag="--x")
+    saved = config.FIELDS.get("run.order")
+    try:
+        config.FIELDS["run.order"] = ambiguous
+        with pytest.raises(AssertionError, match="commands disagree"):
+            # two commands already name run.max_rework; point one at run.order
+            original = config.DEFAULTS["review"]["max_rework"]
+            config.DEFAULTS["review"]["max_rework"] = config.Default("run.order", "x")
+            try:
+                config._written_default("run.order")
+            finally:
+                config.DEFAULTS["review"]["max_rework"] = original
+    finally:
+        config.FIELDS["run.order"] = saved
+
+
+def test_every_flag_writ_can_configure_parses_as_unset(project):
+    """A configurable flag cannot carry its own argparse default.
+
+    This is what makes "a flag always wins" true of a boolean. With
+    `action="store_true"`, an absent `--quiet` and an explicit one are both
+    `False`, and `apply` — which fills only what is None — could not tell a
+    project's `quiet: true` from a user overriding it. So every attribute a config
+    can set has to arrive as None when no flag was given.
+    """
+    parser = build_parser()
+    action = next(a for a in parser._actions if a.dest == "command")
+    for command, wanted in config.DEFAULTS.items():
+        if command not in action.choices:
+            continue
+        # positionals only; every configurable flag is optional by construction
+        required = {
+            "plan": ["d.md"],
+            "show": ["M01"],
+            "logs": ["r1"],
+            "dispatch": ["M01-001"],
+        }.get(command, [])
+        args = action.choices[command].parse_args(required)
+        for attribute in wanted:
+            if not hasattr(args, attribute):
+                continue
+            assert getattr(args, attribute) is None, f"{command} --{attribute}"
+
+
+def test_a_configured_boolean_is_honoured_and_still_overridable(project):
+    """`plan.stages: false` turns the pipeline off, and `--stages` turns it back on.
+
+    Both halves, because a boolean that a flag cannot argue with is not a default,
+    it is a policy — and `--no-stages` swapping the staged pipeline for the older
+    single-shot planner is too consequential to be unsayable for one run.
+    """
+    write_config(project, {"plan": {"stages": False, "gates": False}})
+    args, decided = resolve(project, "plan", "d.md")
+    assert (args.stages, args.gates) == (False, False)
+    assert decided["stages"] == (config.FROM_CONFIG, False)
+
+    args, decided = resolve(project, "plan", "d.md", "--stages", "--gates")
+    assert (args.stages, args.gates) == (True, True)
+    assert decided["stages"] == (config.FROM_FLAG, True)
+
+
+def test_a_negative_flag_is_configured_positively_and_beaten_both_ways(project):
+    """`serve.open` reads the way a person would say it; `--no-open` is its negative.
+
+    The config holds the setting, argparse holds `no_open`, and `--open` exists so
+    a project that turned the browser off can still ask for it once. Without that
+    counterpart the two negatively-spelled settings would be the only ones a flag
+    could not argue with in both directions.
+    """
+    write_config(project, {"serve": {"open": False}, "status": {"clear": False}})
+    args, decided = resolve(project, "serve")
+    assert args.no_open is True
+    # reported as the setting, not as the flag it reached argparse through
+    assert decided["no_open"] == (config.FROM_CONFIG, False)
+    assert resolve(project, "serve", "--open")[0].no_open is False
+    assert resolve(project, "status")[0].no_clear is True
+    assert resolve(project, "status", "--clear")[0].no_clear is False
+
+
+def test_false_in_a_config_is_a_value_and_not_an_absence(project):
+    """`quiet: false` has to survive the lookup that discards empty strings.
+
+    `_lookup` treats `""` as unset — an empty agent command is not an answer — and
+    a check that discarded anything falsy with it would make every boolean in the
+    file unsettable in one direction, silently.
+    """
+    write_config(project, {"common": {"quiet": False}, "run": {"max_rework": 0}})
+    args, decided = resolve(project, "run")
+    assert args.quiet is False
+    assert decided["quiet"] == (config.FROM_CONFIG, False)
+    assert args.max_rework == 0
+    assert decided["max_rework"] == (config.FROM_CONFIG, 0)
+
+
+def test_the_critics_setting_carries_three_states(project):
+    """Off, all, or exactly these — the same three the flag has.
+
+    `plan.critics` says *whether* to run them, `critique.critics` says *which*, so
+    a project that has settled on a subset states it once and both commands honour
+    it. Absent runs nothing under `writ plan`, because each critic costs an agent
+    run and writ does not spend those unasked.
+    """
+    from writ import commands, critics
+
+    args, _ = resolve(project, "plan", "d.md")
+    assert args.critics is False
+    assert commands._critics_requested(args) is False
+
+    write_config(project, {"plan": {"critics": True}})
+    args, _ = resolve(project, "plan", "d.md")
+    assert commands._critics_requested(args) is True
+    assert commands._chosen_critics(args) == list(critics.CRITICS)
+
+    write_config(
+        project, {"plan": {"critics": True}, "critique": {"critics": ["scope"]}}
+    )
+    args, _ = resolve(project, "plan", "d.md")
+    assert [c.name for c in commands._chosen_critics(args)] == ["scope"]
+    # and a flag naming them outright still wins over the configured set
+    args, _ = resolve(project, "plan", "d.md", "--critics", "coverage")
+    assert [c.name for c in commands._chosen_critics(args)] == ["coverage"]
+
+
+def test_an_unknown_critic_is_refused_with_the_name_it_meant():
+    with pytest.raises(WritError, match=r"did you mean 'coverage'"):
+        config.validate({"critique": {"critics": ["coverge"]}})
+
+
+def test_a_critic_list_must_be_a_list():
+    with pytest.raises(WritError, match="expected a list of names"):
+        config.validate({"critique": {"critics": "coverage"}})
+
+
+def test_an_empty_critic_list_is_none_rather_than_all(project):
+    """`"critics": []` is a project saying none, which is not saying nothing."""
+    assert config.validate({"critique": {"critics": []}}) == {"critique": {"critics": []}}
+
+
+def test_a_port_outside_the_range_is_refused():
+    with pytest.raises(WritError, match="expected a port from 1 to 65535"):
+        config.validate({"serve": {"port": 70000}})
+
+
+def test_an_interval_must_be_a_positive_number():
+    assert config.validate({"status": {"interval": 0.5}}) == {"status": {"interval": 0.5}}
+    with pytest.raises(WritError, match="number of seconds above 0"):
+        config.validate({"status": {"interval": 0}})
+
+
+def test_a_flag_setting_refuses_a_non_boolean():
+    with pytest.raises(WritError, match="expected true or false"):
+        config.validate({"plan": {"stages": "yes"}})
+
+
+def test_the_analysis_stages_have_their_own_role(project):
+    """Reading a document is cheaper work than synthesising a plan from it.
+
+    So `agents.stage` can point somewhere cheaper than the planner. Unset it is
+    the planner, which is what writ did before the role existed.
+    """
+    write_config(project, {"agents": {"stage": {"command": "codex", "timeout": 600}}})
+    args, decided = resolve(project, "plan", "d.md")
+    assert args.stage_agent == "codex"
+    assert args.stage_timeout == 600
+    assert decided["stage_agent"] == (config.FROM_CONFIG, "codex")
+
+    args, _ = resolve(project, "plan", "d.md")
+    assert args.agent == "pi"  # the planner is untouched by the stage setting
+
+
+#: the positional each command needs before its flags can be parsed at all
+POSITIONALS = {
+    "plan": ["d.md"],
+    "show": ["M01"],
+    "logs": ["r1"],
+    "dispatch": ["M01-001"],
+}
+
+
+def test_a_generated_config_resolves_exactly_like_no_config(writ, project, tmp_path):
+    """The whole promise of the generated file, checked per command per argument.
+
+    `writ init` writes every field at writ's own default, so a project that has one
+    and a project that has none must reach identical arguments — otherwise `writ
+    init` quietly decides something on the way past, which is the one thing the file
+    is not allowed to do.
+
+    This caught a real bug. `status.clear` and `serve.open` are stated positively
+    and reach argparse as `no_clear` and `no_open`; inverting the config value but
+    not the builtin made a generated config resolve to the *opposite* of no config
+    for both, and nothing else here would have noticed.
+    """
+    writ("init")
+    bare = tmp_path / "no-config"
+    bare.mkdir()
+    for command, wanted in config.DEFAULTS.items():
+        argv = [command, *POSITIONALS.get(command, [])]
+        resolved = []
+        for root in (project, bare):
+            args, _ = resolve(root, *argv)
+            resolved.append(
+                {a: getattr(args, a) for a in wanted if hasattr(args, a)}
+            )
+        assert resolved[0] == resolved[1], command
+
+
+def test_the_generated_file_holds_every_field_and_nothing_else(writ, project):
+    """It is the schema, so it has to be the whole schema and no more than it."""
+    writ("init")
+    raw = json.loads(config.config_file(project).read_text())
+    flat: dict[str, object] = {}
+
+    def walk(node: dict, prefix: str = "") -> None:
+        for key, value in node.items():
+            if config.is_comment(key):
+                continue
+            path = f"{prefix}{key}"
+            walk(value, f"{path}.") if isinstance(value, dict) else flat.update(
+                {path: value}
+            )
+
+    walk(raw)
+    assert sorted(flat) == sorted(config.FIELDS)
+    assert flat == config.DEFAULT_VALUES
