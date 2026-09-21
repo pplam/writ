@@ -97,6 +97,20 @@
     "critics": ["coverage", "dependency", "acceptance", "feasibility"]
   },
 
+  "adjudicate": {
+    "_": [
+      "the bounded repair loop that answers a plan's findings before it runs",
+      "(writ adjudicate). Two repairs may land; a finding still open after that",
+      "needs a decision rather than another patch."
+    ],
+    "max_rounds": 2,
+    "_critics": [
+      "re-run the critics after each patch, so a finding closes on a re-review",
+      "rather than on the patch's word. Costs a critic pass per round."
+    ],
+    "critics": true
+  },
+
   "serve": {
     "_host": "loopback by default; the page has no authentication",
     "port": 8731

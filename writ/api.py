@@ -218,16 +218,22 @@ def coverage(data: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def repairs(data: dict[str, Any]) -> list[dict[str, Any]]:
-    """Every request a gate has made for the plan to change."""
+    """Every request to change the plan: from a gate, or from adjudication.
+
+    `gate` stays as it was for a gate-scoped request and is empty for a plan-scoped
+    one; `scope` is the field to read when what matters is which occasion it was.
+    """
     return [
         {
             "id": request.get("id", ""),
             "gate": request.get("gate", ""),
+            "scope": repair.scope_of(request),
             "status": request.get("status", ""),
             "round": int(request.get("round", 1)),
             "summary": request.get("summary", ""),
             "findings": list(request.get("findings", [])),
             "applied_tasks": list(request.get("applied_tasks", [])),
+            "revised_tasks": list(request.get("revised_tasks", [])),
             "refusals": len(request.get("refusals") or []),
             "opened_at": request.get("opened_at", ""),
         }

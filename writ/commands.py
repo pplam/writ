@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from . import (
+    adjudicate,
     agents,
     analysis,
     config,
@@ -710,7 +711,7 @@ def cmd_check(args) -> int:
     if blocking:
         print()
         print(
-            "fix the plan and re-plan, answer them one at a time with "
+            "repair them with `writ adjudicate`, answer them one at a time with "
             "`writ set F-NNNN accepted|declined --reason ...`, or accept them all "
             "with `writ approve --force --reason ...`"
         )
@@ -765,6 +766,140 @@ def cmd_critique(args) -> int:
         )
     blocking = sum(report.blocking for report in reports if report.ok)
     return 1 if blocking or any(not report.ok for report in reports) else 0
+
+
+def cmd_adjudicate(args) -> int:
+    """Repair the plan against its own findings, bounded, before it executes.
+
+    The loop writ was missing. `writ check` and `writ critique` produce findings;
+    this is what answers them. An adjudicator proposes a patch, writ validates it
+    against the invariants no agent is trusted with — a bar may not be lowered, a
+    requirement may not be dropped — applies it if it holds, then re-checks and
+    re-runs the critics so a finding closes on evidence rather than on the patch's
+    word.
+
+    Bounded on purpose, and separate from `writ approve --force`. Force is a human
+    accepting an objection on the record; this is an attempt to remove it. A plan
+    that is still objected to after its budget stops for a person rather than
+    looping.
+    """
+    root = Path(args.root)
+    data = state.load(root)
+    if not data["tasks"]:
+        raise WritError("there is no plan to repair (run `writ plan` first)")
+    if plans.plan_status(data)["status"] == "executing":
+        raise WritError(
+            "this plan is executing; a running plan is repaired by its gates, not "
+            "by adjudication (writ status)"
+        )
+    open_blocking = [
+        finding
+        for finding in plans.findings(data, open_only=True)
+        if finding.severity == "error"
+    ]
+    if not open_blocking:
+        stale = critics.unreviewed(data)
+        if not args.json:
+            print("nothing blocking stands against this plan")
+            _print_stale(stale)
+        elif args.json:
+            render.emit_json(
+                {"rounds": [], "stopped": "clean", "plan": dict(plans.plan_status(data))}
+            )
+        return 0
+    doc = Path(args.doc) if getattr(args, "doc", None) else None
+    directory = state.store_dir(root) / "adjudication" / f"r{plans.revision(data)}"
+
+    def announce(number: int, resolved) -> None:
+        if args.json:
+            return
+        print(f"adjudication round {number}: {len(open_blocking)} blocking")
+        print(f"  running: {resolved.display}")
+        sys.stdout.flush()
+
+    def report(round_) -> None:
+        if args.json:
+            return
+        if round_.error:
+            print(f"  round {round_.number} failed: {round_.error}", file=sys.stderr)
+            return
+        if round_.refused:
+            print(f"  writ refused the patch ({len(round_.refused)} reason(s)):")
+            for finding in round_.refused[:6]:
+                print(f"    {finding.line()}")
+            return
+        if round_.questions:
+            print(f"  raised {len(round_.questions)} question(s) for a human")
+            return
+        applied = round_.applied
+        added = ", ".join(applied.get("tasks") or []) or "none"
+        revised = ", ".join(applied.get("revised") or []) or "none"
+        print(
+            f"  applied: added {added}; revised {revised} "
+            f"(plan revision {applied.get('revision')})"
+        )
+        print(f"  blocking now: {round_.blocking_after}")
+
+    def recheck() -> list[str]:
+        """Re-run the critics against the patched plan."""
+        if args.no_critics:
+            return []
+        chosen = _chosen_critics(args)
+        if not args.json:
+            print("  re-reviewing the patched plan")
+        _run_critics(args, root=root, doc=doc, chosen=chosen, plan_path=None)
+        return []
+
+    result = adjudicate.loop(
+        root=root,
+        doc=doc,
+        directory=directory,
+        agent=getattr(args, "adjudicator_agent", None) or args.agent,
+        model=getattr(args, "adjudicator_model", None) or args.model,
+        timeout=args.timeout,
+        cwd=args.cwd,
+        max_rounds=args.max_rounds,
+        recheck=recheck,
+        stream=not args.quiet,
+        on_round=report,
+        on_start=announce,
+    )
+    data = state.load(root)
+    if args.json:
+        render.emit_json(
+            {
+                "rounds": [
+                    {
+                        "number": round_.number,
+                        "request": round_.request_id,
+                        "revision": round_.revision,
+                        "error": round_.error,
+                        "refused": [f.to_dict() for f in round_.refused],
+                        "applied": round_.applied,
+                        "questions": round_.questions,
+                        "blocking_after": round_.blocking_after,
+                    }
+                    for round_ in result.rounds
+                ],
+                "stopped": result.stopped,
+                "resolved": result.resolved,
+                "remaining": result.remaining,
+                "plan": dict(plans.plan_status(data)),
+            }
+        )
+        return 0 if result.clean else 1
+    print()
+    print(
+        f"{len(result.rounds)} round(s): {result.resolved} finding(s) resolved, "
+        f"{result.remaining} still blocking"
+    )
+    if result.stopped and result.stopped != "clean":
+        print(f"stopped: {result.stopped}")
+    if result.clean:
+        print("next: writ approve")
+    else:
+        print("next: writ check   (then writ approve --force --reason ..., or re-plan)")
+    return 0 if result.clean else 1
 
 
 def _critics_requested(args) -> bool:
@@ -1201,16 +1336,23 @@ def _list_gates(data, args):
 
 
 def _list_repairs(data, args):
-    """Every time a gate has asked for the plan to change, and what came of it."""
+    """Every time the plan has been asked to change, and what came of it.
+
+    Both occasions, in one list. A gate-scoped request names the gate that asked; a
+    plan-scoped one shows `plan`, because what asked was `writ adjudicate` before
+    any of it ran.
+    """
     items = repair.requests(data)
     if args.status:
         items = [item for item in items if item.get("status") == args.status]
     if args.task:
-        items = [item for item in items if item.get("gate") == args.task]
+        items = [
+            item for item in items if repair.scope_of(item) == args.task
+        ]
     rows = [
         [
             i.get("id", ""),
-            i.get("gate", ""),
+            repair.scope_of(i),
             i.get("status", ""),
             str(i.get("round", 1)),
             str(len(i.get("refusals") or [])),
@@ -1220,7 +1362,7 @@ def _list_repairs(data, args):
         for i in items
     ]
     return (
-        ["ID", "GATE", "STATUS", "ROUND", "REFUSED", "FINDINGS", "SUMMARY"],
+        ["ID", "SCOPE", "STATUS", "ROUND", "REFUSED", "FINDINGS", "SUMMARY"],
         rows,
         list(items),
     )

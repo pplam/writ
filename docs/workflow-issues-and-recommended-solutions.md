@@ -1,82 +1,149 @@
 # Workflow Issues and Recommended Solutions
 
-## 1. Mandatory planning quality gates
+Triaged against the implementation on 2026-09-22. Each issue below was confirmed by
+reading the cited code. Items from the original review that did not survive triage are
+listed at the end with the reason.
 
-### Existing issue
-
-The staged planning pipeline, deterministic checks, and adversarial critics are implemented, but several stages remain optional. A plan can potentially proceed after deterministic validation without:
-
-- independent critic review of the current plan revision;
-- complete coverage, dependency, scope, acceptance, and feasibility review;
-- resolution of blocking findings;
-- confirmation that all required planning artifacts exist;
-- confirmation that unresolved ambiguities have been explicitly approved.
-
-### Recommended solution
-
-Make the following prerequisites mandatory before execution:
-
-1. Requirements, repository inventory, and verification artifacts exist.
-2. Deterministic plan validation has completed.
-3. All required critics have reviewed the current plan revision.
-4. No blocking findings remain open.
-5. Every `must` requirement is covered, evidenced as existing, or explicitly approved as out of scope/deferred.
-6. No unresolved mandatory ambiguity remains without an explicit decision.
-7. Milestone and final integration gates are installed.
-8. The plan revision has not changed since the latest checks and critic reviews.
-
-Retain forced approval as an escape hatch, but require a reason and record that the normal quality gate was bypassed.
+Ordering is by urgency: priority 1 issues can corrupt state or wedge a run, priority 2
+issues let an unsound plan reach execution.
 
 ---
 
-## 2. Candidate-plan comparison is absent
+## Priority 1 — correctness and durability
 
-### Existing issue
+### 1. Worker exceptions leave prepared runs unreconciled
 
-The current workflow uses requirements extraction, repository reconnaissance, verification analysis, and one synthesis plan. Independent candidate plans are not generated or compared.
+**Confirmed.** `_prepare` claims the task by writing `task["status"] = "running"` or
+`"reviewing"` (`writ/runner.py:1069-1071`) and appends the run id. `runner.execute` is
+then called at `writ/orchestrator.py:694` with no `try/finally` that restores state:
+both handlers (`writ/orchestrator.py:701-703`) return an `Outcome` carrying an error
+string and never touch the task record.
 
-This is acceptable only if the intended workflow deliberately removes that stage. The documentation and workflow diagram should not imply that candidate-plan generation exists when it does not.
+A provider crash, subprocess failure, or any unexpected exception therefore strands the
+task mid-status with no durable outcome. The run looks active, the process is gone, and
+recovery depends on a later `reap`.
 
-### Recommended solution
+Possible stuck states:
 
-Choose one of the following explicitly:
+- task remains `running` or `reviewing`;
+- run remains active;
+- process has already disappeared.
 
-- Keep the stage removed and update all documentation to describe the actual workflow.
-- Generate multiple candidate plans for high-risk or ambiguous projects only.
-- Generate separate implementation-oriented and verification/integration-oriented plans, then have a synthesizer compare and adjudicate them.
+**Recommended solution.** Guarantee reconciliation for every prepared run:
 
-Do not concatenate candidate plans. Require the synthesizer to explain which decisions were selected and why.
+- wrap the worker lifecycle in `try/finally`;
+- if execution raises, mark the run failed or interrupted;
+- restore implementation tasks to `planned` and review tasks to `awaiting-review`;
+- persist the exception type, message, and traceback location;
+- refresh milestone state before returning.
 
----
-
-## 3. Requirements extraction can still omit design obligations
-
-### Existing issue
-
-Later stages can detect requirements dropped from the extracted inventory, but they cannot reliably detect an obligation that the requirements agent omitted in the first place unless a critic rereads the design document. Critic review is not necessarily mandatory.
-
-### Recommended solution
-
-Add an independent requirements completeness check:
-
-- require the coverage critic to reread the design document;
-- compare extracted requirements against headings, normative language, constraints, interfaces, and non-functional requirements;
-- block approval when a design obligation has no inventory entry;
-- preserve the source heading and relevant quote for every requirement.
+This is the failure that silently wedges a project, and the fix is contained.
 
 ---
 
-## 4. Baseline results are agent-reported
+### 2. State replacement lacks crash durability
 
-### Existing issue
+**Confirmed.** `_write` (`writ/state.py:170-178`) calls `tmp.write_text(...)` then
+`tmp.replace(target)`. `os.replace` is atomic against concurrent *readers*, not against
+power loss: neither the file nor the containing directory is flushed, so a machine crash
+can lose the most recent committed state.
 
-The repository inventory records baseline commands and results, but the result is supplied by the analysis agent. The system validates the result's structure, not whether the command was actually executed successfully.
+**Recommended solution.** For durable state transitions:
 
-A plan can therefore contain an inaccurate baseline such as a reported passing test suite that was never run.
+1. Write the temporary file.
+2. Flush and `fsync` the temporary file.
+3. Atomically replace the target.
+4. `fsync` the containing directory where supported.
+5. Clean up orphaned temporary files during startup.
 
-### Recommended solution
+Make this the default for state and critical run metadata, with an explicitly documented
+performance option if needed. Roughly four lines, and it is the durability floor every
+other guarantee sits on.
 
-Add a deterministic baseline runner that:
+---
+
+### 3. Process identity is a bare PID, across locks, sessions, and cancellation
+
+Three separate symptoms, one root cause and one fix. Do them as a single piece of work.
+
+**3a. Age-only stale-lock breaking — confirmed.** `_lock_is_stale`
+(`writ/state.py:213-218`) compares `st_mtime` against a flat `LOCK_STALE_SECONDS = 60.0`
+(`writ/state.py:36`), and `_release` (`writ/state.py:221`) unlinks the lock regardless of
+owner. The mtime is written once at acquire and never refreshed, so any transaction
+holding the lock longer than 60s — a slow agent write, an OS-paused process, a slow
+filesystem — has its lock stolen while still inside the critical section. That is
+concurrent writes to `state.json` with no detection.
+
+**3b. PID-only process identity — confirmed.** Ownership is recorded as a bare pid
+(`writ/runner.py:1058` `owner_pid`, `writ/orchestrator.py:215`) and checked with
+`process_alive` (`writ/runner.py:1587`), which is a `kill(pid, 0)` liveness probe. PIDs
+are reused after a process exits, so an unrelated process can be mistaken for the
+original owner: stale runs treated as active, recovery skipped, or cancellation
+(`os.killpg` at `writ/runner.py:1579`) targeting the wrong process group.
+
+**3c. Session claiming is not atomic — confirmed.** `claim_session`
+(`writ/orchestrator.py:197-215`) reads the existing pid, checks `process_alive`, then
+writes the replacement. Two processes can pass the check before either writes — a
+textbook TOCTOU on the file that is supposed to prevent double dispatch.
+
+**Recommended solution.** Record and verify a composite identity everywhere:
+
+```json
+{"pid": 4711, "start_time": 1758500000.0, "hostname": "...", "token": "..."}
+```
+
+- treat a process as the recorded owner only when the full identity matches;
+- refresh a heartbeat while a lock is held when long operations are possible;
+- break a lock only when its owner is confirmed dead or its token is demonstrably
+  orphaned;
+- use OS-level advisory locks where available;
+- keep the age timeout only as last-resort recovery, with an explicit warning;
+- create the session file with `O_CREAT | O_EXCL` or store ownership inside the state
+  transaction, and release it only when the stored token belongs to the releasing
+  process.
+
+Ranking note: 3a outranks 3b and 3c because a stolen state lock corrupts data, whereas a
+bad session claim mostly produces a confusing error.
+
+---
+
+### 4. Transient infrastructure failures are not separated from task failures
+
+**Confirmed.** The error path at `writ/orchestrator.py:701-703` flattens a provider
+timeout, a subprocess-spawn failure, a state-lock timeout, and a genuine reviewer
+rejection into the same `Outcome.error` string. Tasks burn rework attempts on transient
+failures and are then reported as having failed on technical merit.
+
+The task rework budget is not an appropriate mechanism for infrastructure retries, and
+this corrupts the signal the whole review loop depends on.
+
+**Recommended solution.** Classify failures into separate categories:
+
+- retryable infrastructure failure;
+- non-retryable task failure;
+- reviewer rejection;
+- human-blocked decision.
+
+For retryable infrastructure failures add a separate bounded retry budget, exponential
+backoff with jitter, durable retry timestamps, a recorded classification and reason, and
+idempotency keys. Report clearly that the task was not rejected on technical merit. Do
+not consume task rework attempts.
+
+---
+
+## Priority 2 — plan integrity
+
+### 5. Baseline results are agent-reported
+
+**Confirmed.** Validation checks only that `baseline_result` is an object and that
+`status` is one of pass/fail/unknown (`writ/analysis.py:546-550`). No baseline command is
+ever executed; `baseline_commands` is carried as data
+(`writ/analysis.py:561`, `writ/analysis.py:1188-1190`).
+
+A plan can therefore claim a green test suite that was never run, and every downstream
+regression judgement inherits that error.
+
+**Recommended solution.** Add a deterministic baseline runner that:
 
 - executes declared baseline commands from the repository root;
 - records the exact command, exit code, duration, and timestamp;
@@ -90,296 +157,139 @@ Commands should run under an explicit safety policy or allowlist.
 
 ---
 
-## 5. Verification links rely too heavily on generated text
+### 6. Planning quality gates are optional
 
-### Existing issue
+**Confirmed.** `approve` (`writ/plans.py:492-530`) checks exactly one thing: that no open
+finding has `severity == "error"`. There is no check that critics ran, that they reviewed
+the *current* plan revision, or that required planning artifacts exist.
 
-The verification artifact, tasks, acceptance criteria, and gates are related mainly through generated text and indirect reconciliation. A requirement may have a verification method in an artifact without a guaranteed explicit link to a task criterion and final evidence.
+The sharpest edge is revision staleness — a critic approval carried over from an earlier
+revision is worse than no approval, because it reads as review that did not happen.
 
-### Recommended solution
+This item absorbs two related findings from the original review, since both reduce to
+"make a critic mandatory and give it a better checklist":
 
-Introduce stable verification IDs and enforce an explicit chain:
+- *Requirements completeness.* Later stages can detect requirements dropped from the
+  inventory but not an obligation the requirements agent never extracted. Require the
+  coverage critic to reread the design document, compare extracted requirements against
+  headings, normative language, constraints, interfaces, and non-functional
+  requirements, block when a design obligation has no inventory entry, and preserve the
+  source heading and quote for every requirement.
+- *Semantic dependency correctness.* The graph validator catches cycles and unknown
+  references, but an acyclic graph can still order tasks impossibly. Require the
+  dependency critic for every executable plan, covering missing contract dependencies,
+  unnecessary serialization edges, shared interfaces and schemas, parallel branches that
+  cannot safely coexist, and missing integration or join tasks. Record the reason for
+  every nontrivial dependency.
+
+**Recommended solution.** Make these prerequisites mandatory before execution:
+
+1. Requirements, repository inventory, and verification artifacts exist.
+2. Deterministic plan validation has completed.
+3. All required critics have reviewed the current plan revision.
+4. No blocking findings remain open.
+5. Every `must` requirement is covered, evidenced as existing, or explicitly approved as
+   out of scope or deferred.
+6. No unresolved mandatory ambiguity remains without an explicit decision.
+7. Milestone and final integration gates are installed.
+8. The plan revision has not changed since the latest checks and critic reviews.
+
+Retain forced approval as an escape hatch. The existing `--force --reason` handling
+(`writ/plans.py:520-528`) is already the right shape: keep requiring a reason and record
+that the normal quality gate was bypassed.
+
+---
+
+### 7. Plan repair has no bounded pre-execution loop — **implemented**
+
+**The diagnosis held.** A complete repair loop existed for execution-time failures
+and had no pre-execution counterpart: `repair.open_request` took `gate_id` as a
+required argument, and gates do not exist until execution starts. During planning a
+finding had two ends — hand disposal via `plans.dispose`, or `writ approve --force`
+sweeping the lot through `accept_all`. Neither is a repair.
+
+**What was built.** `writ adjudicate` (`writ/adjudicate.py`, `commands.cmd_adjudicate`),
+the pre-execution half of the same loop:
 
 ```text
-requirement → verification method → task → acceptance evidence → milestone/final gate
+check + critics → findings → adjudicator proposes a patch → writ validates it
+→ apply → re-check → re-run the critics → repeat, bounded
 ```
 
-For example:
+It reuses the gate machinery rather than duplicating it, which was the point:
 
-```json
-{
-  "id": "VER-001",
-  "requirement_id": "REQ-001",
-  "kind": "test",
-  "command": "pytest -q tests/test_parser.py"
-}
-```
+- **Requests are scoped, not gate-keyed.** `repair.open_request` takes `gate_id` as
+  optional; `repair.PLAN_SCOPE`, `scope_of`, `is_plan_request` and `plan_request`
+  read the scope. `validate`, `apply_patch` and the round bounds are shared
+  unchanged.
+- **`revise_tasks` is new, and only valid before execution.** Most pre-execution
+  findings are about a task that is already in the plan — a vague criterion is fixed
+  by writing a better one, not by adding a task to check up on it. A gate repair
+  cannot do this (a contract whose bar somebody already met must not change), so
+  `_validate_revisions` refuses a revision on a gate-scoped request, on a task that
+  is not `planned`, and on a gate.
+- **The bar cannot be lowered.** A revision that drops a requirement the task
+  covered, reduces its criteria count, or invents a requirement is refused
+  (`dropped-requirement`, `weakened-acceptance`, `unknown-requirement`). This is the
+  invariant that stops the loop being a way to make a bad plan pass.
+- **Bounded four ways.** Rounds per plan (`repair.plan_exhausted`, `--max-rounds`,
+  default 2); refusals per request (`MAX_PATCH_ATTEMPTS`) — a refusal does not spend
+  a round, and the next attempt is told which invariant it broke; repeat findings
+  (`repair.plan_repeat_findings`); and a question, which stops the loop and reaches
+  the decision log.
+- **The scheduler stays out of it.** `orchestrator.next_job` skips plan-scoped
+  requests, so one is never dispatched against a gate that does not exist.
 
-Tasks should reference `verification_ids`, and gate evidence should reference the resulting verification records.
+**A real hole this surfaced.** `plans.record_findings` only reopened a returning
+finding if its disposition was `resolved`. The adjudicator sets `accepted` — so an
+agent could close its own objection and a re-check that still reported it would not
+reopen it, which is exactly the laundering the loop had to be unable to do. Fixed by
+`plans._reopens`: an *agent's* acceptance is a claim a later check overturns, a
+*person's* is a judgement that stands. Two tests in `tests/test_plans.py` pin both
+halves.
 
----
+The staleness signal is now consumed as well: `critics.unreviewed` already reported
+which critics had not read the current revision, and the loop re-runs them after each
+applied patch, so a finding closes on a re-review rather than on the patch's word.
 
-## 6. Plan repair is not a complete pre-execution adjudication loop
+**Coverage.** 31 tests in `tests/test_adjudicate.py` — every validation rule, the
+refuse-then-succeed path, all four stopping conditions, the critic re-read, and the
+scheduler separation. Suite at 838.
 
-### Existing issue
-
-The repository has repair machinery for findings and execution-time gate failures, but it does not consistently perform a bounded pre-execution loop of:
-
-```text
-critic findings → repair proposal → patch validation → apply → re-check → re-review
-```
-
-Persistent findings may instead require manual intervention or force approval.
-
-### Recommended solution
-
-Add a pre-execution adjudication loop:
-
-1. Run deterministic validation and all required critics.
-2. Collect open blocking findings.
-3. Ask a separate adjudicator to propose a structured patch.
-4. Validate the patch against the current revision.
-5. Apply only valid patches.
-6. Re-run deterministic checks and all critics against the new revision.
-7. Stop after a bounded number of rounds.
-8. Escalate repeated or unresolved findings to a human.
-
-A repair must not be allowed to silently change requirements, remove evidence, or weaken acceptance criteria.
-
----
-
-## 7. Unknown paths are not strict enough
-
-### Existing issue
-
-Nonexistent paths in task fences generally produce advisory notes because they may be new files. This permits a typo to look like a legitimate planned path.
-
-### Recommended solution
-
-Distinguish explicitly between:
-
-- an existing path;
-- a declared new path;
-- an unknown or unjustified path.
-
-Add a `creates` field or equivalent declaration for new files and directories. Make undeclared unknown paths blocking findings.
+**Still open, deliberately.** The loop is opt-in: `writ plan` does not run it, for the
+same reason it does not run the critics unasked — it costs an agent run plus a critic
+pass per round. Wiring it into `writ plan` behind a flag is the natural follow-on, and
+it depends on issue 6: while critic review stays optional, a plan often reaches
+approval with nothing recorded to adjudicate.
 
 ---
 
-## 8. Acceptance commands are not independently validated
+### 8. Unknown paths are advisory
 
-### Existing issue
+**Confirmed.** A fence path that does not exist produces `severity="note"`
+(`writ/plancheck.py:646-655`). A typo is therefore indistinguishable from a legitimately
+planned new file.
 
-Acceptance criteria may name commands, test files, or tools without proving that they exist or can run in the configured repository environment.
+**Recommended solution.** Distinguish explicitly between an existing path, a declared new
+path, and an unknown or unjustified path. Add a `creates` field or equivalent declaration
+for new files and directories, and make undeclared unknown paths blocking findings.
 
-### Recommended solution
-
-Add a feasibility phase that validates or safely executes acceptance commands before implementation where possible. Check:
-
-- command availability;
-- working directory;
-- referenced test paths;
-- referenced artifact paths;
-- required dependencies;
-- expected exit-code conventions.
-
-For commands that cannot run before implementation, require the plan to identify the task that creates the missing test or infrastructure.
+Small change, and it pairs naturally with issue 6.
 
 ---
 
-## 9. Semantic dependency correctness is not deterministic
+### 9. Shared working-tree parallelism remains unsafe
 
-### Existing issue
+**Confirmed as described.** The planner detects overlapping declared ownership, but agents
+can still modify undeclared files, generated files, lockfiles, or shared configuration. A
+shared working tree stays vulnerable to interference even when declared path fences do not
+overlap.
 
-The graph validator catches cycles, unknown references, and other structural errors, but not all semantically missing or unnecessary dependencies. An acyclic graph can still execute tasks in an impossible order.
+Urgent in consequence but slow in remedy: this is an architectural change, not a patch.
+Schedule it deliberately rather than squeezing it in alongside the priority 1 fixes.
 
-### Recommended solution
-
-Require the dependency critic for every executable plan and make it review:
-
-- missing contract dependencies;
-- unnecessary serialization edges;
-- shared interfaces and schemas;
-- parallel branches that cannot safely coexist;
-- missing integration or join tasks.
-
-Record the reason for every nontrivial dependency, such as a file, interface, schema, migration, or generated artifact.
-
----
-
-## 10. Milestone and final gates rely too much on agent judgement
-
-### Existing issue
-
-Milestone and final gates exist, but their conclusions can still depend primarily on a gate agent's interpretation. A statement such as “the complete product works” is not reliable evidence without executed commands and persisted artifacts.
-
-### Recommended solution
-
-Make gates evidence-driven:
-
-- run milestone-specific verification commands automatically;
-- run a canonical final verification matrix at the final gate;
-- persist command output, exit codes, and artifacts;
-- require the gate agent to interpret the evidence rather than invent it;
-- block acceptance when required evidence is absent.
-
----
-
-## 11. PID-only process identity
-
-### Existing issue
-
-Run recovery and session ownership rely primarily on recorded PIDs. PIDs can be reused after a process exits, causing Writ to mistake an unrelated process for the original owner.
-
-Potential consequences include:
-
-- stale runs treated as active;
-- stale sessions treated as active;
-- recovery skipped incorrectly;
-- cancellation targeting the wrong process.
-
-### Recommended solution
-
-Record and verify process identity using more than a PID:
-
-- PID;
-- process start time;
-- process group ID;
-- executable or command-line identity;
-- unique launch token.
-
-Only treat a process as the recorded owner when the identity matches. Use the same identity information for session claims, cancellation, and stale-run recovery.
-
----
-
-## 12. Age-only stale-lock breaking
-
-### Existing issue
-
-The state lock can be considered stale solely because its modification time exceeds a fixed age. A live writer paused by the operating system or delayed by a slow filesystem can therefore have its lock removed while still writing.
-
-This can cause concurrent writes and state loss.
-
-### Recommended solution
-
-Use ownership-aware locking:
-
-- record PID, process start time, hostname, and a unique lock token;
-- refresh a heartbeat while the lock is held when long operations are possible;
-- break a lock only when its owner is confirmed dead or its token is demonstrably orphaned;
-- use OS-level advisory locks where available;
-- preserve the age timeout only as a last-resort recovery mechanism with an explicit warning.
-
----
-
-## 13. Worker exceptions can leave prepared runs unreconciled
-
-### Existing issue
-
-The orchestrator catches worker exceptions and returns an outcome, but an exception after task/run preparation can leave the task or run in an active state without a durable outcome.
-
-Possible stuck states include:
-
-- task remains `running` or `reviewing`;
-- run remains active;
-- process has already disappeared;
-- recovery depends on a later `reap` call.
-
-### Recommended solution
-
-Guarantee reconciliation for every prepared run:
-
-- wrap the worker lifecycle in a `try/finally` block;
-- if execution raises, mark the run failed or interrupted;
-- restore implementation tasks to `planned` and review tasks to `awaiting-review` where appropriate;
-- persist the exception type, message, and traceback location;
-- refresh milestone state before returning.
-
-Add failure-injection tests at every lifecycle boundary.
-
----
-
-## 14. Session claiming is not fully atomic
-
-### Existing issue
-
-Session claiming checks whether an existing session is live and then writes a new session file. Two processes can pass the check concurrently before either writes the replacement.
-
-### Recommended solution
-
-Make session ownership atomic:
-
-- create the session file using exclusive creation (`O_CREAT | O_EXCL`), or;
-- store session ownership inside the state transaction; and
-- include a unique owner token, not only a PID.
-
-When releasing a session, remove it only if the stored token belongs to the releasing process.
-
----
-
-## 15. Transient infrastructure failures are not separated from task failures
-
-### Existing issue
-
-Provider timeouts, quota errors, subprocess-spawn failures, temporary filesystem errors, and state-lock timeouts can be recorded similarly to genuine implementation failures or review rejections.
-
-The task rework budget is not an appropriate mechanism for infrastructure retries.
-
-### Recommended solution
-
-Classify failures into separate categories:
-
-- retryable infrastructure failure;
-- non-retryable task failure;
-- reviewer rejection;
-- human-blocked decision.
-
-For retryable infrastructure failures, add:
-
-- a separate bounded retry budget;
-- exponential backoff with jitter;
-- durable retry timestamps;
-- failure classification and reason;
-- idempotency keys;
-- clear reporting that the task was not rejected on technical merit.
-
-Do not consume task rework attempts for infrastructure retries.
-
----
-
-## 16. State replacement lacks full crash durability
-
-### Existing issue
-
-State writes use a temporary file and atomic replacement, which protects readers from partially written JSON. However, the write path does not appear to guarantee that file and directory metadata have been flushed to durable storage before returning.
-
-A machine crash can therefore lose the most recent committed state.
-
-### Recommended solution
-
-For durable state transitions:
-
-1. Write the temporary file.
-2. Flush and `fsync` the temporary file.
-3. Atomically replace the target.
-4. `fsync` the containing directory where supported.
-5. Clean up orphaned temporary files during startup.
-
-Make this the default for state and critical run metadata, with an explicitly documented performance option if needed.
-
----
-
-## 17. Shared working-tree parallelism remains unsafe
-
-### Existing issue
-
-The planner detects overlapping declared ownership, but agents can still modify undeclared files, generated files, lockfiles, shared configuration, or other indirect integration points.
-
-A shared working tree therefore remains vulnerable to interference even when declared path fences do not overlap.
-
-### Recommended solution
-
-Prefer isolated worktrees or branches for parallel implementation tasks:
+**Recommended solution.** Prefer isolated worktrees or branches for parallel
+implementation tasks:
 
 ```text
 task worktree → implementation → review → integration worktree → merge/check
@@ -395,48 +305,47 @@ If shared-tree execution remains supported:
 
 ---
 
-## 18. Required failure-injection coverage is missing
+## Testing
 
-### Existing issue
+Failure-injection coverage is the verification for issues 1 through 4, not a separate work
+item. Write each test alongside the fix it covers, and have every test assert both the
+persisted run record and the resulting task state:
 
-Normal-path tests cover much of the workflow, but reliability depends on behavior during process, filesystem, locking, and state failures. These paths need explicit validation.
-
-### Recommended solution
-
-Add failure-injection tests for:
-
-- PID reuse or mismatched process identity;
+- PID reuse and mismatched process identity;
 - stale and live lock handling;
 - concurrent session claims;
-- state write failure before replacement;
-- state write failure after replacement;
+- state write failure before and after replacement;
 - subprocess spawn failure;
 - timeout and process-group termination;
 - worker exceptions after run preparation;
 - missing, malformed, or misplaced verdicts;
-- reviewer interruption;
-- supervisor disappearance;
+- reviewer interruption and supervisor disappearance;
 - transient provider and filesystem failures;
 - resume after every interrupted lifecycle stage.
 
-Each test should verify both the persisted run record and the resulting task state.
+---
+
+## Removed from this review
+
+- **Candidate-plan comparison.** Already resolved, and the original review missed it.
+  `docs/workflow-review-and-feedback-driven-replanning.md` marks stage 4 as deliberately
+  removed in its pipeline diagram and devotes a section ("Stage 4 was removed rather than
+  built") to the reasoning: with the requirement inventory fixed first, a rival plan would
+  need an unreviewed third agent to adjudicate between candidates. The documentation does
+  not overclaim, so there is nothing to align and nothing to build.
+- **Verification ID chain.** An appealing schema, but a large refactor buying traceability
+  no observed failure yet demands. Revisit if reconciliation bugs appear.
+- **Acceptance command feasibility phase.** Most acceptance commands legitimately cannot
+  run before implementation, so the phase mostly emits "the task that creates this has
+  not run yet". Low signal for the machinery required.
+- **Required tooling not guaranteed.** Misdiagnosed. The review reported `pytest` as
+  unavailable, but `.venv/bin/python` has pytest 9.1.1 and it is on `PATH`; the venv was
+  simply not activated. Declaring dev dependencies and a bootstrap command remains good
+  hygiene, but it is documentation work, not a workflow defect.
 
 ---
 
-## 19. Required tooling is not guaranteed in the execution environment
+## Note on file concentration
 
-### Existing issue
-
-The repository test suite could not be executed in the current environment because `pytest` was unavailable. This indicates that the workflow does not yet guarantee or clearly report the availability of its own validation tooling.
-
-### Recommended solution
-
-Document and enforce project setup requirements:
-
-- provide a reproducible development environment;
-- declare test and lint dependencies;
-- check required tools before planning and execution;
-- report missing tools as a distinct feasibility failure;
-- support a documented bootstrap command or virtual environment.
-
-A missing tool must not be confused with a failing test or a failed implementation.
+`writ/state.py` is 234 lines and carries both issue 2 and issue 3a. It is the
+highest-leverage file in the repository right now.

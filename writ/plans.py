@@ -337,7 +337,7 @@ def record_findings(
             existing["seen_at"] = utcnow()
             existing["seen_count"] = int(existing.get("seen_count", 1)) + 1
             existing["revision"] = current
-            if existing.get("disposition") == "resolved":
+            if _reopens(existing):
                 # It came back. Reopen rather than record a second finding: the
                 # useful fact is that this objection has now survived a repair.
                 existing["disposition"] = "open"
@@ -375,6 +375,35 @@ def record_findings(
             payload["resolved_by"] = "writ"
             payload["resolved_revision"] = current
     return written
+
+
+#: actors whose disposition a later check may overturn.
+#:
+#: An agent closing its own objection is a claim, not a fact. A human doing it is a
+#: judgement, and judgements stand.
+AGENT_ACTORS = ("adjudicator", "repair-planner", "writ")
+
+
+def _reopens(payload: dict[str, Any]) -> bool:
+    """Whether a finding that has come back should reopen.
+
+    `resolved` always reopens: it means a check had stopped seeing the finding and
+    now sees it again, which is precisely the repeat this ledger exists to catch.
+
+    `accepted` reopens only when an *agent* accepted it. That is the hole this
+    closes: a repair planner may accept a finding and say it added work that closes
+    it, and if the next check disagrees, the planner's word must not be what
+    settles it — otherwise the loop could launder a plan past its own critics by
+    asserting each objection away. A person who accepted a finding on the record has
+    made a judgement about a known objection, and re-reporting it does not overturn
+    that; they are told it is still open by `writ check` either way.
+    """
+    disposition = payload.get("disposition")
+    if disposition == "resolved":
+        return True
+    if disposition != "accepted":
+        return False
+    return str(payload.get("disposed_by", "")) in AGENT_ACTORS
 
 
 def _finding_key(payload: dict[str, Any]) -> str:

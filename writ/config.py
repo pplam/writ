@@ -97,6 +97,19 @@ DEFAULT_LEVEL = 2
 #: `--interval`: seconds between redraws under `writ status --watch`.
 DEFAULT_INTERVAL = 2.0
 
+#: `--max-rounds`: how many repairs may land on a plan before it stops for a human.
+#:
+#: Read from `repair.py` rather than restated, because the same bound governs the
+#: gate loop and the pre-execution one, and two numbers that had to agree would
+#: eventually not.
+def _max_repair_rounds() -> int:
+    from .repair import DEFAULT_MAX_REPAIR_ROUNDS
+
+    return DEFAULT_MAX_REPAIR_ROUNDS
+
+
+MAX_REPAIR_ROUNDS = _max_repair_rounds()
+
 #: Sentinel: derive this field's written default from `DEFAULTS`.
 #:
 #: Most fields have exactly one builtin, stated once in the `Default` that backs
@@ -332,6 +345,24 @@ FIELDS: dict[str, Field] = {
         choices=_critic_names,
         doc="which critics run, of @CRITICS@ (@flag@). null is all of them."
         " @PLAN_CRITICS@ decides whether writ plan runs them at all",
+    ),
+    # ---------------------------------------------------------- adjudicate
+    "adjudicate.max_rounds": Field(
+        # `tally`, not `count`: 0 is meaningful and means adjudicate nothing, which
+        # is how a project turns the loop off without turning the command off.
+        kind="tally",
+        flag="--max-rounds",
+        doc="how many repairs may land on a plan before it stops for a human"
+        " (@flag@). A finding still open past this needs a decision, not a patch",
+    ),
+    "adjudicate.critics": Field(
+        kind="flag",
+        flag="--no-critics",
+        # Configured as a person would say it and reaching argparse as `no_critics`,
+        # so the value has to be flipped on the way. See `_for_args`.
+        invert=True,
+        doc="re-run the critics after each applied patch (@flag@ turns it off)."
+        " Off is cheaper and blind to whatever only a critic sees",
     ),
     # ------------------------------------------------------------- dispatch
     "dispatch.detach": Field(
@@ -589,6 +620,20 @@ DEFAULTS: dict[str, dict[str, Default]] = {
             "model": Default("agents.critic.model"),
             "timeout": Default("agents.critic.timeout", AGENT_TIMEOUT),
             "critics": Default("critique.critics"),
+        },
+        "adjudicate": {
+            # The adjudicator runs on the critic's agent, not the planner's. It is
+            # doing the critics' kind of work — reading a plan against findings —
+            # and a project that pointed the critics at a stronger model meant that
+            # for this too.
+            "agent": Default("agents.critic.command", "pi"),
+            "model": Default("agents.critic.model"),
+            "timeout": Default("agents.critic.timeout", AGENT_TIMEOUT),
+            "max_rounds": Default("adjudicate.max_rounds", MAX_REPAIR_ROUNDS),
+            "critic_agent": Default("agents.critic.command"),
+            "critic_model": Default("agents.critic.model"),
+            "critics": Default("critique.critics"),
+            "no_critics": Default("adjudicate.critics", True),
         },
         "check": {"all": Default("check.all", False)},
         "coverage": {"uncovered": Default("coverage.uncovered", False)},
@@ -945,6 +990,8 @@ SECTION_DOCS: dict[str, str] = {
     "run": "how `writ run` walks the graph",
     "plan": "what `writ plan` does before and after it commits a plan",
     "critique": "which critics read a committed plan (writ critique)",
+    "adjudicate": "the bounded repair loop that answers a plan's findings before"
+    " it executes (writ adjudicate)",
     "dispatch": "how one task is handed to an agent (writ dispatch)",
     "check": "what `writ check` reports",
     "coverage": "what `writ coverage` reports",

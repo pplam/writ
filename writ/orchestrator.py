@@ -289,6 +289,12 @@ def next_job(
     for request in repair.open_requests(data):
         if request.get("status") not in ("open", "planning"):
             continue
+        if repair.is_plan_request(request):
+            # A plan-scoped request has no gate to dispatch against. It belongs to
+            # `writ adjudicate`, which runs before execution; reaching it here would
+            # mean a plan was approved mid-adjudication, and the repair it is still
+            # waiting for is not this scheduler's to plan.
+            continue
         if not repair.patches_left(request):
             # Writ has refused everything this planner proposed. The gate is held
             # for a human; re-planning it would spend agents on the same refusal.

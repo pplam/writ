@@ -28,7 +28,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import analysis, commands, config, critics
+from . import analysis, commands, config, critics, repair
 from .server import DEFAULT_HOST, DEFAULT_PORT
 from .decisions import SETTABLE_DECISION_STATUSES
 from .model import DEFAULT_MAX_REWORK, JUDGED_STATUSES, SETTABLE_STATUSES
@@ -305,6 +305,68 @@ def build_parser() -> argparse.ArgumentParser:
         help="print nothing; exit 1 if anything blocking stands",
     )
     p.set_defaults(func=commands.cmd_check)
+
+    p = sub.add_parser(
+        "adjudicate",
+        help="repair the plan against its open findings, bounded, before it runs",
+    )
+    p.add_argument(
+        "doc",
+        nargs="?",
+        help="the design document, if the adjudicator should read it",
+    )
+    p.add_argument(
+        "--agent",
+        help="adjudicator agent command (default: agents.critic, else the planner)",
+    )
+    p.add_argument("--model", help="model for the adjudicator")
+    p.add_argument(
+        "--critic-agent",
+        help=(
+            "agent for the critics that re-read each patched plan "
+            "(default: the adjudicator's). Separate because they are separate "
+            "jobs: one proposes the change, the others judge it"
+        ),
+    )
+    p.add_argument("--critic-model", help="model for the re-reading critics")
+    p.add_argument(
+        "--timeout", type=int, help="seconds before the adjudicator is killed"
+    )
+    p.add_argument("--cwd", help="working directory for the agent (default: --root)")
+    p.add_argument(
+        "--max-rounds",
+        type=int,
+        help=(
+            "how many patches may land before the plan stops for a human "
+            f"(default: {repair.DEFAULT_MAX_REPAIR_ROUNDS})"
+        ),
+    )
+    p.add_argument(
+        "--critics",
+        nargs="*",
+        metavar="NAME",
+        help=(
+            "which critics re-read the patched plan (default: all). "
+            + ", ".join(critic.name for critic in critics.CRITICS)
+        ),
+    )
+    p.add_argument(
+        "--no-critics",
+        action="store_true",
+        default=None,
+        help=(
+            "re-check deterministically between rounds but do not re-run the "
+            "critics; cheaper, and blind to anything only a critic can see"
+        ),
+    )
+    p.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        default=None,
+        help="do not mirror the adjudicator's output to the terminal",
+    )
+    p.set_defaults(func=commands.cmd_adjudicate)
 
     p = sub.add_parser(
         "critique",

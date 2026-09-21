@@ -210,6 +210,66 @@ def test_a_finding_keeps_its_id_across_re_checks(inventoried, project):
     assert {f.id for f in second if f.severity == "error"} == ids
 
 
+def _critic_finding(message="nothing covers the queue depth view"):
+    return plancheck.Finding(
+        severity="error",
+        category="missing-coverage",
+        message=message,
+        where="REQ-003",
+        source="critic:coverage",
+    )
+
+
+def test_an_agents_acceptance_does_not_survive_the_finding_coming_back(
+    inventoried, project
+):
+    """A repair's claim to have closed a finding is not what settles it.
+
+    Otherwise the pre-execution repair loop could launder a plan past its own
+    critics: accept each objection, assert work that closes it, and the ledger would
+    agree. The check that still reports it has to win.
+    """
+    with state.transaction(project) as data:
+        written = plans.record_findings(
+            data, [_critic_finding()], scope="critic:coverage"
+        )
+        plans.dispose(
+            data, written[0].id, "accepted", actor="adjudicator", change="added a task"
+        )
+        assert plans.get_finding(data, written[0].id)["disposition"] == "accepted"
+        plans.record_findings(data, [_critic_finding()], scope="critic:coverage")
+        record = plans.get_finding(data, written[0].id)
+    assert record["disposition"] == "open"
+    assert record["reopened_at"]
+    assert record["seen_count"] == 2
+
+
+def test_a_persons_acceptance_stands_when_the_finding_comes_back(
+    inventoried, project
+):
+    """A human accepting a known objection has made a judgement, not a claim.
+
+    `writ check` still lists it, so nothing is hidden — but a re-check does not
+    overturn a decision somebody signed.
+    """
+    with state.transaction(project) as data:
+        written = plans.record_findings(
+            data, [_critic_finding()], scope="critic:coverage"
+        )
+        plans.dispose(
+            data,
+            written[0].id,
+            "accepted",
+            actor="tim",
+            reason="shipping without the depth view on purpose",
+        )
+        plans.record_findings(data, [_critic_finding()], scope="critic:coverage")
+        record = plans.get_finding(data, written[0].id)
+    assert record["disposition"] == "accepted"
+    assert record["disposed_by"] == "tim"
+    assert "reopened_at" not in record
+
+
 def test_a_finding_that_goes_away_is_resolved_not_deleted(inventoried, project):
     with state.transaction(project) as data:
         data["tasks"]["M01-001"]["acceptances"] = [
