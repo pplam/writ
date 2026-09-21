@@ -775,6 +775,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="only report finished work",
     )
+    # The negative is the one worth spelling, because streaming is the default: a
+    # run that prints nothing for ten minutes is indistinguishable from a hung one.
+    p.add_argument(
+        "--stream",
+        dest="no_stream",
+        action="store_false",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--no-stream",
+        dest="no_stream",
+        action="store_true",
+        default=None,
+        help=(
+            "do not mirror the agents' own output; report transitions only. Each "
+            "line is labelled with its task and role, and the full transcript is "
+            "on disk either way (writ logs <task>)"
+        ),
+    )
     p.add_argument(
         "--dry-run",
         action="store_true",

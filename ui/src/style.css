@@ -947,6 +947,66 @@ pre.command {
 
 .held { border-left-color: var(--i-review); }
 
+/*
+ * The planning pipeline, as a sequence.
+ *
+ * Numbered and ordered because the order is the content: which stage stopped
+ * decides what the plan does and does not rest on, and a set of badges would not
+ * say that. A pending stage is dimmed rather than hidden — a pipeline missing its
+ * verification analysis has to look different from one that never had a third
+ * stage at all.
+ */
+.stage-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.stage {
+  border: 1px solid var(--line);
+  border-left-width: 2.5px;
+  border-left-color: var(--edge);
+  border-radius: var(--radius);
+  padding: 8px 12px;
+  background: var(--panel);
+}
+
+.stage header { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.stage p { margin: 3px 0 0; }
+.stage-mark { font-family: var(--mono); color: var(--dim); }
+
+.stage.ok { border-left-color: var(--i-completed); }
+.stage.reused { border-left-color: var(--i-running); }
+.stage.failed { border-left-color: var(--i-failed); }
+.stage.pending { opacity: 0.6; border-left-style: dashed; }
+
+.stage.ok .stage-mark { color: var(--i-completed); }
+.stage.failed .stage-mark { color: var(--i-failed); }
+
+.pill.ok, .pill.reused { background: var(--s-planned); color: var(--dim); }
+.pill.pending { border: 1px dashed var(--edge); color: var(--faint); }
+
+/*
+ * What the suite did before the plan existed.
+ *
+ * Sunken rather than a card of its own: it belongs to the inventory stage above it,
+ * and a red border here would read as this plan having broken something.
+ */
+.baseline {
+  margin-top: 10px;
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  background: var(--sunken);
+}
+
+.baseline header { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.baseline p { margin: 4px 0 0; }
+.baseline .meta-row { margin-top: 4px; }
+.baseline.bad { background: var(--s-failed); }
+
 .finding .command, .held .command, .card .ruling .command { margin: 8px 0 0; }
 
 /* The filter chip for the view you are on. */

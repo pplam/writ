@@ -85,6 +85,44 @@ def test_snapshot_matches_the_typescript_interface(worked):
     assert set(api.everything(worked)) == declared_fields("Snapshot")
 
 
+def test_plan_matches_the_typescript_interface(worked):
+    data = state.load(worked)
+    assert set(api.plan(data)) == declared_fields("Plan")
+
+
+def test_pipeline_matches_the_typescript_interface():
+    """The pipeline payload, and each stage row in it.
+
+    Built from a record rather than by planning a project, because the fields under
+    test are the ones a plan *without* a full pipeline still has to carry: the
+    contract is that a dashboard can render the shape either way.
+    """
+    payload = api._pipeline(
+        {
+            "pipeline": {
+                "plan_id": "design-20250101T000000",
+                "directory": ".writ/plans/design-20250101T000000",
+                "at": "2025-01-01T00:00:00+00:00",
+                "stages": {
+                    "requirements": {
+                        "artifact": ".writ/plans/x/requirements.json",
+                        "reused": False,
+                        "exit_code": 0,
+                        "error": "",
+                        "at": "2025-01-01T00:00:00+00:00",
+                    }
+                },
+                "requirement_ids": ["REQ-001"],
+                "baseline": {"status": "pass", "commands": ["pytest -q"]},
+            }
+        }
+    )
+    assert set(payload) == declared_fields("Pipeline")
+    assert set(payload["baseline"]) == declared_fields("PipelineBaseline")
+    for row in payload["stage_rows"]:
+        assert set(row) == declared_fields("PipelineStage")
+
+
 def test_run_row_and_detail_match_the_typescript_interfaces(writ, design, project):
     writ("init")
     writ("plan", str(design), *LEGACY_PLAN)

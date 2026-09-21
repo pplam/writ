@@ -716,6 +716,107 @@ def test_a_plan_without_a_pipeline_reports_none(approved, project):
     assert api.plan(state.load(project))["pipeline"] == {}
 
 
+def test_the_api_reports_every_stage_in_pipeline_order(writ, project, design):
+    """The dashboard draws the pipeline, so it needs the sequence, not a set.
+
+    `stages` is a sorted set of names: `inventory, requirements, verification`,
+    which is neither the order they run in nor a statement about what is missing.
+    """
+    from writ import api
+
+    writ("init")
+    writ("plan", str(design), *staged())
+    rows = api.plan(state.load(project))["pipeline"]["stage_rows"]
+    assert [row["name"] for row in rows] == list(analysis.STAGE_NAMES)
+    assert [row["state"] for row in rows] == ["ok", "ok", "ok"]
+    assert [row["artifact"] for row in rows] == [
+        stage.artifact for stage in analysis.STAGES
+    ]
+
+
+def test_a_stage_with_no_entry_reports_pending_rather_than_vanishing():
+    """A stage the record does not mention is named, and marked as not run.
+
+    Not reachable from the CLI today: the record is only written after a synthesis
+    that succeeded, and a synthesis only runs once every stage has. It is in the read
+    model because the alternative is a payload that shrinks — a pipeline recorded by
+    a writ with three stages, read by a writ with four, would silently describe the
+    fourth as though it were never part of the pipeline at all, and "this plan rests
+    on an analysis nobody ran" is not a thing to infer from an absent key.
+    """
+    from writ import api
+
+    payload = api._pipeline(
+        {
+            "pipeline": {
+                "plan_id": "design-20250101T000000",
+                "stages": {
+                    "requirements": {
+                        "artifact": "requirements.json",
+                        "exit_code": 0,
+                        "error": "",
+                    }
+                },
+            }
+        }
+    )
+    states = {row["name"]: row["state"] for row in payload["stage_rows"]}
+    assert states == {
+        "requirements": "ok",
+        "inventory": "pending",
+        "verification": "pending",
+    }
+
+
+def test_a_failed_stage_is_distinguished_from_one_that_did_not_run():
+    """Both leave no artifact, and they are opposite things to go and look at."""
+    from writ import api
+
+    payload = api._pipeline(
+        {
+            "pipeline": {
+                "plan_id": "design-20250101T000000",
+                "stages": {
+                    "requirements": {"artifact": "requirements.json", "error": ""},
+                    "inventory": {
+                        "artifact": "inventory.json",
+                        "error": "wrote no artifact (exit 1)",
+                        "exit_code": 1,
+                    },
+                },
+            }
+        }
+    )
+    rows = {row["name"]: row for row in payload["stage_rows"]}
+    assert rows["inventory"]["state"] == "failed"
+    assert rows["inventory"]["error"] == "wrote no artifact (exit 1)"
+    assert rows["verification"]["state"] == "pending"
+    assert rows["verification"]["error"] == ""
+
+
+def test_a_reused_stage_says_so_rather_than_reading_as_a_fresh_run(
+    writ, project, design
+):
+    """Resuming a pipeline costs nothing, and the dashboard should not claim it did.
+
+    The stage count is the cost of a `writ plan`, so a dashboard that showed three
+    fresh analyses for a resume that paid for none would misreport what the plan cost
+    and, worse, how recently each part of it was established.
+    """
+    from writ import api
+
+    writ("init")
+    writ("plan", str(design), "--stage", "requirements", *staged())
+    plan_id = next(state.plans_dir(project).iterdir()).name
+    writ("plan", str(design), "--plan-id", plan_id, *staged())
+    rows = {
+        row["name"]: row for row in api.plan(state.load(project))["pipeline"]["stage_rows"]
+    }
+    assert rows["requirements"]["state"] == "reused"
+    assert rows["inventory"]["state"] == "ok"
+    assert rows["verification"]["state"] == "ok"
+
+
 def test_a_requirement_citing_a_heading_that_does_not_exist_is_flagged(
     writ, project, design
 ):

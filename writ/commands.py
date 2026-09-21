@@ -2489,9 +2489,18 @@ def cmd_run(args) -> int:
     """Walk the DAG: dispatch what is ready, review what is reported, repeat.
 
     The individual commands each move one task one step. This is the one that
-    finishes a project, so its output is a progress log rather than a transcript:
-    with several agents interleaved, mirroring their stdout would be unreadable.
-    Each agent's full output is on disk, and `writ logs <task>` shows it.
+    finishes a project, so its output is a progress log first: one line per
+    transition, which is what a reader comes back to after lunch and reads.
+
+    The agents' own output is mirrored underneath it, each line tagged with the task
+    and role it came from. That used to be left out on the grounds that several
+    interleaved agents would be unreadable, which was true of an unlabelled
+    character-at-a-time mirror and is the reason `_tee` now writes whole lines under
+    one lock. The tradeoff it was trading against is worse: a silent terminal for
+    the length of a model call is indistinguishable from a hung one, and the state
+    it hides is exactly the state someone needs to see. `--no-stream` restores the
+    progress log alone, and `--json` never mirrors, because a machine-readable
+    stream with an agent's prose in it is not machine-readable.
     """
     root = Path(args.root)
     data = state.load(root)
@@ -2539,6 +2548,9 @@ def cmd_run(args) -> int:
 
     orchestrator.claim_session(root, force=args.force)
     parallel = max(1, args.parallel)
+    # `--json` is a machine-readable stream and an agent's prose is not part of it.
+    # `--quiet` asks for less, and an agent's whole transcript is not less.
+    stream = not getattr(args, "no_stream", False) and not args.json and not args.quiet
     if not args.json:
         print(
             f"running up to {parallel} agent{'s' if parallel > 1 else ''} at a time"
@@ -2552,8 +2564,14 @@ def cmd_run(args) -> int:
             )
         )
         print(f"logs: {state.runs_dir(root)}")
+        if not stream:
+            print("streaming off: transitions only (writ logs <task> for output)")
         print("─" * 62)
-    reporter = _RunReporter(quiet=args.quiet, json_events=args.json)
+    # Shared with the agents' mirrored output so the two cannot interleave mid-line.
+    output_lock = threading.Lock()
+    reporter = _RunReporter(
+        quiet=args.quiet, json_events=args.json, lock=output_lock
+    )
     try:
         session = orchestrator.run(
             root,
@@ -2569,6 +2587,8 @@ def cmd_run(args) -> int:
             cwd=args.cwd,
             max_rework=getattr(args, "max_rework", None),
             on_event=reporter,
+            stream=stream,
+            lock=output_lock,
         )
     finally:
         orchestrator.release_session(root)
@@ -2672,14 +2692,20 @@ def _first_line(text: str, limit: int = 96) -> str:
 class _RunReporter:
     """Turns scheduler events into a readable progress log.
 
-    Interleaved agent output is noise, so this reports transitions instead: what
-    started, what it produced, and what that unblocked.
+    Transitions only: what started, what it produced, and what that unblocked. When
+    the agents' own output is streamed it runs underneath these lines rather than
+    replacing them — the transcript says what an agent did, and this says what writ
+    did about it, which is the shorter and more re-readable of the two.
     """
 
-    def __init__(self, *, quiet: bool, json_events: bool) -> None:
+    def __init__(
+        self, *, quiet: bool, json_events: bool, lock: threading.Lock | None = None
+    ) -> None:
         self.quiet = quiet
         self.json_events = json_events
-        self.lock = threading.Lock()
+        # The same lock the streamed agent output holds, when there is any, so a
+        # transition line and an agent's line cannot land on top of each other.
+        self.lock = lock or threading.Lock()
 
     def __call__(self, name: str, payload: dict[str, Any]) -> None:
         with self.lock:

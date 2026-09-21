@@ -125,6 +125,28 @@ time.sleep(60)
 """
 
 
+#: An implementer that talks while it works, for the streaming tests. One line per
+#: iteration, flushed, so two of these running at once really do interleave.
+NOISY = """
+import json, re, sys
+prompt = sys.stdin.read()
+path = re.search(r'^  (\\S*verdict\\.json)$', prompt, re.M).group(1)
+total = int(re.search(r'has (\\d+) acceptance criteri', prompt).group(1))
+task = re.search(r'\\b(M\\d+-\\d+|G-[A-Z0-9]+)\\b', prompt).group(1)
+for i in range(40):
+    sys.stdout.write('%s thinking step %d of the work\\n' % (task, i))
+    sys.stdout.flush()
+open(path, "w").write(json.dumps({
+    "outcome": "complete",
+    "summary": "did the work",
+    "criteria": [
+        {"number": i, "status": "passed", "evidence": "ran: pytest -q -> ok"}
+        for i in range(1, total + 1)
+    ],
+}))
+"""
+
+
 def agent(script: str) -> str:
     return f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
 
@@ -1246,3 +1268,104 @@ def test_a_run_that_judged_nothing_does_not_report_a_judgement(planned, writ, pr
     data = state.load(project)
     run = next(r for r in data["runs"].values() if r["role"] == "reviewer")
     assert run["resulting_status"] == "awaiting-review"
+
+
+# --------------------------------------------------------------------------
+# streaming the agents' own output
+
+
+def test_a_run_mirrors_each_agents_output_labelled_by_task_and_role(
+    planned, writ, agents_pair
+):
+    """The default. A silent terminal and a hung agent look identical otherwise.
+
+    The label is the whole reason this can be on by default: `writ run` streams
+    several agents into one terminal, and unlabelled output would be a transcript
+    with no way to tell who was speaking.
+    """
+    code, out, _ = writ("run", "--agent", agent(NOISY), "--reviewer", agent(REVIEWER))
+    assert code == 0
+    assert "M01-001 impl   | M01-001 thinking step 0 of the work" in out
+    assert "M01-001 review | reviewed" in out
+    # and the progress log is still there, underneath it
+    assert "dispatch M01-001" in out
+
+
+def test_no_stream_keeps_the_progress_log_and_drops_the_transcript(
+    planned, writ, agents_pair
+):
+    code, out, _ = writ(
+        "run", "--no-stream", "--agent", agent(NOISY), "--reviewer", agent(REVIEWER)
+    )
+    assert code == 0
+    # No mirrored line: the agent's script is quoted in the dispatch line either
+    # way, so the test is for the streamed form, not for the words.
+    assert "impl   |" not in out
+    assert "M01-001 thinking step" not in out
+    assert "streaming off" in out
+    assert "dispatch M01-001" in out
+
+
+def test_quiet_does_not_mean_an_entire_transcript(planned, writ):
+    """`--quiet` asks for less, and an agent's whole output is not less."""
+    code, out, _ = writ(
+        "run", "--quiet", "--agent", agent(NOISY), "--reviewer", agent(REVIEWER)
+    )
+    assert code == 0
+    assert "impl   |" not in out
+
+
+def test_json_output_is_not_polluted_by_streamed_prose(planned, writ):
+    """A machine-readable stream with an agent's prose in it is not machine-readable."""
+    code, out, _ = writ(
+        "--json", "run", "--agent", agent(NOISY), "--reviewer", agent(REVIEWER)
+    )
+    assert code == 0
+    assert "impl   |" not in out
+    for line in out.splitlines():
+        if line.strip() in ("{", "}") or line.startswith(("  ", "}")):
+            continue
+        assert line.startswith("{"), line
+
+
+def test_streaming_leaves_the_transcript_on_disk_unprefixed(planned, writ, project):
+    """The label is for the terminal. The file is what the agent actually wrote."""
+    writ(
+        "run",
+        "--agent",
+        agent(NOISY),
+        "--reviewer",
+        agent(REVIEWER),
+        "--max-tasks",
+        "1",
+    )
+    run_id = next(
+        run["id"] for run in state.load(project)["runs"].values() if run["role"] == "agent"
+    )
+    log = (state.run_dir(project, run_id) / "stdout.log").read_text()
+    assert "M01-001 thinking step 0 of the work" in log
+    assert "impl   |" not in log
+
+
+def test_concurrent_agents_never_splice_a_line(planned, writ, project):
+    """Two agents mirroring at once, and every line whole and attributed.
+
+    The reason `writ run` streamed nothing before: a character-at-a-time mirror puts
+    two agents' words inside each other's sentences, and the label at the start of a
+    line means nothing if something else can write before the line ends.
+    """
+    chain(writ, 2)
+    code, out, _ = writ(
+        "run", "--parallel", "3", "--agent", agent(NOISY), "--reviewer", agent(REVIEWER)
+    )
+    assert code == 0
+    mirrored = [line for line in out.splitlines() if " | " in line]
+    assert len(mirrored) > 40, "expected the agents to have been streamed at all"
+    for line in mirrored:
+        # Exactly one label, and the task it names is the task that spoke.
+        assert line.count(" | ") == 1, line
+        label, said = line.split(" | ", 1)
+        task, role = label.split()
+        assert role in ("impl", "review")
+        if "thinking step" in said:
+            assert said.startswith(f"{task} thinking step"), line

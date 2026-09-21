@@ -182,11 +182,50 @@ export interface Plan {
   uncovered: string[];
   open_repairs: string[];
   held_gates: HeldGate[];
+  /** What the staged pipeline produced, or absent for a single-shot plan. */
+  pipeline: Pipeline | Record<string, never>;
 }
 
 export interface HeldGate {
   id: string;
   reason: string;
+}
+
+/**
+ * The staged planning pipeline: the analyses a plan was built on.
+ *
+ * Empty for a plan from the single-shot planner, which is why every field is
+ * optional at the call site — `pipeline.plan_id` is the presence test.
+ */
+export interface Pipeline {
+  plan_id: string;
+  directory: string;
+  at: string;
+  stages: string[];
+  stage_rows: PipelineStage[];
+  requirements: number;
+  ambiguities: number;
+  unresolved_ambiguities: number;
+  undemonstrable: string[];
+  baseline: PipelineBaseline;
+}
+
+export interface PipelineStage {
+  name: string;
+  summary: string;
+  /** `pending` means the pipeline never reached it, not that it failed. */
+  state: 'ok' | 'reused' | 'failed' | 'pending';
+  artifact: string;
+  error: string;
+  exit_code: number | null;
+  at: string;
+}
+
+export interface PipelineBaseline {
+  /** Whether the suite passed *before* any of this plan's work started. */
+  status: string;
+  commands: string[];
+  known_failures: string[];
 }
 
 /** One objection to the plan, from writ's own checks or from a gate. */

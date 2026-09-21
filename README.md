@@ -663,7 +663,7 @@ The sections mirror the commands:
 
 | section | what it holds |
 |---|---|
-| `run` | `parallel`, `order`, `max_rework` (which `writ review` honours too, being the same budget), `max_tasks` |
+| `run` | `parallel`, `order`, `max_rework` (which `writ review` honours too, being the same budget), `max_tasks`, `stream` |
 | `plan` | `stages`, `gates`, `chain`, `critics`, `auto_approve`, `refresh`, `instructions`, `extract`, `level`, `flat` |
 | `critique` | `critics` — which of them run |
 | `dispatch` | `detach` |
@@ -791,7 +791,7 @@ operates on.
 
 | Command | Purpose |
 |---|---|
-| `writ run [--parallel N] [--order id\|depth\|unlocks] [--max-tasks N] [--max-rework N] [--agent CMD] [--model M] [--reviewer CMD] [--reviewer-model M] [--reviewer-timeout S] [--timeout S] [--cwd D] [--force] [--quiet] [--dry-run]` | walk the whole graph until it is done or stuck |
+| `writ run [--parallel N] [--order id\|depth\|unlocks] [--max-tasks N] [--max-rework N] [--agent CMD] [--model M] [--reviewer CMD] [--reviewer-model M] [--reviewer-timeout S] [--timeout S] [--cwd D] [--force] [--quiet] [--no-stream] [--dry-run]` | walk the whole graph until it is done or stuck |
 | `writ dispatch <id> [--agent CMD] [--model M] [--detach] [--force] [--timeout S] [--cwd D] [--quiet] [--dry-run] [-- args]` | an agent implements the task and reports a verdict |
 | `writ review [id] [--agent CMD] [--model M] [--timeout S] [--cwd D] [--max-rework N] [--force] [--quiet] [--dry-run]` | a second agent verifies and signs off; no id reviews all awaiting |
 | `writ cancel [run-id]` | stop a run, or reap dead ones when given no id |
@@ -932,6 +932,30 @@ them apart is how a plan gets approved with a requirement nobody implemented —
 status looked fine on its own. Gates held for a human come first when there are
 any, because that is the state where nothing is running, nothing is broken, and
 nothing will change until a person acts.
+
+It also shows the pipeline the plan came out of — the three analyses, in the order
+they ran, each with the artifact it wrote and whether it was run or reused:
+
+```
+Pipeline  design-20250101T091200                      2 hours ago
+
+✓ requirements  ok  requirements.json    what the design document obliges
+✓ inventory     ok  inventory.json       what the repository already is and tests
+✓ verification  ok  verification.json    how each obligation could be demonstrated
+
+3 requirements inventoried    2 undemonstrable
+
+Baseline  fail   the suite was already failing when planning started
+ran pytest -q
+2 known failures: tests/test_legacy.py::test_a  tests/test_legacy.py::test_b
+```
+
+Two things there are worth the space. A stage marked `pending` never ran, which
+says what the plan does *not* rest on: with no verification artifact, nothing
+worked out how any requirement would be demonstrated, and every acceptance bar in
+the plan is the synthesizing agent's own invention. And the baseline is the
+repository's own suite *before* any of this work started — a project whose tests
+were already red will otherwise blame that on whichever task first runs into it.
 
 It is read-only, like the rest of the dashboard. Disposing of a finding takes a
 reason, and a reason is something to type deliberately, so the page shows the
@@ -1297,9 +1321,8 @@ question is only ever asked in one place.
 
 ### Reading the progress log
 
-The log is one line per event, not a transcript. Several agents talking at once
-is unreadable, so `writ run` reports transitions instead — what started, what it
-produced, and what that changed:
+The log is one line per event: what started, what it produced, and what that
+changed.
 
 ```
 dispatch M01-002  ->  claude -p                 an agent started
@@ -1342,11 +1365,37 @@ parse, so no criterion moved and the task went back to `planned` — it kept the
 three bars the implementer had already earned rather than losing them to a
 reviewer's malformed file.
 
-`--quiet` drops the started lines and keeps the transitions. `--json` emits the
-same events as objects, each carrying `status`, `criteria`, `unmet`, `summary`,
-and `decisions`, so a wrapper does not have to parse the text.
+Underneath those lines, each agent's own output is mirrored as it arrives, every
+line tagged with the task and the role it came from:
 
-Full agent output is always on disk, whatever the log shows:
+```
+dispatch M01-002  ->  claude -p
+M01-002 impl   | reading src/frame.py and the two tests that cover it
+M01-002 impl   | running: pytest -q tests/test_frame.py
+M01-002 impl   | 14 passed
+         ? M01-002  awaiting-review  3/3
+review   M01-002  ->  codex exec -
+M01-002 review | re-running the command the verdict cites
+```
+
+This used to be left out, on the grounds that several agents talking at once is
+unreadable. That was true of the mirror writ had — it copied a character at a
+time, so two agents ended up inside each other's sentences. It writes whole lines
+under one lock now, shared with the progress log, so with `--parallel 4` every
+line still arrives intact and says who is talking. The tradeoff it was trading
+against is the worse one: a terminal that prints nothing for the length of a model
+call is indistinguishable from a hung one, and "nothing is happening" is exactly
+the state you need to be able to see.
+
+`--no-stream` goes back to the progress log alone, and `run.stream: false` in
+`config.json` makes that the project's default. `--quiet` drops the started lines
+and does not mirror. `--json` emits the events as objects — each carrying
+`status`, `criteria`, `unmet`, `summary`, and `decisions` — and never mirrors,
+because a machine-readable stream with an agent's prose in it is not
+machine-readable.
+
+Full agent output is always on disk, whatever the log shows, and the file is what
+the agent wrote — the labels belong to the terminal, not the transcript:
 
 ```bash
 writ logs M01-002                      # what that agent actually printed

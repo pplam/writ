@@ -743,14 +743,45 @@ TIMEOUT_NOTE = "writ: agent exceeded its timeout and was terminated"
 
 
 def _tee(
-    source: IO[str], sink: IO[str], mirror: IO[str] | None, prefix: str = ""
+    source: IO[str],
+    sink: IO[str],
+    mirror: IO[str] | None,
+    prefix: str = "",
+    lock: threading.Lock | None = None,
 ) -> None:
     """Copy a stream to a file and optionally to the terminal, line by line.
 
     Read in small chunks rather than by line: an agent that draws progress with
     carriage returns and no newline would otherwise appear frozen.
+
+    `lock`, when given, makes each mirrored line one atomic write. Several agents
+    running at once each have two of these pumps, and a character-at-a-time mirror
+    would splice their output together mid-word — which is the reason `writ run`
+    had nothing to mirror to at all. Holding the lock for a whole line is enough:
+    the label at the start of a line is what makes interleaved output attributable,
+    and it is only true if nothing else can write between the label and the text.
+    The transcript on disk is unaffected either way, and stays byte-for-byte what
+    the agent wrote.
     """
     at_line_start = True
+    pending: list[str] = []
+
+    def flush_line(final: bool = False) -> None:
+        """Write one buffered line to the terminal under the lock."""
+        if mirror is None or not pending:
+            return
+        line = "".join(pending)
+        pending.clear()
+        if final and not line.endswith(("\n", "\r")):
+            line += "\n"
+        if lock is not None:
+            with lock:
+                mirror.write(line)
+                mirror.flush()
+        else:
+            mirror.write(line)
+            mirror.flush()
+
     while True:
         chunk = source.read(1)
         if not chunk:
@@ -760,13 +791,14 @@ def _tee(
         if mirror is None:
             continue
         if prefix and at_line_start:
-            mirror.write(prefix)
-        mirror.write(chunk)
-        mirror.flush()
+            pending.append(prefix)
+        pending.append(chunk)
         at_line_start = chunk in ("\n", "\r")
-    if mirror is not None and not at_line_start:
-        mirror.write("\n")
-        mirror.flush()
+        if at_line_start:
+            flush_line()
+    # Whatever the agent left without a trailing newline: a prompt it was waiting
+    # on, or a progress line it never finished.
+    flush_line(final=True)
 
 
 def _feed(process: subprocess.Popen, prompt: str) -> None:
@@ -1058,12 +1090,23 @@ def _live_run_for(data: dict[str, Any], task_id: str) -> str | None:
     return None
 
 
-def execute(root: Path, run_id: str, *, stream: bool = False, prefix: str = "") -> int:
+def execute(
+    root: Path,
+    run_id: str,
+    *,
+    stream: bool = False,
+    prefix: str = "",
+    lock: threading.Lock | None = None,
+) -> int:
     """Run the agent synchronously and record the outcome.
 
     Unlike `run_agent`, this records the pid in project state so another
     terminal can watch or cancel the run, and it converts the exit code into
     task status. With `stream`, output is also mirrored to this terminal.
+
+    `lock` is shared by every concurrent caller mirroring to the same terminal, so
+    `writ run` can stream several agents at once and have each line stay whole and
+    labelled. Without it a single run streams exactly as before.
     """
     data = state.load(root)
     run = data["runs"].get(run_id)
@@ -1093,12 +1136,12 @@ def execute(root: Path, run_id: str, *, stream: bool = False, prefix: str = "") 
                 pumps = [
                     threading.Thread(
                         target=_tee,
-                        args=(process.stdout, out, sys.stdout, prefix),
+                        args=(process.stdout, out, sys.stdout, prefix, lock),
                         daemon=True,
                     ),
                     threading.Thread(
                         target=_tee,
-                        args=(process.stderr, err, sys.stderr, prefix),
+                        args=(process.stderr, err, sys.stderr, prefix, lock),
                         daemon=True,
                     ),
                 ]

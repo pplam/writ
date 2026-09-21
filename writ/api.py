@@ -23,7 +23,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from . import orchestrator, plancheck, plans, render, repair, runner, state, verdict
+from . import (
+    analysis,
+    orchestrator,
+    plancheck,
+    plans,
+    render,
+    repair,
+    runner,
+    state,
+    verdict,
+)
 from .model import (
     acceptance_summary,
     blocked_on,
@@ -120,8 +130,17 @@ def _pipeline(record: dict[str, Any]) -> dict[str, Any]:
     baseline = pipeline.get("baseline") or {}
     return {
         "plan_id": pipeline.get("plan_id", ""),
+        "directory": pipeline.get("directory", ""),
+        "at": pipeline.get("at", ""),
         "stages": sorted(pipeline.get("stages", {})),
+        # The pipeline as a pipeline: every stage writ knows about, in the order it
+        # runs, whether or not this plan got that far. `stages` above is a set of
+        # names and reads the same for a pipeline that stopped at `requirements` as
+        # for one that never ran that stage — which are different situations, and
+        # the second one is the one worth seeing.
+        "stage_rows": _stage_rows(pipeline),
         "requirements": len(pipeline.get("requirement_ids", []) or []),
+        "ambiguities": int(pipeline.get("ambiguities", 0) or 0),
         "unresolved_ambiguities": int(pipeline.get("unresolved_ambiguities", 0) or 0),
         "undemonstrable": list(pipeline.get("undemonstrable", []) or []),
         "baseline": {
@@ -130,6 +149,41 @@ def _pipeline(record: dict[str, Any]) -> dict[str, Any]:
             "known_failures": list(baseline.get("known_failures", []) or []),
         },
     }
+
+
+def _stage_rows(pipeline: dict[str, Any]) -> list[dict[str, Any]]:
+    """Each analysis stage in pipeline order, with what it produced.
+
+    Ordered by `analysis.STAGES` rather than by what the record happens to hold,
+    so the dashboard draws the pipeline's shape and marks where it stopped. A
+    stage with no entry is `pending`: never reached, as against run and failed.
+    """
+    stored = pipeline.get("stages")
+    stored = stored if isinstance(stored, dict) else {}
+    rows = []
+    for stage in analysis.STAGES:
+        entry = stored.get(stage.name)
+        entry = entry if isinstance(entry, dict) else None
+        if entry is None:
+            state_name = "pending"
+        elif entry.get("error"):
+            state_name = "failed"
+        elif entry.get("reused"):
+            state_name = "reused"
+        else:
+            state_name = "ok"
+        rows.append(
+            {
+                "name": stage.name,
+                "summary": stage.summary,
+                "state": state_name,
+                "artifact": Path(str(entry.get("artifact", ""))).name if entry else "",
+                "error": str(entry.get("error") or "") if entry else "",
+                "exit_code": entry.get("exit_code") if entry else None,
+                "at": str(entry.get("at") or "") if entry else "",
+            }
+        )
+    return rows
 
 
 def findings(data: dict[str, Any]) -> list[dict[str, Any]]:

@@ -251,6 +251,15 @@ FIELDS: dict[str, Field] = {
         doc="stop after starting this many tasks (@flag@); null walks the whole"
         " graph, and reviews of started tasks still finish",
     ),
+    "run.stream": Field(
+        kind="flag",
+        flag="--no-stream",
+        invert=True,
+        doc="mirror each agent's own output to the terminal as it arrives, tagged"
+        " with the task and role it came from (@flag@ sets this false). The"
+        " transcript is written to disk either way; this is about whether a long"
+        " run looks alive while it works",
+    ),
     # ----------------------------------------------------------------- plan
     "plan.stages": Field(
         kind="flag",
@@ -634,6 +643,7 @@ DEFAULTS: dict[str, dict[str, Default]] = {
             "order": Default("run.order"),
             "max_rework": Default("run.max_rework"),
             "max_tasks": Default("run.max_tasks"),
+            "no_stream": Default("run.stream", True),
         },
     }.items()
 }

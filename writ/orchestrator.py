@@ -48,6 +48,15 @@ GRACE_SECONDS = 5.0
 ORDERS = ("id", "depth", "unlocks")
 DEFAULT_ORDER = "id"
 
+#: How each role is tagged when its output is mirrored to the terminal. Padded to
+#: one width so the labels form a column and the agents' own text stays aligned.
+ROLE_TAGS = {
+    "agent": "impl  ",
+    "reviewer": "review",
+    "gate": "gate  ",
+    "repair": "repair",
+}
+
 
 @dataclass
 class Job:
@@ -467,10 +476,25 @@ def run(
     agent_args: list[str] | None = None,
     max_rework: int | None = None,
     on_event: Callable[[str, dict[str, Any]], None] | None = None,
+    stream: bool = False,
+    lock: threading.Lock | None = None,
 ) -> Session:
-    """Walk the DAG until it runs out of work, an error stops it, or you do."""
+    """Walk the DAG until it runs out of work, an error stops it, or you do.
+
+    With `stream`, each agent's own output is mirrored to this terminal as it
+    arrives, every line labelled with the task and role it came from. The progress
+    log from `on_event` is interleaved with it and remains the thing that says what
+    happened; the mirror is there so a long run is visibly working rather than
+    silent for ten minutes. Transcripts are written either way.
+    """
     session = Session()
     emit = on_event or (lambda name, payload: None)
+    # One lock for the whole session: every worker mirrors to this one terminal, and
+    # a per-run lock would not stop two runs interleaving. The caller passes its own
+    # when it also writes there — `writ run` prints a progress log to the same
+    # terminal, and a transition line spliced into an agent's sentence would be the
+    # very thing the lock exists to prevent.
+    mirror_lock = (lock or threading.Lock()) if stream else None
 
     # The approval gate. Checked here rather than only in the CLI so that any
     # caller of `run` — the supervisor, the server, a test — is held to it: an
@@ -560,7 +584,9 @@ def run(
                         "in_flight": len(in_flight) + 1,
                     },
                 )
-                future = pool.submit(_execute, root, job, run_id)
+                future = pool.submit(
+                    _execute, root, job, run_id, stream=stream, lock=mirror_lock
+                )
                 in_flight[future] = job
 
             if not in_flight:
@@ -640,14 +666,37 @@ def _prepare(
     return run_id, resolved
 
 
-def _execute(root: Path, job: Job, run_id: str) -> Outcome:
+def _label(job: Job) -> str:
+    """The tag on every mirrored line of one agent's output.
+
+    Both the task and the role, because a task's implementation and its review are
+    two different agents saying different things about the same id, and with several
+    running at once the id alone does not say which one is talking.
+    """
+    return f"{job.task_id} {ROLE_TAGS.get(job.role, job.role)} | "
+
+
+def _execute(
+    root: Path,
+    job: Job,
+    run_id: str,
+    *,
+    stream: bool = False,
+    lock: threading.Lock | None = None,
+) -> Outcome:
     """Run one agent to completion. Errors become outcomes, never exceptions.
 
     A worker that raised would take the scheduler down with it and lose the
     other agents' work, so everything is reported back as data.
     """
     try:
-        code = runner.execute(root, run_id, stream=False)
+        code = runner.execute(
+            root,
+            run_id,
+            stream=stream,
+            prefix=_label(job) if stream else "",
+            lock=lock,
+        )
     except WritError as exc:
         return Outcome(job=job, run_id=run_id, error=str(exc))
     except Exception as exc:  # pragma: no cover - defensive

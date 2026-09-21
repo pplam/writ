@@ -63,7 +63,12 @@ def test_the_shipped_example_validates():
     example = Path(__file__).resolve().parent.parent / "config.example.json"
     loaded = config.validate(json.loads(example.read_text()))
     assert sorted(loaded["agents"]) == sorted(config.ROLES)
-    assert loaded["run"] == {"parallel": 3, "order": "id", "max_rework": 2}
+    assert loaded["run"] == {
+        "parallel": 3,
+        "order": "id",
+        "max_rework": 2,
+        "stream": True,
+    }
     # a filled-in example, so it exercises the sections beyond agents and run too
     assert loaded["plan"] == {"stages": True, "gates": True, "critics": True}
     assert loaded["critique"]["critics"]
@@ -100,6 +105,8 @@ def test_the_starter_config_holds_writs_own_defaults(writ, project):
         "parallel": 1,
         "order": orchestrator.DEFAULT_ORDER,
         "max_rework": DEFAULT_MAX_REWORK,
+        # on: a run that prints nothing while a model works reads as a hung one
+        "stream": True,
     }
 
 

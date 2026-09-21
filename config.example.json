@@ -65,7 +65,14 @@
     "_": "defaults for `writ run`, all overridable per invocation",
     "parallel": 3,
     "order": "id",
-    "max_rework": 2
+    "max_rework": 2,
+    "_stream": [
+      "Mirror each agent's own output to the terminal while it works, tagged",
+      "with the task and role it came from. On by default: a run that prints",
+      "nothing for the length of a model call looks identical to a hung one.",
+      "false keeps the progress log alone. The transcript is on disk either way."
+    ],
+    "stream": true
   },
 
   "plan": {
