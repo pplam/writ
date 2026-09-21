@@ -48,7 +48,7 @@ cd ~/projects/my-service
 
 writ init
 writ plan docs/design.md --dry-run     # see what the planner will be asked
-writ plan docs/design.md               # an agent reads the doc and the repo
+writ plan docs/design.md               # three analyses, then a plan built on them
 
 writ check                             # what writ can prove about the plan
 writ coverage                          # every requirement, and what covers it
@@ -112,18 +112,56 @@ a detached run and an interactive `writ status` never corrupt each other.
 
 ## Planning
 
-`writ plan` hands the design document and the repository to a coding agent and
-asks for a plan as JSON: milestones, tasks, checkable acceptance criteria, the
-dependency edges between them, and the paths each task may touch. Planning is a
-judgement call — which work is one bounded session, what the real bar is, what
-must land first — and reading the repo is part of making it.
+`writ plan` turns a design document into a task DAG: milestones, tasks, checkable
+acceptance criteria, the dependency edges between them, and the paths each task
+may touch. Planning is a judgement call — which work is one bounded session, what
+the real bar is, what must land first — and reading the repo is part of making it.
+
+It runs as a **staged pipeline** rather than one agent call, because those are
+different judgements and running them together loses what makes a plan checkable.
+Three analyses write artifacts first, then a synthesis agent decomposes the work
+from them:
+
+```text
+requirements.json   every obligation the document states, one per entry
+inventory.json      what the repository already is, does, and tests — plus the
+                    baseline: did the suite pass before any of this started
+verification.json   how each obligation could actually be demonstrated
+        │
+        ▼
+plan.json           the decomposition, synthesized from all three
+```
+
+Each artifact is checkable before the next stage sees it: an inventory claiming
+coverage of a requirement nobody recorded is rejected at the stage that invented
+it, rather than becoming a task no obligation asked for. And the synthesizer is
+held to them — the requirement inventory arrives as a fixed list, and a dropped or
+invented id is a finding on the plan (`analysis.reconcile`). A single agent writing
+the inventory and the tasks together can never disagree with itself, so the
+omission leaves no trace anywhere; fixing the list first is what makes it findable.
 
 ```bash
 writ plan docs/design.md --dry-run     # print the planning prompt
-writ plan docs/design.md               # plan, validate, commit
+writ plan docs/design.md               # analyse, synthesize, validate, commit
 writ plan docs/design.md --agent claude --model opus
 writ plan docs/design.md --instructions "storage layer first"
+
+writ plan docs/design.md --stage requirements   # stop after one analysis
+writ plan docs/design.md --plan-id design-20260101T120000   # resume a pipeline
+writ plan docs/design.md --refresh              # redo stages already done
+writ plan docs/design.md --no-stages            # the older single-shot planner
 ```
+
+Stages are resumable. Artifacts live under `.writ/plans/<plan-id>/`, and a stage
+whose artifact is already there is reused rather than re-run, so a pipeline that
+failed at synthesis does not pay for three analyses again. A failed stage stops the
+pipeline instead of synthesising from a partial set.
+
+Deliberately absent: competing candidate plans. With the requirement inventory
+fixed, the useful disagreement about a plan is about coverage of a known list —
+which the critics below produce by reading the one plan adversarially. Two plans
+with no shared vocabulary would need a third agent to choose between them, and
+that agent would be the unreviewed author again.
 
 The agent's output is mirrored to your terminal as it arrives, prefixed with
 `|`, so a long planning run is visibly working rather than looking hung. The
@@ -176,9 +214,9 @@ A plan can be structurally perfect and still be wrong: complete in shape,
 infeasible in practice, or quietly missing an obligation the design stated. So
 committing a plan is not the same as accepting it.
 
-`writ plan` asks the agent for a **requirement inventory** before any task — every
-obligation the document states, one per entry, each with the heading it came from.
-Tasks then name the requirements they discharge. That is what makes coverage
+The pipeline's first stage produces a **requirement inventory** before any task —
+every obligation the document states, one per entry, each with the heading it came
+from. Tasks then name the requirements they discharge. That is what makes coverage
 checkable rather than a matter of reading both documents side by side:
 
 ```bash
@@ -199,13 +237,28 @@ writ list findings --open     # the ledger
 
 Findings carry a severity. Only an `error` blocks: the plan is held at
 `needs-approval` and `writ run` refuses to start it. Warnings and notes are
-recorded and readable and do not stop anything. A plan with no blocking findings
-approves itself; one with them waits for a person:
+recorded and readable and do not stop anything.
+
+A clean check does **not** approve the plan. Those are different claims — "nothing
+writ can prove is wrong with this" is much weaker than "somebody signed this off",
+and every defect a deterministic check cannot see (an omitted requirement, an edge
+that is legal but incorrect, a criterion nothing can demonstrate) passes a clean
+check by construction. So approval takes an actor:
 
 ```bash
 writ approve --by ada --reason "read it through"
 writ approve --force --reason "known gap, shipping the spike"
 ```
+
+For automation that has to get from a document to a running graph unattended:
+
+```bash
+writ plan docs/design.md --auto-approve
+```
+
+which approves the plan only when nothing blocking stands against it. It is not a
+silent `--force`: a blocking finding still holds the plan, because overruling
+writ's own objection is a judgement and the record has to say whose.
 
 Or answer one finding at a time, which is the more useful shape when you disagree
 with a particular objection rather than with all of them:
@@ -596,7 +649,7 @@ Four roles, because that is how many writ actually distinguishes:
 
 | role | used by | falls back to |
 |---|---|---|
-| `planner` | `writ plan` | `pi` |
+| `planner` | `writ plan` — its analysis stages and its synthesis | `pi` |
 | `critic` | `writ critique`, `writ plan --critics` | the planning agent |
 | `implementer` | `writ run`, `writ dispatch`, **and gates and repair planners** | `pi` |
 | `reviewer` | `writ review`, `writ run` | the implementing agent |
@@ -670,7 +723,11 @@ operates on.
 | Command | Purpose |
 |---|---|
 | `writ init [--force]` | create the project store |
-| `writ plan <doc>` | have an agent derive requirements, milestones, tasks, acceptance criteria |
+| `writ plan <doc>` | analyse the document and repo in stages, then synthesize milestones, tasks, acceptance criteria |
+| `writ plan <doc> --stage NAME` | run the analyses up to that stage and stop, committing nothing |
+| `writ plan <doc> --plan-id ID [--refresh]` | resume a pipeline, reusing (or redoing) the artifacts it already wrote |
+| `writ plan <doc> --no-stages` | the older single-shot planner: one agent, every judgement at once |
+| `writ plan <doc> --auto-approve` | approve on commit when nothing blocking stands against it |
 | `writ check [--all] [--quiet]` | re-check the committed plan and report what stands against it |
 | `writ critique [--critics NAMES] [--agent CMD] [--model M] [--timeout S] [--cwd D] [--quiet]` | independent critics read the plan and report findings |
 | `writ approve [--by WHO] [--reason R] [--force]` | sign the plan off, which is what `writ run` requires |

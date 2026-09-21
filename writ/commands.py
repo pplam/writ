@@ -9,10 +9,11 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from . import (
     agents,
+    analysis,
     config,
     critics,
     decisions,
@@ -71,11 +72,15 @@ def cmd_init(args) -> None:
 def cmd_plan(args) -> int:
     """Turn a design document into a task DAG.
 
-    By default a coding agent does the planning: it reads the document and the
-    repository and returns a plan as JSON, which Writ validates before any of it
-    reaches project state. `--extract` uses the deterministic heading parser
-    instead, and `--from-plan` re-imports a plan artifact without paying for
-    another agent run.
+    By default this is a staged pipeline (`writ/analysis.py`): three analyses
+    write artifacts — what the document requires, what the repository already is,
+    how each requirement could be demonstrated — and a synthesis agent decomposes
+    the work from all three. Writ then checks that the synthesizer honoured them
+    (`analysis.reconcile`) as well as that the plan is structurally sound.
+
+    `--no-stages` is the older single-shot planner, which makes every one of those
+    judgements in one response. `--extract` uses the deterministic heading parser,
+    and `--from-plan` re-imports a plan artifact without paying for an agent run.
     """
     root = Path(args.root)
     doc = Path(args.design).expanduser()
@@ -83,6 +88,12 @@ def cmd_plan(args) -> int:
         raise WritError(f"design document not found: {doc}")
 
     plan_path: Path | None = None
+    #: set only on the staged path, and only once synthesis has produced a plan
+    extra_findings: list[plancheck.Finding] = []
+    pipeline_artifacts: analysis.Artifacts | None = None
+    pipeline_results: list[analysis.Result] = []
+    pipeline_id: str | None = None
+    pipeline_directory: Path | None = None
     if args.from_plan:
         plan_path = Path(args.from_plan).expanduser()
         document = planning.read_document(plan_path)
@@ -105,6 +116,7 @@ def cmd_plan(args) -> int:
                 "or --force to replace the plan"
             )
         context = planning.plan_context(data)
+        staged = bool(getattr(args, "stages", True))
         if args.dry_run:
             print(
                 planning.build_prompt(
@@ -113,9 +125,29 @@ def cmd_plan(args) -> int:
                     plan_path=state.plan_dir(root, "<plan-id>") / "plan.json",
                     instructions=args.instructions,
                     context=context,
+                    artifacts=(
+                        analysis.read_all(
+                            state.plan_dir(root, getattr(args, "plan_id", None))
+                        )
+                        if staged and getattr(args, "plan_id", None)
+                        else None
+                    ),
                 )
             )
             return 0
+
+        plan_id = getattr(args, "plan_id", None) or planning.new_plan_id(doc)
+        directory = state.plan_dir(root, plan_id)
+        artifacts = None
+        if staged:
+            artifacts, pipeline_results, stopped = _run_stages(
+                args, root=root, doc=doc, plan_id=plan_id, context=context
+            )
+            if stopped is not None:
+                return stopped
+            pipeline_id = plan_id
+            pipeline_directory = directory
+
         print(f"planning {doc.name} with {args.agent}...")
 
         def announce(resolved: agents.ResolvedAgent, directory: Path) -> None:
@@ -139,11 +171,25 @@ def cmd_plan(args) -> int:
             context=context,
             stream=not args.quiet,
             on_start=announce,
+            artifacts=artifacts,
+            plan_id=plan_id,
         )
         if not args.quiet:
             print("  " + "─" * 60)
-        print(f"planning agent exited {code}; plan: {plan_path}")
-        source = f"{doc.name} (agent)"
+        label = "synthesis agent" if artifacts is not None else "planning agent"
+        print(f"{label} exited {code}; plan: {plan_path}")
+        source = f"{doc.name} (staged)" if artifacts is not None else f"{doc.name} (agent)"
+        if artifacts is not None:
+            pipeline_artifacts = artifacts
+            extra_findings = analysis.reconcile(document, artifacts)
+            # Whether each obligation traces to a heading that exists. Checked
+            # against the inventory the requirements stage wrote rather than the
+            # plan's copy of it, so a synthesizer that tidied a source cannot
+            # launder a citation the stage got wrong.
+            extra_findings += planning.untraceable_requirements(
+                artifacts.requirements.requirements if artifacts.requirements else [],
+                doc,
+            )
 
     milestones = document.milestones
     summary = planner.summarize(milestones)
@@ -168,6 +214,11 @@ def cmd_plan(args) -> int:
         document=document,
         plan_path=plan_path,
         source=source,
+        extra_findings=extra_findings,
+        pipeline_artifacts=pipeline_artifacts,
+        pipeline_results=pipeline_results,
+        pipeline_id=pipeline_id,
+        pipeline_directory=pipeline_directory,
     )
     print(
         f"created {summary['milestones']} milestones and {created} tasks "
@@ -194,17 +245,177 @@ def cmd_plan(args) -> int:
             plan_path=plan_path,
         )
     data = state.load(root)
+    counts = plancheck.tally(plans.findings(data, open_only=True))
     if plans.runnable(data):
-        print("plan approved: no blocking findings")
+        record = plans.plan_status(data)
+        print(f"plan approved by {record['approved_by']}: {record['approval_note']}")
+        if counts["warning"]:
+            print(f"  {counts['warning']} advisory finding(s) stand on the record")
         print("next: writ run")
-    else:
-        counts = plancheck.tally(plans.findings(data, open_only=True))
+    elif counts["error"]:
         print(
             f"plan held at {plans.plan_status(data)['status']}: "
             f"{counts['error']} blocking, {counts['warning']} advisory"
         )
         print("next: writ check   (then writ approve, or re-plan)")
+    else:
+        # Nothing objects, and that is deliberately not the same as approved.
+        print(
+            f"plan at {plans.plan_status(data)['status']}: nothing blocking, "
+            f"{counts['warning']} advisory"
+        )
+        print("next: writ check, writ coverage   (then writ approve)")
     return 0
+
+
+def _run_stages(
+    args,
+    *,
+    root: Path,
+    doc: Path,
+    plan_id: str,
+    context: dict[str, Any],
+) -> tuple[analysis.Artifacts | None, list[analysis.Result], int | None]:
+    """Run the analysis stages, and say whether planning should continue.
+
+    Returns `(artifacts, results, stop)`. `stop` is an exit code when the caller
+    must not go on to synthesis: either a stage failed, or `--stage` asked for
+    the analyses alone. Otherwise it is None and `artifacts` is complete.
+
+    A failed stage stops the pipeline rather than letting synthesis proceed on a
+    partial set. Synthesising without the requirement inventory would produce
+    exactly the plan the staging exists to prevent — one whose coverage claims
+    nothing established — and it would cost an agent run to find that out.
+    """
+    stages = analysis.upto(args.stage) if getattr(args, "stage", None) else list(
+        analysis.STAGES
+    )
+    agent = getattr(args, "stage_agent", None) or args.agent
+    model = getattr(args, "stage_model", None) or args.model
+    # Resolve before the pipeline creates anything. An unknown --model is a
+    # WritError from `agents.resolve`, and raising it after the plan directory
+    # exists leaves a project littered with empty pipelines that never ran.
+    agents.resolve(agent, list(getattr(args, "agent_args", []) or []), model)
+    directory = state.plan_dir(root, plan_id)
+    print(f"analysing {doc.name} in {len(stages)} stage(s) with {agent}...")
+    print(f"  artifacts: {directory}")
+
+    def announce(stage: analysis.Stage, resolved: agents.ResolvedAgent) -> None:
+        print(f"  {stage.name}: {stage.summary}")
+        if resolved.warning:
+            print(f"    warning: {resolved.warning}", file=sys.stderr)
+        if not args.quiet:
+            print("  " + "─" * 60)
+        sys.stdout.flush()
+
+    def finished(result: analysis.Result) -> None:
+        if not args.quiet and not result.reused:
+            print("  " + "─" * 60)
+        if result.reused:
+            print(f"  {result.stage}: reusing {result.path.name}")
+        elif result.ok:
+            print(f"  {result.stage}: wrote {result.path.name}")
+        else:
+            print(f"  {result.stage}: failed — {result.error}", file=sys.stderr)
+        sys.stdout.flush()
+
+    artifacts, results = analysis.run_pipeline(
+        root=root,
+        doc=doc,
+        directory=directory,
+        chosen=stages,
+        agent=agent,
+        agent_args=list(getattr(args, "agent_args", []) or []),
+        model=model,
+        timeout=args.timeout,
+        cwd=args.cwd,
+        instructions=args.instructions,
+        context=context,
+        refresh=bool(getattr(args, "refresh", False)),
+        stream=not args.quiet,
+        on_start=announce,
+        on_finish=finished,
+    )
+    failed = [result for result in results if not result.ok]
+    if failed:
+        names = ", ".join(result.stage for result in failed)
+        print(
+            f"planning stopped: the {names} stage produced no usable artifact.\n"
+            f"  fix or re-run with: writ plan {doc} --plan-id {plan_id}\n"
+            "  (completed stages are reused; add --refresh to redo them)",
+            file=sys.stderr,
+        )
+        return artifacts, results, 1
+
+    _print_stage_summary(artifacts)
+
+    if getattr(args, "stage", None):
+        print(
+            f"\nstages complete: {args.stage}. Nothing has been committed.\n"
+            f"  continue with: writ plan {doc} --plan-id {plan_id}"
+        )
+        return artifacts, results, 0
+    return artifacts, results, None
+
+
+def _print_stage_summary(artifacts: analysis.Artifacts) -> None:
+    """What the analyses found, before any of it becomes tasks.
+
+    Printed because these artifacts are the plan's premises, and a premise nobody
+    read is the failure mode staging is supposed to fix. The baseline in
+    particular: a run that starts with a failing suite will attribute that failure
+    to the first task that trips over it unless somebody saw this line.
+    """
+    requirements = artifacts.requirements
+    if requirements is not None:
+        musts = sum(1 for req in requirements.requirements if req.priority == "must")
+        print(
+            f"  requirements: {len(requirements.requirements)} obligations "
+            f"({musts} must)"
+        )
+        unresolved = requirements.open_questions
+        if unresolved:
+            print(
+                f"  warning: {len(unresolved)} ambiguity(ies) with no assumed "
+                "reading — the plan will have to guess",
+                file=sys.stderr,
+            )
+    inventory = artifacts.inventory
+    if inventory is not None:
+        status = inventory.baseline_status
+        commands = ", ".join(inventory.baseline_commands) or "none named"
+        print(f"  baseline: {commands} → {status}")
+        if status == "fail":
+            print(
+                "  warning: this project's verification already fails. Failures "
+                "during execution will be ambiguous unless these are fixed first: "
+                + (", ".join(inventory.known_failures) or "unnamed"),
+                file=sys.stderr,
+            )
+        elif status == "unknown":
+            print(
+                "  warning: the baseline was never established, so a later failure "
+                "cannot be told from a pre-existing one",
+                file=sys.stderr,
+            )
+        already = inventory.satisfied()
+        if already:
+            print(f"  already satisfied by this repository: {', '.join(already)}")
+    verification = artifacts.verification
+    if verification is not None:
+        undemonstrable = [
+            str(entry.get("requirement_id", ""))
+            for entry in verification.undemonstrable
+        ]
+        print(f"  verification: {len(verification.covered)} requirements demonstrable")
+        if undemonstrable:
+            print(
+                f"  warning: no way found to demonstrate {', '.join(undemonstrable)} "
+                "— any task claiming them will be judged on prose",
+                file=sys.stderr,
+            )
+        for entry in verification.missing_infrastructure:
+            print(f"  missing infrastructure: {entry.get('need')}")
 
 
 def _print_plan(
@@ -253,6 +464,11 @@ def _commit_plan(
     document: planning.PlanDocument,
     plan_path: Path | None,
     source: str,
+    extra_findings: Iterable[plancheck.Finding] = (),
+    pipeline_artifacts: analysis.Artifacts | None = None,
+    pipeline_results: Iterable[analysis.Result] = (),
+    pipeline_id: str | None = None,
+    pipeline_directory: Path | None = None,
 ) -> tuple[int, list[plancheck.Finding]]:
     """Write the plan to state, then check it and set the plan's status.
 
@@ -329,10 +545,50 @@ def _commit_plan(
                 "created_at": state.utcnow(),
             }
         )
+        if pipeline_artifacts is not None and pipeline_id and pipeline_directory:
+            analysis.record(
+                data,
+                plan_id=pipeline_id,
+                directory=pipeline_directory,
+                results=pipeline_results,
+                artifacts=pipeline_artifacts,
+            )
         plans.bump(data)
         plans.set_status(data, "draft")
-        findings = plans.run_check(data, root=root.resolve())
+        # The reconcile findings go in beside writ's structural ones rather than
+        # into a channel of their own: a dropped requirement holds the plan the
+        # same way a cycle does, and `writ approve` should not need to know which
+        # kind it is overruling.
+        findings = plans.run_check(
+            data, root=root.resolve(), extra=extra_findings
+        )
+        if getattr(args, "auto_approve", False):
+            _auto_approve(data)
     return created, findings
+
+
+def _auto_approve(data: dict[str, Any]) -> None:
+    """Approve the plan without a human, when nothing blocking stands against it.
+
+    Deliberately narrow. `--auto-approve` is for automation that has to get from a
+    document to a running graph with nobody watching, and the one thing it must not
+    become is a way to start executing a plan writ objected to. So a blocking
+    finding is not overridden here — `writ approve --force --reason ...` is the only
+    path that does that, because accepting an objection is a judgement and the
+    record has to say whose.
+    """
+    blocking = [
+        finding
+        for finding in plans.findings(data, open_only=True)
+        if finding.severity == "error"
+    ]
+    if blocking:
+        return
+    plans.approve(
+        data,
+        actor="writ --auto-approve",
+        reason="no blocking findings stood against the plan",
+    )
 
 
 def _resolve_depends(

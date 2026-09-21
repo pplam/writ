@@ -103,6 +103,32 @@ def plan(data: dict[str, Any]) -> dict[str, Any]:
         "uncovered": [row["id"] for row in rows if row["state"] == "uncovered"],
         "open_repairs": [r["id"] for r in repair.open_requests(data)],
         "held_gates": [{"id": k, "reason": v} for k, v in sorted(held.items())],
+        # What the plan was built on, when it came from the staged pipeline. The
+        # baseline is the part worth a dashboard's space: a project whose suite
+        # was already failing when planning started will attribute that failure to
+        # whichever task trips over it first, and nothing else on this payload
+        # would say so.
+        "pipeline": _pipeline(record),
+    }
+
+
+def _pipeline(record: dict[str, Any]) -> dict[str, Any]:
+    """The staged pipeline's provenance, or empty for a plan without one."""
+    pipeline = record.get("pipeline")
+    if not isinstance(pipeline, dict) or not pipeline:
+        return {}
+    baseline = pipeline.get("baseline") or {}
+    return {
+        "plan_id": pipeline.get("plan_id", ""),
+        "stages": sorted(pipeline.get("stages", {})),
+        "requirements": len(pipeline.get("requirement_ids", []) or []),
+        "unresolved_ambiguities": int(pipeline.get("unresolved_ambiguities", 0) or 0),
+        "undemonstrable": list(pipeline.get("undemonstrable", []) or []),
+        "baseline": {
+            "status": baseline.get("status", "unknown"),
+            "commands": list(baseline.get("commands", []) or []),
+            "known_failures": list(baseline.get("known_failures", []) or []),
+        },
     }
 
 

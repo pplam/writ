@@ -195,7 +195,7 @@ def looping(writ, design, project, tmp_path, monkeypatch):
     (tmp_path / "counters").mkdir()
     monkeypatch.setenv("WRIT_TEST_PATCH", json.dumps(REPAIR_PATCH))
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), "--extract", "--auto-approve")
     return writ
 
 
@@ -243,7 +243,7 @@ def test_a_gate_is_a_task_so_the_graph_walks_it(approved, project):
 
 def test_a_plan_with_a_blocking_finding_will_not_run(writ, project, design):
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), "--extract", "--auto-approve")
     with state.transaction(project) as data:
         data["tasks"]["M01-001"]["acceptances"] = [{"text": "it works", "status": "pending"}]
         plans.run_check(data, root=project)
@@ -256,7 +256,7 @@ def test_a_plan_with_a_blocking_finding_will_not_run(writ, project, design):
 
 def test_forced_approval_needs_a_reason_and_records_it(writ, project, design):
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), "--extract", "--auto-approve")
     with state.transaction(project) as data:
         data["tasks"]["M01-001"]["acceptances"] = [{"text": "it works", "status": "pending"}]
         plans.run_check(data, root=project)

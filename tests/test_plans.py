@@ -96,7 +96,7 @@ def inventoried(writ, project, design, tmp_path):
     artifact = tmp_path / "plan.json"
     artifact.write_text(json.dumps(PLAN), encoding="utf-8")
     writ("init")
-    writ("plan", str(design), "--from-plan", str(artifact))
+    writ("plan", str(design), "--from-plan", str(artifact), "--auto-approve")
     return writ
 
 
@@ -238,10 +238,71 @@ def test_a_finding_that_goes_away_is_resolved_not_deleted(inventoried, project):
 
 def test_only_a_blocking_finding_holds_the_plan(inventoried, project):
     data = state.load(project)
-    # The committed plan has warnings (the design's generic criteria) and still
-    # approved itself, because advisory findings are not a veto.
+    # The committed plan has warnings (the design's generic criteria) and
+    # `--auto-approve` still approved it, because advisory findings are not a veto.
     assert plans.plan_status(data)["status"] == "approved"
     assert plans.runnable(data)
+
+
+def test_a_clean_check_does_not_approve_the_plan(writ, project, design, tmp_path):
+    """A check says nothing is provably wrong. Approval says somebody decided.
+
+    These were one status until the planning review pointed out that they are
+    different claims, and that the weaker one was silently standing in for the
+    stronger: every defect a clean check cannot see — an omitted requirement, a
+    legal-but-wrong edge, a criterion nothing can demonstrate — passed straight
+    through to execution as an approved plan.
+    """
+    artifact = tmp_path / "plan.json"
+    artifact.write_text(json.dumps(PLAN), encoding="utf-8")
+    writ("init")
+    writ("plan", str(design), "--from-plan", str(artifact))
+    data = state.load(project)
+    assert not plancheck.blocking(plans.findings(data, open_only=True))
+    assert plans.plan_status(data)["status"] == "needs-approval"
+    assert not plans.runnable(data)
+    # Re-checking it does not change that, however many times it is run.
+    assert writ("check")[0] == 0
+    assert not plans.runnable(state.load(project))
+
+
+def test_auto_approve_signs_off_a_clean_plan_and_says_who(
+    writ, project, design, tmp_path
+):
+    artifact = tmp_path / "plan.json"
+    artifact.write_text(json.dumps(PLAN), encoding="utf-8")
+    writ("init")
+    code, out, _ = writ("plan", str(design), "--from-plan", str(artifact), "--auto-approve")
+    assert code == 0
+    record = plans.plan_status(state.load(project))
+    assert record["status"] == "approved"
+    assert record["approved_by"] == "writ --auto-approve"
+    assert record["forced"] is False
+    assert "approved by writ --auto-approve" in out
+
+
+def test_auto_approve_will_not_override_a_blocking_finding(
+    writ, project, design, tmp_path
+):
+    """The one thing --auto-approve must not become: a silent --force.
+
+    Automation needs to get from a document to a running graph unattended, which
+    is what the flag is for. Letting it also overrule writ's own objections would
+    make every blocking finding advisory for anyone in a hurry.
+    """
+    broken = json.loads(json.dumps(PLAN))
+    # a task that depends on something no plan defines: a blocking finding
+    broken["milestones"][0]["tasks"][0]["requirement_ids"] = ["REQ-404"]
+    artifact = tmp_path / "plan.json"
+    artifact.write_text(json.dumps(broken), encoding="utf-8")
+    writ("init")
+    code, out, _ = writ("plan", str(design), "--from-plan", str(artifact), "--auto-approve")
+    assert code == 0
+    data = state.load(project)
+    assert plancheck.blocking(plans.findings(data, open_only=True))
+    assert plans.plan_status(data)["status"] == "needs-approval"
+    assert not plans.runnable(data)
+    assert "writ approve" in out
 
 
 # --------------------------------------------------------------------------

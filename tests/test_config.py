@@ -456,7 +456,7 @@ def test_a_configured_run_needs_no_flags_at_all(
     script.write_text(AGENT, encoding="utf-8")
     base = f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}"
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), "--extract", "--auto-approve")
     write_config(
         project,
         {

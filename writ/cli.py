@@ -28,7 +28,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import commands, config, critics
+from . import analysis, commands, config, critics
 from .server import DEFAULT_PORT
 from .decisions import SETTABLE_DECISION_STATUSES
 from .model import DEFAULT_MAX_REWORK, JUDGED_STATUSES, SETTABLE_STATUSES
@@ -177,6 +177,59 @@ def build_parser() -> argparse.ArgumentParser:
             "add a review gate per milestone and a final gate over the plan "
             "(default: on). A gate judges integrated work against the "
             "requirements and can ask for the plan to be repaired"
+        ),
+    )
+    p.add_argument(
+        "--stages",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "run the staged planning pipeline (default: on). Three analyses — "
+            + ", ".join(stage.name for stage in analysis.STAGES)
+            + " — write artifacts before a synthesis agent decomposes the work "
+            "from them. --no-stages is the older single-shot planner, which makes "
+            "every one of those judgements in one response"
+        ),
+    )
+    p.add_argument(
+        "--stage",
+        metavar="NAME",
+        choices=analysis.STAGE_NAMES,
+        help=(
+            "run the analyses up to and including this stage, then stop without "
+            "synthesising or committing anything. Continue later with --plan-id"
+        ),
+    )
+    p.add_argument(
+        "--plan-id",
+        metavar="ID",
+        help=(
+            "reuse an existing pipeline directory under .writ/plans/. Stages whose "
+            "artifact is already there are not re-run, so a pipeline that failed "
+            "part-way resumes instead of paying for its analyses again"
+        ),
+    )
+    p.add_argument(
+        "--refresh",
+        action="store_true",
+        help="re-run stages that already have an artifact, instead of reusing them",
+    )
+    p.add_argument(
+        "--stage-agent",
+        metavar="CMD",
+        help="agent for the analysis stages (default: --agent)",
+    )
+    p.add_argument(
+        "--stage-model", metavar="NAME", help="model for the analysis stages"
+    )
+    p.add_argument(
+        "--auto-approve",
+        action="store_true",
+        help=(
+            "approve the plan without a human when no blocking finding stands "
+            "against it. For automation: a clean check means writ proved nothing "
+            "wrong, not that anyone read it. Blocking findings are never "
+            "overridden this way — that is `writ approve --force --reason ...`"
         ),
     )
     p.add_argument(

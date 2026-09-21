@@ -139,13 +139,15 @@ def not_runnable_message(data: dict[str, Any]) -> str:
             "Writ can prove about it, then `writ approve`."
         )
     if not counts["error"]:
-        # Nothing is objecting any more, but the status still says otherwise: the
-        # findings were answered after the last check, and the status comes from a
-        # check. Sending this reader to `--force` would have them overrule
-        # objections that are no longer there.
+        # Nothing blocking stands against this plan; it simply has not been signed
+        # off. That is the ordinary state of a freshly planned project now that a
+        # clean check no longer approves itself, so it gets the plain instruction
+        # rather than being sent to `--force` to overrule objections that are not
+        # there.
         return (
-            f"this plan is {status}, but nothing blocking is open any more. "
-            "Re-check it with `writ check` to approve it on that basis."
+            f"this plan is {status} and nothing blocking stands against it. "
+            "Read it with `writ check` and `writ coverage`, then approve it with "
+            "`writ approve`. For automation, plan with `--auto-approve`."
         )
     return (
         f"this plan is {status}: {counts['error']} blocking "
@@ -454,6 +456,16 @@ def run_check(
 ) -> list[Finding]:
     """Check the committed graph and set the plan's status from the result.
 
+    A clean check moves a draft to `needs-approval`, not to `approved`. Writ used
+    to approve it outright, which collapsed two different facts into one status:
+    "nothing writ can prove is wrong with this plan" and "somebody signed this
+    plan off". The first is what a check establishes, and it is a much weaker
+    claim — every defect in §3 of the review (an omitted requirement, a dependency
+    that is legal but incorrect, a criterion nothing can demonstrate) passes a
+    clean check by construction. Approval is a judgement, so it needs an actor:
+    `writ approve`, or `writ plan --auto-approve` for automation that has chosen
+    to make it in advance.
+
     An approved plan that still checks clean stays approved — a re-check is not a
     reason to ask for approval again. One that has acquired a blocking finding
     since approval goes back to `needs-approval`, because whatever was signed off
@@ -472,12 +484,8 @@ def run_check(
     if open_blocking:
         if record["status"] in ("draft", "approved", "needs-approval"):
             set_status(data, "needs-approval")
-    elif record["status"] in ("draft", "needs-approval"):
-        set_status(data, "approved")
-        record["approved_at"] = utcnow()
-        record["approved_by"] = "writ"
-        record["approval_note"] = "no blocking findings"
-        record["forced"] = False
+    elif record["status"] == "draft":
+        set_status(data, "needs-approval")
     return found
 
 

@@ -245,7 +245,7 @@ def test_prompt_lists_existing_tasks_when_appending(planned, writ, project, desi
 
 def test_plan_runs_the_agent_and_commits_its_plan(writ, project, design):
     writ("init")
-    code, out, _ = writ("plan", str(design), "--agent", agent_writing(PLAN))
+    code, out, _ = writ("plan", str(design), "--no-stages", "--agent", agent_writing(PLAN))
     assert code == 0
     assert "created 2 milestones and 3 tasks" in out
     assert "(agent)" in out
@@ -268,7 +268,7 @@ def test_plan_runs_the_agent_and_commits_its_plan(writ, project, design):
 
 def test_plan_keeps_the_agent_transcript_and_artifact(writ, project, design):
     writ("init")
-    writ("plan", str(design), "--agent", agent_writing(PLAN))
+    writ("plan", str(design), "--no-stages", "--agent", agent_writing(PLAN))
     record = state.load(project)["plans"][-1]
     artifact = Path(record["artifact"])
     assert json.loads(artifact.read_text())["milestones"][0]["id"] == "M01"
@@ -281,7 +281,7 @@ def test_plan_keeps_the_agent_transcript_and_artifact(writ, project, design):
 def test_plan_accepts_json_printed_on_stdout(writ, project, design):
     writ("init")
     code, _, _ = writ(
-        "plan", str(design), "--agent", agent_writing(PLAN, to_stdout=True)
+        "plan", str(design), "--no-stages", "--agent", agent_writing(PLAN, to_stdout=True)
     )
     assert code == 0
     assert len(_work(state.load(project))) == 3
@@ -289,7 +289,7 @@ def test_plan_accepts_json_printed_on_stdout(writ, project, design):
 
 def test_plan_dry_run_prints_the_prompt_and_runs_no_agent(writ, project, design):
     writ("init")
-    code, out, _ = writ("plan", str(design), "--dry-run")
+    code, out, _ = writ("plan", str(design), "--no-stages", "--dry-run")
     assert code == 0
     assert "Schema:" in out and "plan.json" in out
     assert state.load(project)["tasks"] == {}
@@ -301,7 +301,7 @@ def test_plan_dry_run_prints_the_prompt_and_runs_no_agent(writ, project, design)
 def test_plan_reports_a_planner_that_produced_nothing(writ, project, design):
     writ("init")
     silent = f"{sys.executable} -c 'import sys; sys.stdin.read(); print(\"thinking\")'"
-    code, _, err = writ("plan", str(design), "--agent", silent)
+    code, _, err = writ("plan", str(design), "--no-stages", "--agent", silent)
     assert code == 2
     assert "without producing a plan" in err
     assert state.load(project)["tasks"] == {}
@@ -310,7 +310,7 @@ def test_plan_reports_a_planner_that_produced_nothing(writ, project, design):
 def test_plan_reports_an_invalid_plan_with_the_artifact_path(writ, project, design):
     writ("init")
     bad = agent_writing('{"milestones": [{"title": "M", "tasks": []}]}')
-    code, _, err = writ("plan", str(design), "--agent", bad)
+    code, _, err = writ("plan", str(design), "--no-stages", "--agent", bad)
     assert code == 2
     assert "tasks must be a non-empty list" in err
     assert "plan artifact:" in err
@@ -319,7 +319,7 @@ def test_plan_reports_an_invalid_plan_with_the_artifact_path(writ, project, desi
 
 def test_plan_reports_a_missing_planning_agent(writ, project, design):
     writ("init")
-    code, _, err = writ("plan", str(design), "--agent", "definitely-not-an-agent")
+    code, _, err = writ("plan", str(design), "--no-stages", "--agent", "definitely-not-an-agent")
     assert code == 2
     assert "planning agent not found" in err
 
@@ -341,7 +341,7 @@ def test_plan_rejects_a_dependency_on_nothing(writ, project, design):
             }
         ]
     }
-    code, _, err = writ("plan", str(design), "--agent", agent_writing(dangling))
+    code, _, err = writ("plan", str(design), "--no-stages", "--agent", agent_writing(dangling))
     assert code == 2
     assert "neither in this plan nor an existing task" in err
     assert state.load(project)["tasks"] == {}
@@ -364,7 +364,7 @@ def test_plan_append_can_depend_on_existing_tasks(planned, writ, project, design
         ]
     }
     code, out, _ = writ(
-        "plan", str(design), "--append", "--agent", agent_writing(followup)
+        "plan", str(design), "--append", "--no-stages", "--agent", agent_writing(followup)
     )
     assert code == 0 and "created 1 milestones and 1 tasks" in out
     data = state.load(project)
@@ -384,7 +384,7 @@ def test_plan_leaves_independent_tasks_independent(writ, project, design):
         ]
     }
     writ("init")
-    writ("plan", str(design), "--parallel", "--agent", agent_writing(independent))
+    writ("plan", str(design), "--parallel", "--no-stages", "--agent", agent_writing(independent))
     data = state.load(project)
     assert data["tasks"]["M01-001"]["depends_on"] == []
     assert data["tasks"]["M01-002"]["depends_on"] == []
@@ -406,7 +406,7 @@ def test_plan_warns_about_sections_the_document_does_not_have(writ, project, des
         ]
     }
     writ("init")
-    code, _, err = writ("plan", str(design), "--agent", agent_writing(invented))
+    code, _, err = writ("plan", str(design), "--no-stages", "--agent", agent_writing(invented))
     assert code == 0
     assert "no section titled 'Milestone 9 — Invented'" in err
 
@@ -431,7 +431,7 @@ def test_plan_from_missing_artifact_is_an_error(writ, design):
 def test_plan_timeout_kills_a_stuck_planner(writ, project, design):
     writ("init")
     stuck = f"{sys.executable} -c 'import sys,time; sys.stdin.read(); time.sleep(30)'"
-    code, _, err = writ("plan", str(design), "--agent", stuck, "--timeout", "1")
+    code, _, err = writ("plan", str(design), "--no-stages", "--agent", stuck, "--timeout", "1")
     assert code == 2
     assert "exceeding its timeout" in err
     # a planner that hung silently gets told why that usually happens
@@ -462,14 +462,14 @@ def test_plan_dry_run_previews_an_imported_plan(writ, design, tmp_path, project)
 def test_extra_args_after_separator_reach_the_planning_agent(writ, project, design):
     writ("init")
     printer = f"{sys.executable} -c 'import sys; sys.stdin.read(); print(sys.argv[1:])'"
-    writ("plan", str(design), "--agent", printer, "--", "--model", "sonnet")
+    writ("plan", str(design), "--no-stages", "--agent", printer, "--", "--model", "sonnet")
     directory = next(state.plans_dir(project).iterdir())
     assert "'--model', 'sonnet'" in (directory / "stdout.log").read_text()
 
 
 def test_plan_checks_the_overwrite_gate_before_running_an_agent(planned, writ, project, design):
     before = list(state.plans_dir(project).iterdir())
-    code, _, err = writ("plan", str(design), "--agent", agent_writing(PLAN))
+    code, _, err = writ("plan", str(design), "--no-stages", "--agent", agent_writing(PLAN))
     assert code == 2 and "already has tasks" in err
     # the gate fired without spending an agent run
     assert list(state.plans_dir(project).iterdir()) == before
@@ -477,7 +477,7 @@ def test_plan_checks_the_overwrite_gate_before_running_an_agent(planned, writ, p
 
 def test_plan_reports_the_exact_command_it_runs(writ, project, design):
     writ("init")
-    code, out, _ = writ("plan", str(design), "--agent", agent_writing(PLAN))
+    code, out, _ = writ("plan", str(design), "--no-stages", "--agent", agent_writing(PLAN))
     assert code == 0
     assert "running:" in out
     assert "transcript:" in out
@@ -497,7 +497,7 @@ def test_plan_model_flag_reaches_a_known_agent(writ, project, design, monkeypatc
 
     monkeypatch.setattr(planning_module.runner, "run_agent", fake_run_agent)
     writ("init")
-    code, _, _ = writ("plan", str(design), "--agent", "pi", "--model", "sonnet")
+    code, _, _ = writ("plan", str(design), "--no-stages", "--agent", "pi", "--model", "sonnet")
     assert code == 0
     assert seen["command"] == ["pi", "-p", "--model", "sonnet"]
 
@@ -505,7 +505,7 @@ def test_plan_model_flag_reaches_a_known_agent(writ, project, design, monkeypatc
 def test_plan_model_for_an_unknown_agent_is_rejected_before_running(writ, design, project):
     writ("init")
     code, _, err = writ(
-        "plan", str(design), "--agent", "mystery-agent", "--model", "x"
+        "plan", str(design), "--no-stages", "--agent", "mystery-agent", "--model", "x"
     )
     assert code == 2
     assert "does not know how to pass a model" in err
@@ -536,7 +536,7 @@ def chatty_agent(lines, *, stderr_lines=(), exit_code=0):
 def test_plan_mirrors_agent_output_to_the_terminal(writ, project, design):
     writ("init")
     agent = chatty_agent(["reading the design doc", "inspecting src/"])
-    code, out, _ = writ("plan", str(design), "--agent", agent)
+    code, out, _ = writ("plan", str(design), "--no-stages", "--agent", agent)
     assert code == 0
     assert "reading the design doc" in out
     assert "inspecting src/" in out
@@ -544,7 +544,7 @@ def test_plan_mirrors_agent_output_to_the_terminal(writ, project, design):
 
 def test_streamed_output_is_prefixed_so_it_is_distinguishable(writ, project, design):
     writ("init")
-    code, out, _ = writ("plan", str(design), "--agent", chatty_agent(["thinking"]))
+    code, out, _ = writ("plan", str(design), "--no-stages", "--agent", chatty_agent(["thinking"]))
     assert code == 0
     assert "| thinking" in out
 
@@ -552,7 +552,7 @@ def test_streamed_output_is_prefixed_so_it_is_distinguishable(writ, project, des
 def test_agent_stderr_is_mirrored_too(writ, project, design):
     writ("init")
     agent = chatty_agent(["ok"], stderr_lines=["warning: slow model"])
-    code, _, err = writ("plan", str(design), "--agent", agent)
+    code, _, err = writ("plan", str(design), "--no-stages", "--agent", agent)
     assert code == 0
     assert "warning: slow model" in err
 
@@ -560,7 +560,7 @@ def test_agent_stderr_is_mirrored_too(writ, project, design):
 def test_streaming_still_writes_the_full_transcript(writ, project, design):
     writ("init")
     agent = chatty_agent(["line one", "line two"], stderr_lines=["a warning"])
-    writ("plan", str(design), "--agent", agent)
+    writ("plan", str(design), "--no-stages", "--agent", agent)
     directory = next(state.plans_dir(project).iterdir())
     stdout = (directory / "stdout.log").read_text()
     assert "line one" in stdout and "line two" in stdout
@@ -572,7 +572,7 @@ def test_streaming_still_writes_the_full_transcript(writ, project, design):
 def test_quiet_suppresses_the_mirror_but_keeps_the_transcript(writ, project, design):
     writ("init")
     agent = chatty_agent(["chatter"])
-    code, out, _ = writ("plan", str(design), "--agent", agent, "--quiet")
+    code, out, _ = writ("plan", str(design), "--no-stages", "--agent", agent, "--quiet")
     assert code == 0
     # the mirror prefix is the marker; the word itself appears in the echoed argv
     assert "| chatter" not in out
@@ -582,7 +582,7 @@ def test_quiet_suppresses_the_mirror_but_keeps_the_transcript(writ, project, des
 
 def test_streamed_plan_still_commits_correctly(writ, project, design):
     writ("init")
-    code, _, _ = writ("plan", str(design), "--agent", chatty_agent(["working"]))
+    code, _, _ = writ("plan", str(design), "--no-stages", "--agent", chatty_agent(["working"]))
     assert code == 0
     assert len(_work(state.load(project))) == 3
 
@@ -591,7 +591,7 @@ def test_a_planner_that_writes_a_lot_does_not_deadlock(writ, project, design):
     """A full pipe buffer would hang a single-threaded reader."""
     writ("init")
     noisy = chatty_agent([f"line {i} " + "x" * 200 for i in range(400)])
-    code, out, _ = writ("plan", str(design), "--agent", noisy)
+    code, out, _ = writ("plan", str(design), "--no-stages", "--agent", noisy)
     assert code == 0
     assert "line 399" in out
     assert len(_work(state.load(project))) == 3
