@@ -215,7 +215,7 @@ def loop(
     still re-runs the deterministic checks, which is the cheaper half of the same
     idea.
     """
-    resolved = agents.resolve(agent, [], model)
+    resolved = agents.resolve(agent, [], model, events=True)
     directory.mkdir(parents=True, exist_ok=True)
     result = Result()
     budget = repair.DEFAULT_MAX_REPAIR_ROUNDS if max_rounds is None else max_rounds
@@ -353,6 +353,7 @@ def _one_round(
             timeout,
             stream=stream,
             prefix=f"  adjudicate {number} | " if stream else "",
+            event_shape=resolved.event_shape,
         )
     except FileNotFoundError:
         round_.error = f"adjudicator agent not found: {resolved.command[0]}"

@@ -149,6 +149,7 @@ def cmd_plan(args) -> int:
             pipeline_id = plan_id
             pipeline_directory = directory
 
+        print()
         print(f"planning {doc.name} with {args.agent}...")
 
         def announce(resolved: agents.ResolvedAgent, directory: Path) -> None:
@@ -302,7 +303,11 @@ def _run_stages(
     print(f"analysing {doc.name} in {len(stages)} stage(s) with {agent}...")
     print(f"  artifacts: {directory}")
 
+    # A blank line before each stage and after each result. Four agents' worth of
+    # streamed output runs into one wall otherwise, and the lines that say which
+    # stage started and what it wrote are the ones a reader is scanning for.
     def announce(stage: analysis.Stage, resolved: agents.ResolvedAgent) -> None:
+        print()
         print(f"  {stage.name}: {stage.summary}")
         if resolved.warning:
             print(f"    warning: {resolved.warning}", file=sys.stderr)
@@ -368,6 +373,7 @@ def _print_stage_summary(artifacts: analysis.Artifacts) -> None:
     particular: a run that starts with a failing suite will attribute that failure
     to the first task that trips over it unless somebody saw this line.
     """
+    print()
     requirements = artifacts.requirements
     if requirements is not None:
         musts = sum(1 for req in requirements.requirements if req.priority == "must")

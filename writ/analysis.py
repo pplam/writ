@@ -51,6 +51,7 @@ from typing import Any, Callable, Iterable
 
 from . import agents, runner, state
 from .plancheck import Finding, Requirement
+from .stream import truncated
 from .state import WritError, utcnow
 
 # --------------------------------------------------------------------------
@@ -866,7 +867,7 @@ def run_stage(
             )
     if artifact_path.exists():
         artifact_path.unlink()
-    resolved = agents.resolve(agent, list(agent_args or []), model)
+    resolved = agents.resolve(agent, list(agent_args or []), model, events=True)
     where = directory / stage.name
     where.mkdir(parents=True, exist_ok=True)
     prompt = build_prompt(
@@ -881,6 +882,7 @@ def run_stage(
     if on_start is not None:
         on_start(stage, resolved)
     result = Result(stage=stage.name, path=artifact_path)
+    stop_reasons: list[str] = []
     try:
         result.exit_code = runner.run_agent(
             resolved.command,
@@ -890,6 +892,8 @@ def run_stage(
             timeout,
             stream=stream,
             prefix=f"  {stage.name} | " if stream else "",
+            event_shape=resolved.event_shape,
+            stop_reasons=stop_reasons,
         )
     except FileNotFoundError:
         result.error = f"{stage.name} agent not found: {resolved.command[0]}"
@@ -900,11 +904,20 @@ def run_stage(
 
     written = _artifact_text(where, artifact_path)
     if written is None:
-        detail = (
-            agents.hang_hint(resolved)
-            if result.exit_code == 124 and not runner.produced_output(where)
-            else f"exit {result.exit_code}"
-        )
+        if result.exit_code == 124 and not runner.produced_output(where):
+            detail = agents.hang_hint(resolved)
+        elif truncated(stop_reasons):
+            # Named as what it is. A stage whose artifact nearly fills the model's
+            # output allowance fails this way only sometimes — thinking length
+            # varies per run — so the same command succeeding yesterday is not
+            # evidence against it.
+            detail = (
+                f"exit {result.exit_code}, out of output budget: its last turn "
+                "ended on the model's output ceiling, so the artifact was never "
+                "written. A model with more output headroom is the fix"
+            )
+        else:
+            detail = f"exit {result.exit_code}"
         result.error = (
             f"the {stage.name} stage wrote no artifact to {artifact_path} "
             f"({detail}; transcript: {where})"

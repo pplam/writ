@@ -427,7 +427,7 @@ def review(
     is worth more than nothing, and the failure is visible rather than silently
     reducing the review to whoever happened to succeed.
     """
-    resolved = agents.resolve(agent, [], model)
+    resolved = agents.resolve(agent, [], model, events=True)
     directory.mkdir(parents=True, exist_ok=True)
     reports: list[Report] = []
     for critic in chosen:
@@ -454,6 +454,7 @@ def review(
                 timeout,
                 stream=stream,
                 prefix=f"  {critic.name} | " if stream else "",
+                event_shape=resolved.event_shape,
             )
         except FileNotFoundError:
             report.error = f"critic agent not found: {resolved.command[0]}"

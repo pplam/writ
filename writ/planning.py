@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from . import agents, plancheck, runner, state
+from .stream import truncated
 from .plancheck import Finding, Requirement
 from .planner import PlannedMilestone, PlannedTask, section_text
 from .state import WritError
@@ -468,7 +469,7 @@ def generate(
     into that pipeline's directory, beside the analyses it was built from. Without
     them it is the older single-shot planner, which decides everything at once.
     """
-    resolved = agents.resolve(agent, agent_args, model)
+    resolved = agents.resolve(agent, agent_args, model, events=True)
     plan_id = plan_id or new_plan_id(doc)
     directory = state.plan_dir(root, plan_id)
     directory.mkdir(parents=True, exist_ok=True)
@@ -483,6 +484,7 @@ def generate(
     )
     if on_start is not None:
         on_start(resolved, directory)
+    stop_reasons: list[str] = []
     try:
         code = runner.run_agent(
             resolved.command,
@@ -492,13 +494,17 @@ def generate(
             timeout,
             stream=stream,
             prefix="  | " if stream else "",
+            event_shape=resolved.event_shape,
+            stop_reasons=stop_reasons,
         )
     except FileNotFoundError as exc:
         raise WritError(f"planning agent not found: {resolved.command[0]}") from exc
 
     text = _plan_text(directory, plan_path)
     if text is None:
-        raise WritError(_no_plan_message(resolved, directory, code))
+        raise WritError(
+            _no_plan_message(resolved, directory, code, stop_reasons=stop_reasons)
+        )
     try:
         document = load_document(text)
     except WritError as exc:
@@ -507,7 +513,10 @@ def generate(
 
 
 def _no_plan_message(
-    resolved: agents.ResolvedAgent, directory: Path, code: int
+    resolved: agents.ResolvedAgent,
+    directory: Path,
+    code: int,
+    stop_reasons: list[str] | None = None,
 ) -> str:
     """Explain a planner that produced nothing, and why it may have hung."""
     produced_output = runner.produced_output(directory)
@@ -515,6 +524,23 @@ def _no_plan_message(
         detail = "the planning agent was killed for exceeding its timeout"
         if not produced_output:
             detail += f"\n  {agents.hang_hint(resolved)}"
+    elif truncated(stop_reasons or []):
+        # The agent ran, worked, and was cut off mid-turn having spent its whole
+        # output allowance. Said explicitly because the alternative reading —
+        # "it wrote nothing, so it never started" — sends whoever reads this to
+        # check a model id and an API key that were never the problem.
+        detail = (
+            "the planning agent ran out of output budget before it could write "
+            "the plan"
+        )
+        detail += (
+            "\n  its last turn ended on the model's output ceiling, so nothing "
+            "was written and nothing was printed"
+        )
+        detail += (
+            "\n  a plan for this many requirements needs a model with more output "
+            "headroom; the same model on another provider may have far more"
+        )
     else:
         detail = f"the planning agent exited {code} without producing a plan"
         if not produced_output:

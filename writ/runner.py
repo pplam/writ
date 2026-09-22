@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, IO, Iterable
 
 from . import agents, decisions, failures, planner, plans, procs, repair, state, verdict
+from .stream import Renderer
 from .model import (
     DEFAULT_MAX_REWORK,
     add_evidence,
@@ -801,6 +802,54 @@ def _tee(
     flush_line(final=True)
 
 
+#: the agent's own event stream, kept beside the transcript it was rendered into
+EVENTS_FILENAME = "events.jsonl"
+
+
+def _pump_events(
+    source: IO[str],
+    transcript: IO[str],
+    raw: IO[str],
+    shape: str,
+    mirror: IO[str] | None,
+    prefix: str = "",
+    lock: threading.Lock | None = None,
+    reasons: list[str] | None = None,
+) -> None:
+    """Read a structured event stream, showing activity and recording speech.
+
+    Three destinations, because they answer different questions. `raw` gets every
+    event byte for afterwards — it is the only place the stop reason survives.
+    `transcript` gets just what the agent said, so `stdout.log` stays what text
+    mode would have written and everything that parses it keeps working. `mirror`
+    gets a line per event worth watching, which is the whole reason for asking
+    for events in the first place.
+
+    Line-oriented rather than chunked like `_tee`: an event is a line by
+    definition, and a partial line carries nothing to render yet.
+    """
+    renderer = Renderer(shape)
+    for line in source:
+        raw.write(line)
+        raw.flush()
+        rendered = renderer.feed(line)
+        if rendered.text:
+            transcript.write(rendered.text)
+            transcript.flush()
+        if rendered.stop_reason is not None and reasons is not None:
+            reasons.append(rendered.stop_reason)
+        if mirror is None or not rendered.activity:
+            continue
+        shown = "".join(f"{prefix}{item}\n" for item in rendered.activity)
+        if lock is not None:
+            with lock:
+                mirror.write(shown)
+                mirror.flush()
+        else:
+            mirror.write(shown)
+            mirror.flush()
+
+
 def _feed(process: subprocess.Popen, prompt: str) -> None:
     """Deliver the prompt on stdin, tolerating an agent that never reads it."""
     if process.stdin is None:
@@ -827,6 +876,8 @@ def run_agent(
     *,
     stream: bool = False,
     prefix: str = "",
+    event_shape: str = "",
+    stop_reasons: list[str] | None = None,
 ) -> int:
     """Run a coding agent to completion, leaving a full transcript on disk.
 
@@ -837,9 +888,19 @@ def run_agent(
     With `stream`, output is mirrored to this terminal as it arrives, so a long
     agent run is visibly working instead of looking hung. The transcript on disk
     is written either way and is the same bytes.
+
+    With `event_shape`, the agent was asked for structured events instead of
+    prose. They are rendered into activity for the terminal and speech for the
+    transcript, and kept verbatim in `events.jsonl`. `stdout.log` still holds
+    only what the agent said, so this changes what a watching person sees without
+    changing what anything downstream reads. Rendering happens whether or not
+    anyone is watching: `stop_reasons`, filled from the stream, is how a caller
+    tells a truncated run from one that never started, and `--quiet` should not
+    cost that.
     """
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "prompt.txt").write_text(prompt, encoding="utf-8")
+    piped = stream or bool(event_shape)
     with (directory / "stdout.log").open("w", encoding="utf-8") as out, (
         directory / "stderr.log"
     ).open("w", encoding="utf-8") as err:
@@ -847,13 +908,13 @@ def run_agent(
             command,
             cwd=str(cwd),
             stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE if stream else out,
-            stderr=subprocess.PIPE if stream else err,
+            stdout=subprocess.PIPE if piped else out,
+            stderr=subprocess.PIPE if piped else err,
             text=True,
             bufsize=1,
             start_new_session=True,
         )
-        if not stream:
+        if not piped:
             try:
                 process.communicate(input=prompt, timeout=timeout)
                 return process.returncode
@@ -862,48 +923,95 @@ def run_agent(
 
         # tee in threads: the agent may write a lot to either stream, and a
         # full pipe buffer would deadlock a single-threaded reader
-        pumps = [
-            threading.Thread(
-                target=_tee, args=(process.stdout, out, sys.stdout, prefix), daemon=True
-            ),
-            threading.Thread(
-                target=_tee, args=(process.stderr, err, sys.stderr, prefix), daemon=True
-            ),
-        ]
-        for pump in pumps:
-            pump.start()
+        raw: IO[str] | None = None
+        if event_shape:
+            raw = (directory / EVENTS_FILENAME).open("w", encoding="utf-8")
         try:
-            _feed(process, prompt)
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
+            if event_shape and raw is not None:
+                stdout_pump = threading.Thread(
+                    target=_pump_events,
+                    args=(
+                        process.stdout,
+                        out,
+                        raw,
+                        event_shape,
+                        sys.stdout if stream else None,
+                        prefix,
+                        None,
+                        stop_reasons,
+                    ),
+                    daemon=True,
+                )
+            else:
+                stdout_pump = threading.Thread(
+                    target=_tee,
+                    args=(process.stdout, out, sys.stdout if stream else None, prefix),
+                    daemon=True,
+                )
+            pumps = [
+                stdout_pump,
+                threading.Thread(
+                    target=_tee,
+                    args=(process.stderr, err, sys.stderr if stream else None, prefix),
+                    daemon=True,
+                ),
+            ]
             for pump in pumps:
-                pump.join(timeout=1)
-            return _timed_out(process, directory, out, err)
-        for pump in pumps:
-            pump.join(timeout=5)
-        return process.returncode
+                pump.start()
+            try:
+                _feed(process, prompt)
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                for pump in pumps:
+                    pump.join(timeout=1)
+                return _timed_out(process, directory, out, err, raw=raw)
+            for pump in pumps:
+                pump.join(timeout=5)
+            return process.returncode
+        finally:
+            if raw is not None:
+                raw.close()
 
 
 def _timed_out(
-    process: subprocess.Popen, directory: Path, out: IO[str], err: IO[str]
+    process: subprocess.Popen,
+    directory: Path,
+    out: IO[str],
+    err: IO[str],
+    raw: IO[str] | None = None,
 ) -> int:
     """Kill a run that overran, recording whether it had said anything."""
     _terminate(process.pid)
     process.wait(timeout=10)
     out.flush()
     err.flush()
+    # The event stream counts as having said something even when the transcript is
+    # empty: an agent that spent the whole timeout thinking wrote nothing a person
+    # would read, but it plainly did run, and calling that silent sends whoever
+    # reads the message looking at authentication instead.
+    if raw is not None:
+        raw.flush()
+    busy = raw is not None and raw.tell() > 0
     # measured before writing our own note, so callers can still tell a silent
     # hang from an agent that produced output and then stalled
-    if err.tell() == 0 and out.tell() == 0:
+    if err.tell() == 0 and out.tell() == 0 and not busy:
         (directory / "silent").write_text("", encoding="utf-8")
     err.write(f"\n{TIMEOUT_NOTE}\n")
     return 124
 
 
 def produced_output(directory: Path) -> bool:
-    """Whether the agent itself wrote anything, ignoring writ's own notes."""
+    """Whether the agent itself wrote anything, ignoring writ's own notes.
+
+    An event stream counts. A run that thought for four minutes and was cut off
+    before it could act leaves no transcript at all, and the question this answers
+    is whether the agent ran — not whether it managed to say something.
+    """
     if (directory / "silent").exists():
         return False
+    events = directory / EVENTS_FILENAME
+    if events.exists() and events.stat().st_size > 0:
+        return True
     for name in ("stdout.log", "stderr.log"):
         path = directory / name
         if not path.exists():

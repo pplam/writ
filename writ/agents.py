@@ -35,6 +35,11 @@ class AgentProfile:
     interactive_optouts: tuple[str, ...] = ()
     #: subcommands that already imply non-interactive
     headless_subcommands: tuple[str, ...] = ()
+    #: flags that switch this agent to one JSON event per line, so Writ can show
+    #: what it is doing while it does it instead of only what it said at the end
+    event_args: tuple[str, ...] = ()
+    #: which adapter in `writ/stream.py` reads those events
+    event_shape: str = ""
     note: str = ""
 
 
@@ -43,11 +48,15 @@ PROFILES: dict[str, AgentProfile] = {
         prefix=("-p",),
         model_flag="--model",
         interactive_optouts=("-p", "--print", "--mode", "--export"),
+        event_args=("--mode", "json"),
+        event_shape="pi",
     ),
     "claude": AgentProfile(
         prefix=("-p",),
         model_flag="--model",
         interactive_optouts=("-p", "--print"),
+        event_args=("--output-format", "stream-json", "--verbose"),
+        event_shape="claude",
     ),
     "codex": AgentProfile(
         prefix=("exec",),
@@ -89,6 +98,9 @@ class ResolvedAgent:
     name: str
     #: set when Writ could not verify the command runs without a terminal
     warning: str | None = None
+    #: which `writ/stream.py` adapter reads this run's output, empty when the run
+    #: prints prose rather than events
+    event_shape: str = ""
 
     @property
     def display(self) -> str:
@@ -99,12 +111,20 @@ def resolve(
     agent: str,
     extra_args: list[str] | None = None,
     model: str | None = None,
+    *,
+    events: bool = False,
 ) -> ResolvedAgent:
     """Build the argv for a headless agent run.
 
     `agent` is a command string, `extra_args` are the operator's own arguments
     from after `--`, and `model` is the `--model` value to translate. Explicit
     tokens are never overridden: they are the operator saying they know better.
+
+    `events` asks for the agent's structured event stream, so a long run can be
+    watched while it runs rather than read once it ends. It is a request, not a
+    guarantee: an agent Writ has no adapter for, or one whose output mode the
+    operator already set by hand, runs exactly as it did before and reports no
+    shape — better plain prose than events parsed under the wrong shape.
     """
     tokens = shlex.split(agent)
     if not tokens:
@@ -155,9 +175,22 @@ def resolve(
             )
         model_args = [profile.model_flag, model]
 
+    # Asking for events is dropped, not forced, when the operator already spelled
+    # an output mode themselves: their flag decides the format, and Writ would be
+    # parsing one shape while the agent emitted another.
+    event_args: list[str] = []
+    event_shape = ""
+    if events and profile.event_args and not supplied & set(profile.event_args):
+        event_args = list(profile.event_args)
+        event_shape = profile.event_shape
+
     suffix = [token for token in profile.suffix if token not in supplied]
-    command = [executable, *prefix, *rest, *extra, *model_args, *suffix]
-    return ResolvedAgent(command=command, profile=profile, name=name)
+    command = [
+        executable, *prefix, *rest, *extra, *model_args, *event_args, *suffix
+    ]
+    return ResolvedAgent(
+        command=command, profile=profile, name=name, event_shape=event_shape
+    )
 
 
 def silent_exit_hint(resolved: ResolvedAgent, code: int) -> str:

@@ -499,7 +499,9 @@ def test_plan_model_flag_reaches_a_known_agent(writ, project, design, monkeypatc
     writ("init")
     code, _, _ = writ("plan", str(design), "--no-stages", "--agent", "pi", "--model", "sonnet")
     assert code == 0
-    assert seen["command"] == ["pi", "-p", "--model", "sonnet"]
+    # `--mode json` rides along because planning asks for the event stream: the
+    # model flag is still translated to pi's own spelling, which is what this is about
+    assert seen["command"] == ["pi", "-p", "--model", "sonnet", "--mode", "json"]
 
 
 def test_plan_model_for_an_unknown_agent_is_rejected_before_running(writ, design, project):
