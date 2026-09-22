@@ -878,6 +878,7 @@ def run_agent(
     prefix: str = "",
     event_shape: str = "",
     stop_reasons: list[str] | None = None,
+    mirror_lock: threading.Lock | None = None,
 ) -> int:
     """Run a coding agent to completion, leaving a full transcript on disk.
 
@@ -897,6 +898,11 @@ def run_agent(
     anyone is watching: `stop_reasons`, filled from the stream, is how a caller
     tells a truncated run from one that never started, and `--quiet` should not
     cost that.
+
+    `mirror_lock` is shared by every agent a caller runs at once, so each mirrored
+    line reaches the terminal whole. Without it two concurrent agents splice their
+    output together mid-word and the prefix that says which one is speaking stops
+    meaning anything.
     """
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "prompt.txt").write_text(prompt, encoding="utf-8")
@@ -937,7 +943,7 @@ def run_agent(
                         event_shape,
                         sys.stdout if stream else None,
                         prefix,
-                        None,
+                        mirror_lock,
                         stop_reasons,
                     ),
                     daemon=True,
@@ -945,14 +951,26 @@ def run_agent(
             else:
                 stdout_pump = threading.Thread(
                     target=_tee,
-                    args=(process.stdout, out, sys.stdout if stream else None, prefix),
+                    args=(
+                        process.stdout,
+                        out,
+                        sys.stdout if stream else None,
+                        prefix,
+                        mirror_lock,
+                    ),
                     daemon=True,
                 )
             pumps = [
                 stdout_pump,
                 threading.Thread(
                     target=_tee,
-                    args=(process.stderr, err, sys.stderr if stream else None, prefix),
+                    args=(
+                        process.stderr,
+                        err,
+                        sys.stderr if stream else None,
+                        prefix,
+                        mirror_lock,
+                    ),
                     daemon=True,
                 ),
             ]

@@ -70,7 +70,14 @@ def test_the_shipped_example_validates():
         "stream": True,
     }
     # a filled-in example, so it exercises the sections beyond agents and run too
-    assert loaded["plan"] == {"stages": True, "gates": True, "critics": True}
+    assert loaded["plan"] == {
+        "stages": True,
+        "gates": True,
+        "critics": True,
+        "repair": True,
+        "parallel_stages": False,
+        "parallel_critics": True,
+    }
     assert loaded["critique"]["critics"]
 
 

@@ -301,12 +301,43 @@ FIELDS: dict[str, Field] = {
         " (@flag@). Costs an agent run each, which is why writ does not do it"
         " unasked; which critics run is @CRITICS_PATH@",
     ),
+    "plan.parallel_stages": Field(
+        kind="flag",
+        flag="--parallel-stages",
+        doc="run the analysis stages that need nothing from each other at once"
+        " (@flag@) — requirements beside inventory. Buys a stage's wall-clock"
+        " and costs the inventory its coverage claims, which need requirement"
+        " ids it does not have yet",
+    ),
+    "plan.parallel_critics": Field(
+        kind="flag",
+        flag="--parallel-critics",
+        doc="run the critics that only read the repository at once (@flag@),"
+        " each critic that runs the project's commands alone. The interference"
+        " writ avoids by running them one at a time comes from the commands,"
+        " not the reading",
+    ),
+    "critique.parallel": Field(
+        kind="flag",
+        flag="--parallel-critics",
+        doc="the same for writ critique (@flag@)",
+    ),
+    "plan.repair": Field(
+        kind="flag",
+        flag="--repair",
+        doc="answer the plan's blocking findings with the bounded repair loop"
+        " before approval (@flag@), the loop writ adjudicate runs. Costs agent"
+        " runs, so writ does not do it unasked; the bound is"
+        " @MAX_ROUNDS@",
+    ),
     "plan.auto_approve": Field(
         kind="flag",
         flag="--auto-approve",
         doc="approve a plan nothing blocking stands against, with no human"
         " (@flag@). A clean check means writ proved nothing wrong, not that"
-        " anyone read it; blocking findings are never overridden this way",
+        " anyone read it; blocking findings are never overridden this way."
+        " Judged after the critics and @REPAIR_PATH@ have had their say, so"
+        " what it approves is the plan as everything that read it left it",
     ),
     "plan.refresh": Field(
         kind="flag",
@@ -609,6 +640,15 @@ DEFAULTS: dict[str, dict[str, Default]] = {
             "gates": Default("plan.gates", True),
             "stages": Default("plan.stages", True),
             "refresh": Default("plan.refresh", False),
+            "parallel_stages": Default("plan.parallel_stages", False),
+            "parallel_critics": Default("plan.parallel_critics", False),
+            "repair": Default("plan.repair", False),
+            "max_rounds": Default("adjudicate.max_rounds", MAX_REPAIR_ROUNDS),
+            # The adjudicator is the critics' kind of work, so it follows their
+            # agent rather than the planner's — the same choice `writ adjudicate`
+            # makes, read from the same place.
+            "adjudicator_agent": Default("agents.critic.command"),
+            "adjudicator_model": Default("agents.critic.model"),
             "auto_approve": Default("plan.auto_approve", False),
             "critics": Default("plan.critics", False),
             # not a flag: a slot the config fills, so `plan.critics: true` can run
@@ -620,6 +660,7 @@ DEFAULTS: dict[str, dict[str, Default]] = {
             "model": Default("agents.critic.model"),
             "timeout": Default("agents.critic.timeout", AGENT_TIMEOUT),
             "critics": Default("critique.critics"),
+            "parallel_critics": Default("critique.parallel", False),
         },
         "adjudicate": {
             # The adjudicator runs on the critic's agent, not the planner's. It is
@@ -1073,6 +1114,8 @@ def _fill(text: str, path: str | None = None) -> str:
         .replace("@WATCH_FLAG@", FIELDS["status.watch"].flag)
         .replace("@CRITICS_PATH@", "critique.critics")
         .replace("@PLAN_CRITICS@", "plan.critics")
+        .replace("@REPAIR_PATH@", "plan.repair")
+        .replace("@MAX_ROUNDS@", "adjudicate.max_rounds")
     )
     if path:
         out = out.replace("@default@", _rendered(DEFAULT_VALUES[path])).replace(

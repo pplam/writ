@@ -1052,3 +1052,41 @@ pre.command {
 .held-questions li { margin-bottom: 3px; }
 
 .pill.pass { background: var(--s-completed); color: var(--i-completed); }
+
+/*
+ * The planning phase graph.
+ *
+ * Reuses the task graph's node vocabulary — the same box, the same marks, the same
+ * `breathe` on a live one — because a reader should not have to learn two graphs.
+ * What it adds is the statuses a task never has: `pending` for a step writ has
+ * declared and not reached, `reused` for one whose artifact was already on disk,
+ * and `skipped` for one it decided against.
+ *
+ * `pending` is dashed and dimmed rather than absent. The whole point of declaring
+ * the steps up front is that the shape of the attempt is visible before it happens,
+ * and a box that is plainly not-yet is what says so.
+ */
+.phase-holder { overflow: auto; padding-bottom: 8px; margin-top: 10px; }
+.phase-dag { display: block; }
+
+.node.step .box { fill: var(--s-planned); stroke: var(--edge); }
+.node.step.pending .box { fill: none; stroke: var(--edge); stroke-dasharray: 4 3; }
+.node.step.running .box { fill: var(--s-running); stroke: var(--i-running); stroke-width: 1.6; }
+.node.step.ok .box { fill: var(--s-completed); stroke: var(--i-completed); }
+.node.step.reused .box { fill: var(--s-planned); stroke: var(--i-running); stroke-dasharray: 2 2; }
+.node.step.failed .box { fill: var(--s-failed); stroke: var(--i-failed); }
+.node.step.abandoned .box { fill: var(--s-review); stroke: var(--i-review); stroke-dasharray: 5 3; }
+.node.step.skipped .box { fill: none; stroke: var(--edge); opacity: 0.7; }
+
+.node.step.pending .node-title, .node.step.skipped .node-title { fill: var(--dim); }
+.node.step.ok .node-mark { fill: var(--i-completed); }
+.node.step.failed .node-mark { fill: var(--i-failed); }
+.node.step.running .node-mark { fill: var(--i-running); }
+
+/*
+ * The activity pane: what the agent is doing, in the terminal's own vocabulary.
+ *
+ * Shorter than the raw log beside it, because it is the summary — one line per tool
+ * call, per thought, per thing said — and the log below has the detail.
+ */
+pre.log.activity { max-height: 30vh; background: var(--sunken); border-radius: 6px; }

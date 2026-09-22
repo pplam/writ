@@ -84,17 +84,47 @@
     "stages": true,
     "gates": true,
 
+    "_parallel_stages": [
+      "Run the analysis stages that need nothing from each other at once:",
+      "requirements beside inventory, then verification, which needs both. Buys",
+      "a stage's wall-clock and costs the inventory its coverage claims — it has",
+      "no requirement ids to attach them to yet, so it is told to make none.",
+      "Leave it false where `already satisfied by this repository` matters."
+    ],
+    "parallel_stages": false,
+
+    "_parallel_critics": [
+      "Run the critics that only read the repository at once, and each critic",
+      "that runs the project's own commands alone. The interference writ avoids",
+      "by running them one at a time comes from the commands, not the reading,",
+      "so four of the five overlap and the feasibility critic still gets the",
+      "working tree to itself."
+    ],
+    "parallel_critics": true,
+
     "_critics": [
       "Run the critics over every plan straight after committing it. Costs an",
       "agent run each, which is why writ does not do it unasked; this project",
       "has decided it is worth it."
     ],
-    "critics": true
+    "critics": true,
+
+    "_repair": [
+      "Answer the plan's blocking findings with the bounded repair loop before",
+      "approval, the same loop `writ adjudicate` runs. Pair it with critics and",
+      "auto_approve for a project that goes from document to running graph",
+      "unattended: the critics report, this answers them, and approval is judged",
+      "last on what they left. Without it a plan the critics object to waits at",
+      "needs-approval for a person, which is the right shape when there is one."
+    ],
+    "repair": true
   },
 
   "critique": {
     "_": "which critics run, here and for plan.critics. Unset means all of them.",
-    "critics": ["coverage", "dependency", "acceptance", "feasibility"]
+    "critics": ["coverage", "dependency", "acceptance", "feasibility"],
+    "_parallel": "the same concurrency as plan.parallel_critics, for writ critique",
+    "parallel": true
   },
 
   "adjudicate": {

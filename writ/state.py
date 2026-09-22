@@ -105,6 +105,10 @@ def empty_state() -> dict[str, Any]:
         "tasks": {},
         "runs": {},
         "plans": [],
+        # the pre-execution record: one entry per planning attempt, written while
+        # it happens rather than after. Everything else here is a record of work
+        # that finished; this is the only one a reader can watch.
+        "phases": [],
         # what the design asks for, keyed by requirement id, and the plan-level
         # record of whether the graph covering it has been reviewed. Tasks are
         # the work; these two are what the work is answerable to.
@@ -164,6 +168,7 @@ def load(root: str | os.PathLike[str]) -> dict[str, Any]:
     # project planned by an older Writ stays readable and runnable without a
     # migration step that could fail halfway.
     data.setdefault("plans", [])
+    data.setdefault("phases", [])
     data.setdefault("requirements", {})
     data.setdefault("findings", [])
     data.setdefault("repairs", [])

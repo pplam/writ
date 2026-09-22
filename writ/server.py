@@ -37,6 +37,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from . import api, state
 from .state import WritError
@@ -165,6 +166,8 @@ class _Handler(BaseHTTPRequestHandler):
             return api.milestones(data)
         if parts == ["graph"]:
             return api.graph(data)
+        if parts == ["phase"]:
+            return api.phase(data)
         if parts == ["activity"]:
             return api.activity(data)
         if len(parts) == 2 and parts[0] == "task":
@@ -176,6 +179,20 @@ class _Handler(BaseHTTPRequestHandler):
         if len(parts) == 3 and parts[0] == "run":
             # The whole log rather than the tail the detail view carries.
             return api.log(self.root, data, parts[1], parts[2])
+        if len(parts) == 3 and parts[:2] == ["phase", "step"]:
+            # Polled while a reader is watching a live planning step. Not on the
+            # snapshot push: a step's transcript grows continuously while
+            # `state.json` does not move at all, so it is not something a snapshot
+            # watcher would ever notice — and shipping every step's output on every
+            # push would send megabytes to a page showing one of them.
+            #
+            # Unquoted because a step id carries a colon — `stage:requirements`,
+            # `critic:feasibility@r2` — and the client encodes it. The other routes
+            # take ids that survive `encodeURIComponent` unchanged.
+            #
+            # The id selects a step from the record and the path comes from what
+            # that step wrote down; nothing here is built from the request.
+            return api.step_output(data, self.root, unquote(parts[2]))
         return None
 
     # ------------------------------------------------------------- responses

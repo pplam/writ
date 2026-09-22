@@ -96,7 +96,9 @@ def test_the_snapshot_carries_every_view(served):
     _, headers, body = get(f"{base}/api/snapshot")
     assert headers["Content-Type"] == "application/json"
     payload = json.loads(body)
-    for view in ("overview", "tasks", "runs", "milestones", "graph", "decisions"):
+    for view in (
+        "overview", "tasks", "runs", "milestones", "graph", "decisions", "phase"
+    ):
         assert view in payload, view
 
 
@@ -112,6 +114,36 @@ def test_an_unknown_id_is_a_404_with_a_readable_reason(served):
         get(f"{base}/api/task/M99-999")
     assert caught.value.code == 404
     assert b"M99-999" in caught.value.read()
+
+
+def test_a_planning_step_serves_its_own_output(served):
+    """The step output route, including the colon its ids carry.
+
+    `stage:requirements` and `critic:feasibility@r2` go through
+    `encodeURIComponent` on the client, so the route has to unquote. A step id
+    that is not on the record is a 404, which is what makes the path safe: it
+    comes from the record, never from the request.
+    """
+    from writ import phases
+
+    base, project = served
+    phase_id = phases.begin(
+        project,
+        doc="design.md",
+        plan_id="design-20250101T000000",
+        steps=phases.declare(stages=(), synthesis=True),
+    )
+    phases.start_step(project, phase_id, "synthesis")
+    _, _, body = get(f"{base}/api/phase/step/synthesis")
+    assert json.loads(body)["step"] == "synthesis"
+
+    _, _, body = get(f"{base}/api/phase")
+    assert json.loads(body)["id"] == phase_id
+
+    for attempt in ("stage%3Anope", "..%2F..%2Fetc%2Fpasswd", "nope"):
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            get(f"{base}/api/phase/step/{attempt}")
+        assert caught.value.code == 404, attempt
 
 
 def test_an_unknown_route_is_a_404(served):

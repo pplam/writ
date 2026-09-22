@@ -285,6 +285,112 @@ def test_only_the_named_critics_run(planned_with_requirements, project, writ):
     assert names == ["coverage"]
 
 
+# --------------------------------------------------------------------------
+# running them at once
+
+
+def test_only_the_critic_that_runs_commands_says_so():
+    """The distinction that decides the waves is declared, not inferred by name.
+
+    Reading a repository concurrently is harmless; running its test suite twice in
+    one working tree is what produced findings about a broken build. A critic added
+    later is placed by what it says it does.
+    """
+    runs = [critic.name for critic in critics.CRITICS if critic.runs_commands]
+    assert runs == ["feasibility"]
+    # And it is the one whose brief actually tells it to run them.
+    feasibility = critics.by_name(["feasibility"])[0]
+    assert any("run them" in check.lower() for check in feasibility.checks)
+
+
+def test_the_waves_read_together_and_run_alone():
+    grouped = critics.waves(critics.CRITICS)
+    assert [[critic.name for critic in wave] for wave in grouped] == [
+        ["coverage", "dependency", "scope", "acceptance"],
+        ["feasibility"],
+    ]
+    # A partition: every critic runs exactly once, whatever the grouping.
+    assert [critic for wave in grouped for critic in wave] == list(critics.CRITICS)
+
+
+def test_a_wave_is_not_invented_for_critics_that_were_not_chosen():
+    chosen = critics.by_name(["feasibility"])
+    assert critics.waves(chosen) == [chosen]
+    assert critics.waves([]) == []
+
+
+def test_parallel_critics_all_report(planned_with_requirements, project, writ):
+    """Concurrency must not reduce the review to whoever finished first."""
+    code, out, _ = writ("critique", "--agent", agent(SILENT), "--quiet", "--parallel-critics")
+    assert code == 0
+    names = [record["critic"] for record in critics.reviews(state.load(project))]
+    assert names == [critic.name for critic in critics.CRITICS]
+    assert "critics at once:" in out
+
+
+def test_a_parallel_critic_report_names_whose_it_is(
+    planned_with_requirements, project, writ
+):
+    """Four headers print before any of them report, so a bare count has no owner.
+
+    Run one at a time, the counts follow the header that named the critic. Run at
+    once they do not, and an unattributed `0 blocking, 0 advisory` is unreadable.
+    """
+    _, parallel, _ = writ(
+        "critique", "--agent", agent(SILENT), "--quiet", "--parallel-critics"
+    )
+    assert "coverage: 0 blocking" in parallel
+    _, sequential, _ = writ("critique", "--agent", agent(SILENT), "--quiet")
+    assert "coverage: 0 blocking" not in sequential
+    assert "0 blocking" in sequential
+
+
+def test_parallel_critics_report_in_the_order_they_were_asked_for(
+    planned_with_requirements, project, writ
+):
+    """A review reads the same whether or not it ran concurrently.
+
+    Which agent finishes first is a timing accident, and a record that ordered
+    itself by that would make two identical reviews look different.
+    """
+    writ("critique", "--agent", agent(SILENT), "--quiet", "--parallel-critics")
+    parallel = [record["critic"] for record in critics.reviews(state.load(project))]
+    with state.transaction(project) as data:
+        data["reviews"] = []
+    writ("critique", "--agent", agent(SILENT), "--quiet")
+    assert [
+        record["critic"] for record in critics.reviews(state.load(project))
+    ] == parallel
+
+
+def test_one_parallel_critic_failing_does_not_lose_the_others(
+    planned_with_requirements, project, writ
+):
+    code, out, err = writ("critique", "--agent", agent(MUTE), "--quiet", "--parallel-critics")
+    assert code == 1
+    records = critics.reviews(state.load(project))
+    assert len(records) == len(critics.CRITICS)
+    assert all(record.get("error") for record in records)
+
+
+def test_parallel_critics_findings_reach_the_same_ledger(
+    planned_with_requirements, project, writ, monkeypatch
+):
+    monkeypatch.setenv(
+        "WRIT_TEST_REPORT", json.dumps({"findings": [BLOCKING_FINDING]})
+    )
+    monkeypatch.setenv("WRIT_TEST_CRITIC", "builds what the design")
+    code, _, _ = writ("critique", "--agent", agent(CRITIC), "--quiet", "--parallel-critics")
+    assert code == 1
+    records = [
+        record
+        for record in plans.finding_records(state.load(project))
+        if str(record.get("source", "")).startswith("critic:")
+    ]
+    assert [record["source"] for record in records] == ["critic:coverage"]
+    assert not plans.runnable(state.load(project))
+
+
 def test_a_review_is_stale_once_the_plan_moves_on(
     planned_with_requirements, project, writ
 ):
@@ -337,6 +443,57 @@ def test_plan_can_run_the_critics_in_one_pass(writ, project, design, tmp_path):
     )
     assert code == 0
     assert [r["critic"] for r in critics.reviews(state.load(project))] == ["coverage"]
+
+
+def test_auto_approve_waits_for_the_critics(writ, project, design, tmp_path, monkeypatch):
+    """A critic's blocking finding must reach `--auto-approve` before it decides.
+
+    Auto-approve used to run inside the commit that writes the tasks, which is
+    before the critics have read anything. So a plan whose structural checks were
+    clean was approved, the critics then reported something blocking, and the
+    re-check demoted the plan to `needs-approval` — leaving an approval record that
+    said nothing blocking stood against a plan with blocking findings against it.
+    While that window was open the plan really was `approved`, so a concurrent
+    `writ run` would have started executing it.
+    """
+    artifact = tmp_path / "plan.json"
+    artifact.write_text(json.dumps(PLAN), encoding="utf-8")
+    writ("init")
+    # No WRIT_TEST_CRITIC: only the coverage critic runs, so it is the one that
+    # reports, and the selector in the stub matches on brief text rather than name.
+    monkeypatch.setenv("WRIT_TEST_REPORT", json.dumps({"findings": [BLOCKING_FINDING]}))
+    code, out, _ = writ(
+        "plan", str(design), "--from-plan", str(artifact),
+        "--critics", "coverage", "--critic-agent", agent(CRITIC),
+        "--auto-approve", "--quiet",
+    )
+    assert code == 0
+    data = state.load(project)
+    record = plans.plan_status(data)
+    assert record["status"] == "needs-approval"
+    # Never approved at all, rather than approved and then demoted: the record
+    # must not carry an approval the findings contradict.
+    assert record["approved_by"] is None
+    assert record["approved_at"] is None
+    assert "plan held at needs-approval" in out
+
+
+def test_auto_approve_still_approves_a_plan_the_critics_pass(
+    writ, project, design, tmp_path
+):
+    """The other half: silence from the critics still reaches approval."""
+    artifact = tmp_path / "plan.json"
+    artifact.write_text(json.dumps(PLAN), encoding="utf-8")
+    writ("init")
+    code, out, _ = writ(
+        "plan", str(design), "--from-plan", str(artifact),
+        "--critics", "coverage", "--critic-agent", agent(SILENT),
+        "--auto-approve", "--quiet",
+    )
+    assert code == 0
+    record = plans.plan_status(state.load(project))
+    assert record["status"] == "approved"
+    assert record["approved_by"] == "writ --auto-approve"
 
 
 # --------------------------------------------------------------------------

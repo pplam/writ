@@ -45,6 +45,9 @@ failed at synthesis does not pay for three analyses again.
 from __future__ import annotations
 
 import json
+import threading
+from concurrent import futures
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -75,6 +78,15 @@ class Stage:
     rules: str
     #: what it must not do — the boundary that keeps it from being the planner
     out_of_scope: str = ""
+    #: the artifacts it cannot run without. Only a hard prerequisite belongs here:
+    #: verification is deciding how to prove each requirement, so it cannot start
+    #: before there is a list of them. An artifact that merely *sharpens* a stage
+    #: does not, which is what lets two stages share a wave — see `waves`.
+    needs: tuple[str, ...] = ()
+    #: the extra instruction to give this stage when the requirement inventory is
+    #: not available to it, naming what it must therefore leave out. A stage that
+    #: can run without the ids still must not invent them.
+    without_requirements: str = ""
 
     @property
     def scope(self) -> str:
@@ -243,6 +255,12 @@ Rules:
 #: everything later references its ids, inventory second because verification
 #: needs to know which tests exist, verification last because it is the only one
 #: that needs both. Each receives the artifacts of the ones before it.
+#:
+#: `needs` records which of those dependencies is real. Only verification has one:
+#: it is asked how to prove each requirement, so a list of requirements is not
+#: context but input. The inventory is surveying the repository, which the design
+#: document does not change — it is given the requirement ids when they exist only
+#: so its coverage claims can attach to them.
 STAGES: tuple[Stage, ...] = (
     Stage(
         name="requirements",
@@ -277,6 +295,14 @@ STAGES: tuple[Stage, ...] = (
             "judge whether the design is a good idea. Report the ground, not the "
             "route across it."
         ),
+        without_requirements=(
+            "You have not been given the requirement inventory: it is being written "
+            "at the same time as this survey. So leave `existing_coverage` empty. "
+            "Report what this repository has and what it proves in `components` and "
+            "`baseline_commands` as fully as you can, and leave the question of "
+            "which stated obligation that discharges to the stage that has the ids. "
+            "Do not guess at requirement ids in order to fill the field."
+        ),
     ),
     Stage(
         name="verification",
@@ -289,6 +315,7 @@ STAGES: tuple[Stage, ...] = (
         ),
         schema=VERIFICATION_SCHEMA,
         rules=VERIFICATION_RULES,
+        needs=("requirements", "inventory"),
         out_of_scope=(
             "Do not group requirements into tasks, assign them an order, or write "
             "acceptance criteria for work that does not exist yet. One requirement "
@@ -720,6 +747,14 @@ def build_prompt(
         lines.extend(f"- {path}" for path in other_docs)
         lines.append("")
 
+    if (
+        artifacts.requirements is None
+        and stage.name != "requirements"
+        and stage.without_requirements
+    ):
+        lines.append(stage.without_requirements)
+        lines.append("")
+
     if artifacts.requirements is not None and stage.name != "requirements":
         lines.append(
             "The requirement inventory, already established. These ids are fixed: "
@@ -841,7 +876,9 @@ def run_stage(
     context: dict[str, Any] | None = None,
     refresh: bool = False,
     stream: bool = False,
+    mirror_lock: threading.Lock | None = None,
     on_start: Callable[[Stage, agents.ResolvedAgent], None] | None = None,
+    on_launch: Callable[[Stage, agents.ResolvedAgent, Path], None] | None = None,
 ) -> Result:
     """Run one analysis stage, or reuse the artifact it already wrote.
 
@@ -879,8 +916,18 @@ def run_stage(
         instructions=instructions,
         context=context,
     )
+    # Two hooks, and the difference between them is the lock. `on_start` prints,
+    # so it is held behind `mirror_lock` to keep two concurrent stages from
+    # interleaving halfway through a line. `on_launch` records, which means a state
+    # transaction — an flock acquisition and two fsyncs — and holding the terminal
+    # lock across that would stall the other stage's output on a file lock it has
+    # no interest in. Worse, a contended state lock raises, and raising inside
+    # `mirror_lock` would kill a stage over a bookkeeping write.
+    if on_launch is not None:
+        on_launch(stage, resolved, where)
     if on_start is not None:
-        on_start(stage, resolved)
+        with mirror_lock if mirror_lock is not None else nullcontext():
+            on_start(stage, resolved)
     result = Result(stage=stage.name, path=artifact_path)
     stop_reasons: list[str] = []
     try:
@@ -894,6 +941,7 @@ def run_stage(
             prefix=f"  {stage.name} | " if stream else "",
             event_shape=resolved.event_shape,
             stop_reasons=stop_reasons,
+            mirror_lock=mirror_lock,
         )
     except FileNotFoundError:
         result.error = f"{stage.name} agent not found: {resolved.command[0]}"
@@ -931,6 +979,61 @@ def run_stage(
     return result
 
 
+def waves(chosen: Iterable[Stage]) -> list[list[Stage]]:
+    """The chosen stages grouped into what may run at the same time.
+
+    A stage joins the current wave if none of the stages in it produce something
+    it `needs`, and starts a new one otherwise. For the three analyses that means
+    requirements and inventory together, then verification — which needs both — on
+    its own. The grouping is derived from the declared dependencies rather than
+    hardcoded, so a stage added later is placed by what it says it needs.
+
+    Order is preserved, both between waves and within one, so a sequential run and
+    a concurrent one visit the stages in the same order.
+    """
+    grouped: list[list[Stage]] = []
+    current: list[Stage] = []
+    produced: set[str] = set()
+    for stage in chosen:
+        if current and any(need in produced for need in stage.needs):
+            grouped.append(current)
+            current = []
+        current.append(stage)
+        produced.add(stage.name)
+    if current:
+        grouped.append(current)
+    return grouped
+
+
+def verify_coverage_ids(artifact: InventoryArtifact, *, known: Iterable[str]) -> None:
+    """Re-check an inventory's coverage claims once the requirement ids exist.
+
+    An inventory that ran beside the requirements stage was validated against no
+    ids at all, because there were none yet. This is that validation, deferred:
+    the claims still have to attach to real obligations, since a hallucinated
+    `REQ-009` marked already-satisfied is how a requirement nothing asked for gets
+    treated as done.
+
+    Raises rather than dropping the entry. The stage was told to leave the field
+    empty when it has no ids; one that filled it anyway did not misread the schema,
+    it answered a question it had not been given, and the rest of its survey was
+    written by the same reasoning.
+    """
+    ids = set(known)
+    if not ids:
+        return
+    for index, entry in enumerate(artifact.existing_coverage):
+        req_id = str(entry.get("requirement_id", "")).strip()
+        if req_id not in ids:
+            raise WritError(
+                f"existing_coverage[{index}] claims coverage of {req_id}, which is "
+                "not in the requirement inventory. The inventory stage ran beside "
+                "the requirements stage, so it was told to leave existing_coverage "
+                "empty; re-run it with --refresh, sequentially, to have it cite "
+                "real ids."
+            )
+
+
 def run_pipeline(
     *,
     root: Path,
@@ -946,22 +1049,36 @@ def run_pipeline(
     context: dict[str, Any] | None = None,
     refresh: bool = False,
     stream: bool = False,
+    parallel: bool = False,
     on_start: Callable[[Stage, agents.ResolvedAgent], None] | None = None,
     on_finish: Callable[[Result], None] | None = None,
+    on_launch: Callable[[Stage, agents.ResolvedAgent, Path], None] | None = None,
 ) -> tuple[Artifacts, list[Result]]:
     """Run the analysis stages in order, stopping at the first that fails.
 
-    Sequential and fail-fast, unlike the critics. A critic that fails costs one
-    perspective on a plan that still exists; a stage that fails leaves the next
-    stage with nothing to work from — verification cannot decide how to prove a
-    list of obligations it was never given. Stopping at the failure means the
-    error names the stage that actually broke.
+    Sequential and fail-fast by default, unlike the critics. A critic that fails
+    costs one perspective on a plan that still exists; a stage that fails leaves
+    the next stage with nothing to work from — verification cannot decide how to
+    prove a list of obligations it was never given. Stopping at the failure means
+    the error names the stage that actually broke.
+
+    With `parallel`, stages that need nothing from each other run at once (see
+    `waves`), and a wave that fails stops the pipeline as a single stage would.
+    Only requirements and inventory qualify: the survey of the repository does not
+    depend on what the document asks for. What it loses is the ability to say which
+    stated obligation the existing code already discharges, because it has no ids
+    to say it with — so it is told to leave `existing_coverage` empty, and the
+    claims it would have made are checked for afterwards rather than trusted (see
+    `verify_coverage_ids`). That is the trade: one agent's wall-clock against the
+    `replanned-requirement` finding and the synthesizer's note about what is
+    already covered.
     """
     directory.mkdir(parents=True, exist_ok=True)
     artifacts = read_all(directory)
     results: list[Result] = []
-    for stage in chosen:
-        result = run_stage(
+
+    def run(stage: Stage, lock: threading.Lock | None = None) -> Result:
+        return run_stage(
             stage,
             root=root,
             doc=doc,
@@ -976,14 +1093,60 @@ def run_pipeline(
             context=context,
             refresh=refresh,
             stream=stream,
+            mirror_lock=lock,
             on_start=on_start,
+            on_launch=on_launch,
         )
-        results.append(result)
-        if on_finish is not None:
-            on_finish(result)
-        if not result.ok:
+
+    grouped = waves(chosen) if parallel else [[stage] for stage in chosen]
+    lock = threading.Lock()
+    for wave in grouped:
+        if len(wave) == 1:
+            landed = [(wave[0], run(wave[0]))]
+        else:
+            with futures.ThreadPoolExecutor(max_workers=len(wave)) as pool:
+                submitted = {pool.submit(run, stage, lock): stage for stage in wave}
+                done = {}
+                for future in futures.as_completed(submitted):
+                    stage = submitted[future]
+                    try:
+                        done[stage.name] = future.result()
+                    except Exception as exc:  # pragma: no cover - defensive
+                        done[stage.name] = Result(
+                            stage=stage.name,
+                            path=directory / stage.artifact,
+                            error=f"the {stage.name} stage did not run: {exc}",
+                        )
+                # Reported in the order they were asked for, not the order they
+                # finished, so the record of a run does not depend on which agent
+                # happened to be quicker.
+                landed = [(stage, done[stage.name]) for stage in wave]
+
+        for stage, result in landed:
+            if result.ok:
+                setattr(artifacts, stage.name, result.artifact)
+
+        # Deferred validation, once every artifact in the wave has landed and
+        # before any of them is reported: an inventory that ran without the
+        # requirement ids is only now checkable against them, and a stage whose
+        # artifact does not survive that check did not succeed.
+        if len(wave) > 1 and artifacts.inventory is not None:
+            known = [req.id for req in artifacts.inventory_requirements]
+            try:
+                verify_coverage_ids(artifacts.inventory, known=known)
+            except WritError as exc:
+                for stage, result in landed:
+                    if stage.name == "inventory":
+                        result.error = str(exc)
+                        result.artifact = None
+                artifacts.inventory = None
+
+        for stage, result in landed:
+            results.append(result)
+            if on_finish is not None:
+                on_finish(result)
+        if any(not result.ok for _, result in landed):
             break
-        setattr(artifacts, stage.name, result.artifact)
     return artifacts, results
 
 

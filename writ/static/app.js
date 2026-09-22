@@ -1,4 +1,4 @@
-/* built from ui/src (b72d3bb94ab3) */
+/* built from ui/src (8fbc97cd0338) */
 /*
  * writ dashboard — compiled from ui/src by ui/build.mjs.
  * Do not edit: change the TypeScript and rebuild.
@@ -334,6 +334,20 @@ class Store {
     run(id) {
         return this.fetchJson(`api/run/${encodeURIComponent(id)}`);
     }
+    /**
+     * A planning step's live output, polled rather than pushed.
+     *
+     * Polled for two reasons. The snapshot stream fires on `state.json` changing,
+     * and a step's transcript grows continuously while that file does not move at
+     * all — so a snapshot watcher would never learn there was new output. And a
+     * second `EventSource` would take another of the roughly six connections a
+     * browser allows per origin, which is the bug the visibility handling above
+     * exists to avoid; a short poll of a small payload, only while someone is
+     * looking at that step, gives the connection straight back.
+     */
+    stepOutput(id) {
+        return this.fetchJson(`api/phase/step/${encodeURIComponent(id)}`);
+    }
     async fetchJson(path) {
         const response = await fetch(path, { headers: { accept: 'application/json' } });
         if (!response.ok) {
@@ -450,6 +464,217 @@ function fitTitles(host) {
             text.textContent = `${content}…`;
         }
     }
+}
+
+// ---- views/phase.js ----
+/**
+ * The pre-execution phase: every agent writ runs before a single task is dispatched.
+ *
+ * This is the one card on the dashboard that can be busy while nothing has been
+ * executed. `writ plan --critics --repair` is four to fourteen agent runs — three
+ * analyses, a synthesis, the critics, then the repair rounds — and until this card
+ * existed the page had nothing to say for the whole of it, because writ wrote
+ * nothing to `state.json` until the commit at the end.
+ *
+ * Drawn from the server's geometry, for the same reason the task graph is: a column
+ * is a wave, and waves come from `analysis.waves` and `critics.waves` — the
+ * functions that decide what writ actually runs at once. Laying it out here would
+ * be a second implementation of those rules, free to draw two boxes side by side
+ * that writ intends to run one after the other.
+ *
+ * It shows the future as well as the past. A pending step is a box that is already
+ * there, so a reader sees the shape of the attempt — which analyses, which critics,
+ * whether repair is armed — rather than boxes appearing from nowhere one at a time.
+ */
+/** Node geometry. Only the box: every position comes from the server. */
+const STEP_W = 200;
+const STEP_H = 64;
+/**
+ * Status marks. The same vocabulary as the terminal and the rest of the dashboard,
+ * with `reused` reading as the absence of a run rather than a kind of success.
+ */
+const STEP_MARKS = {
+    pending: '○',
+    running: '*',
+    ok: '✓',
+    reused: '·',
+    failed: '✗',
+    skipped: '–',
+    abandoned: '?',
+};
+/** What each kind of step is, for a reader who has not read the source. */
+const KIND_WORDS = {
+    stage: 'analysis',
+    synthesis: 'synthesis',
+    commit: 'writ',
+    critic: 'critic',
+    repair: 'adjudicator',
+    approval: 'writ',
+};
+function isPhase(phase) {
+    return Boolean(phase) && typeof phase.id === 'string' && phase.id !== '';
+}
+/**
+ * The phase as the Plan page's first card.
+ *
+ * Above the plan's own status, and in place of the pipeline's stage list, because
+ * this answers a question that comes first in time: the status card says whether
+ * work may start, and this says whether the thing being judged has finished being
+ * built. During a planning run it is the only card with anything new to say.
+ */
+function renderPhase(host, phase, selected, handlers) {
+    const done = (phase.counts.ok ?? 0) + (phase.counts.reused ?? 0);
+    const failed = phase.counts.failed ?? 0;
+    const holder = el('div', { class: 'phase-holder', 'data-scroll-key': 'phase' });
+    holder.append(canvasFor(phase, selected, handlers));
+    replace(host, el('header', { class: 'plan-head' }, el('h2', {}, 'Planning'), el('span', { class: classes('pill', phase.status) }, phase.status), phase.running
+        ? el('span', { class: 'count live' }, el('span', { class: 'spinner', 'aria-hidden': 'true' }), el('span', { class: 'label' }, liveLabel(phase)))
+        : null, phase.plan_id ? code(phase.plan_id) : null, phase.started_at
+        ? el('span', { class: 'muted small', title: phase.started_at }, ago(phase.started_at))
+        : null), el('p', { class: 'muted small' }, sentence(phase)), holder, el('div', { class: 'meta-row' }, el('span', {}, `${done}/${phase.steps.length} steps`), failed
+        ? el('span', { class: 'count bad' }, el('b', {}, String(failed)), el('span', { class: 'label' }, 'failed'))
+        : null, phase.counts.skipped
+        ? el('span', {}, `${phase.counts.skipped} not reached`)
+        : null, phase.counts.abandoned
+        ? el('span', { class: 'count warn' }, el('b', {}, String(phase.counts.abandoned)), el('span', { class: 'label' }, 'abandoned'))
+        : null, el('span', { class: 'muted small' }, 'a column runs at once')), phase.note ? el('p', { class: 'prose muted small' }, phase.note) : null);
+}
+/** What the phase is doing, in one sentence, in the present tense while it runs. */
+function sentence(phase) {
+    if (phase.running) {
+        return 'Running the agents that produce the plan. Nothing is dispatched until this finishes and the plan is approved.';
+    }
+    if (phase.status === 'abandoned') {
+        return 'The process that was planning is gone. Whatever step it was inside never reported; its transcript is on disk.';
+    }
+    if (phase.status === 'failed') {
+        return 'Planning did not finish. What ran is below, and completed steps are reused if you run it again with the same --plan-id.';
+    }
+    if (phase.status === 'stopped') {
+        return 'Planning stopped where it was asked to. Nothing after the last completed step was run.';
+    }
+    return 'Every step of the planning phase, in the order writ ran them.';
+}
+function liveLabel(phase) {
+    if (!phase.live.length)
+        return 'working';
+    const names = phase.steps.filter((step) => phase.live.includes(step.id)).map((step) => step.name);
+    return names.length > 2 ? `${plural(names.length, 'agent')} running` : names.join(', ');
+}
+function canvasFor(phase, selected, handlers) {
+    const canvas = svg('svg', {
+        class: 'dag phase-dag',
+        width: phase.width,
+        height: phase.height,
+        viewBox: `0 0 ${phase.width} ${phase.height}`,
+        role: 'img',
+        'aria-label': `planning phase, ${plural(phase.steps.length, 'step')}`,
+    });
+    for (const edge of phase.edges)
+        canvas.append(stepEdge(edge));
+    for (const step of phase.steps) {
+        canvas.append(stepNode(step, step.id === selected, handlers));
+    }
+    return canvas;
+}
+function stepEdge(edge) {
+    const lift = Math.max(30, (edge.x2 - edge.x1) / 2);
+    return svg('path', {
+        class: classes('edge', edge.satisfied ? 'satisfied' : 'pending'),
+        d: `M ${edge.x1} ${edge.y1} C ${edge.x1 + lift} ${edge.y1}, ${edge.x2 - lift} ${edge.y2}, ${edge.x2} ${edge.y2}`,
+    });
+}
+function stepNode(step, isSelected, handlers) {
+    const group = svg('g', {
+        class: classes('node', 'step', step.status, step.status === 'running' && 'live', isSelected && 'selected'),
+        transform: `translate(${step.x} ${step.y})`,
+        tabindex: 0,
+        role: 'button',
+        'aria-label': `${step.name}, ${KIND_WORDS[step.kind]}, ${step.status}`,
+    });
+    group.append(svg('title', {}, stepTooltip(step)));
+    group.append(svg('rect', { class: 'box', width: STEP_W, height: STEP_H, rx: 8 }));
+    group.append(svg('text', { class: 'node-mark', x: 11, y: 19 }, STEP_MARKS[step.status] ?? '·'));
+    group.append(svg('text', { class: 'node-id', x: 26, y: 19 }, step.name));
+    group.append(svg('text', { class: 'node-count', x: STEP_W - 11, y: 19, 'text-anchor': 'end' }, duration(step.duration)));
+    group.append(svg('text', { class: 'node-title', x: 11, y: 38 }, step.summary || KIND_WORDS[step.kind]));
+    group.append(svg('text', { class: 'node-status', x: 11, y: 54 }, step.error ? 'failed' : step.note || step.status));
+    const select = () => handlers.onStep(step.id);
+    group.addEventListener('click', select);
+    group.addEventListener('keydown', (event) => {
+        const key = event.key;
+        if (key === 'Enter' || key === ' ') {
+            event.preventDefault();
+            select();
+        }
+    });
+    return group;
+}
+function stepTooltip(step) {
+    const lines = [`${step.name}  (${KIND_WORDS[step.kind]})`, step.status];
+    if (step.summary)
+        lines.push(step.summary);
+    if (step.display)
+        lines.push(step.display);
+    if (step.duration !== null)
+        lines.push(duration(step.duration));
+    if (step.artifact)
+        lines.push(`wrote ${step.artifact}`);
+    if (step.error)
+        lines.push(step.error);
+    return lines.join('\n');
+}
+/** Long summaries are clipped in SVG, which has no text overflow of its own. */
+function fitStepTitles(host) {
+    for (const text of host.querySelectorAll('.step .node-title, .step .node-status')) {
+        const limit = STEP_W - 22;
+        let content = text.textContent ?? '';
+        while (content.length > 1 && text.getComputedTextLength() > limit) {
+            content = content.slice(0, -2);
+            text.textContent = `${content}…`;
+        }
+    }
+}
+/**
+ * One step in the drawer: what ran it, how it ended, and what it is saying.
+ *
+ * The command is here because it is the first thing anyone does with a step that
+ * hung or wrote nothing: run its own invocation by hand. It is the resolved
+ * command, with the model and event flags this step chose, not the agent's name.
+ */
+function renderStepDetail(host, step, output) {
+    replace(host, el('header', { class: 'detail-head' }, el('h2', {}, step.name), el('span', { class: classes('pill', step.status) }, step.status), el('span', { class: 'muted small' }, KIND_WORDS[step.kind])), step.summary ? el('p', { class: 'muted' }, step.summary) : null, el('div', { class: 'meta-row' }, step.duration !== null ? el('span', {}, duration(step.duration)) : null, step.started_at
+        ? el('span', { class: 'muted small', title: step.started_at }, `started ${ago(step.started_at)}`)
+        : null, step.exit_code !== null ? el('span', {}, `exit ${step.exit_code}`) : null, step.model ? code(step.model) : null, step.artifact ? code(step.artifact) : null), step.note ? el('p', { class: 'muted small' }, step.note) : null, step.error ? el('p', { class: 'prose error' }, step.error) : null, step.command ? el('pre', { class: 'command' }, step.command) : null, step.directory ? el('pre', { class: 'command' }, step.directory) : null, ...outputPanes(step, output));
+}
+function outputPanes(step, output) {
+    if (!step.has_output) {
+        // A commit or an approval is writ's own work. An empty output pane here would
+        // read as an agent that said nothing rather than as one that never existed.
+        return [el('p', { class: 'muted small' }, 'This step is writ itself, not an agent: there is no transcript.')];
+    }
+    if (!output)
+        return [el('p', { class: 'muted' }, 'Loading output…')];
+    const activity = output.activity.length
+        ? el('pre', { class: 'log activity', 'data-scroll-key': `step-activity:${step.id}` }, output.activity.join('\n'))
+        : null;
+    const text = output.text.text
+        ? el('pre', { class: 'log', 'data-scroll-key': `step-log:${step.id}` }, output.text.text)
+        : null;
+    if (!activity && !text) {
+        return [
+            el('p', { class: 'muted small' }, step.status === 'pending'
+                ? 'Not started yet.'
+                : 'Nothing on the transcript yet. The agent has not produced output.'),
+        ];
+    }
+    return [
+        activity ? el('h3', {}, 'Activity') : null,
+        activity,
+        text ? el('h3', {}, 'Output') : null,
+        text,
+        output.text.truncated ? el('p', { class: 'muted small' }, 'showing the tail of a longer log') : null,
+    ];
 }
 
 // ---- views/overview.js ----
@@ -1085,11 +1310,24 @@ const FINDING_FILTERS = {
 function renderPlan(host, plan, findings, coverage, repairs, options, handlers = {}) {
     const shown = findings.filter(FINDING_FILTERS[options.filter] ?? FINDING_FILTERS.open);
     const pipeline = plan.pipeline;
-    replace(host, statusCard(plan), plan.held_gates.length ? heldCard(plan, handlers) : null, 
+    const phase = options.phase;
+    const watched = isPhase(phase);
+    replace(host, 
+    // First, because it comes first in time. The status card says whether work may
+    // start; this says whether the thing being judged has finished being built —
+    // and while planning is running it is the only card with news.
+    watched ? phaseCard(phase, options.step ?? null, handlers) : null, statusCard(plan), plan.held_gates.length ? heldCard(plan, handlers) : null, 
     // Above the findings: the findings say what is wrong with the plan, and this
     // says what the plan was derived from. A reader deciding whether to trust a
     // finding about coverage wants to know whether a requirements stage ran at all.
-    pipeline && pipeline.plan_id ? pipelineCard(pipeline) : null, findingsCard(shown, findings, options.filter), coverage.length ? coverageCard(coverage, handlers) : null, repairs.length ? repairsCard(repairs, handlers) : null);
+    pipeline && pipeline.plan_id ? pipelineCard(pipeline, !watched) : null, findingsCard(shown, findings, options.filter), coverage.length ? coverageCard(coverage, handlers) : null, repairs.length ? repairsCard(repairs, handlers) : null);
+}
+/** The phase graph, in its own card so the Plan page stays a stack of cards. */
+function phaseCard(phase, step, handlers) {
+    const card = el('section', { class: classes('card', 'phase-card', phase.status === 'failed' && 'urgent') });
+    const forward = { onStep: (id) => handlers.onStep?.(id) };
+    renderPhase(card, phase, step, forward);
+    return card;
 }
 /** How each stage ended, as a mark and a word. */
 const STAGE_MARKS = {
@@ -1111,14 +1349,19 @@ const STAGE_MARKS = {
  * was already failing when planning started will be blamed on whichever task first
  * runs into it.
  */
-function pipelineCard(pipeline) {
+function pipelineCard(pipeline, withStages) {
     const failed = pipeline.stage_rows.filter((stage) => stage.state === 'failed');
     const pending = pipeline.stage_rows.filter((stage) => stage.state === 'pending');
     const stopped = failed.length > 0 || pending.length > 0;
     const baseline = pipeline.baseline;
     return el('section', { class: classes('card', failed.length > 0 && 'urgent') }, el('header', { class: 'plan-head' }, el('h2', {}, 'Pipeline'), code(pipeline.plan_id), pipeline.at ? el('span', { class: 'muted small', title: pipeline.at }, ago(pipeline.at)) : null), el('p', { class: 'muted small' }, stopped
         ? 'The plan does not rest on every analysis: what is missing was never established.'
-        : 'Each analysis ran and the synthesized plan was checked against all of them.'), el('ol', { class: 'stage-list' }, ...pipeline.stage_rows.map(stageRow)), el('div', { class: 'meta-row' }, el('span', {}, `${plural(pipeline.requirements, 'requirement')} inventoried`), pipeline.unresolved_ambiguities
+        : 'Each analysis ran and the synthesized plan was checked against all of them.'), 
+    // Only when there is no phase graph above. The graph draws the same steps and
+    // draws them live, so showing both would put two accounts of one pipeline on
+    // one page — and the reader would have to work out that they agree. Plans made
+    // by an older writ, which kept no phase record, still get the list.
+    withStages ? el('ol', { class: 'stage-list' }, ...pipeline.stage_rows.map(stageRow)) : null, el('div', { class: 'meta-row' }, el('span', {}, `${plural(pipeline.requirements, 'requirement')} inventoried`), pipeline.unresolved_ambiguities
         ? el('span', { class: 'count warn' }, el('b', {}, String(pipeline.unresolved_ambiguities)), el('span', { class: 'label' }, 'open questions'))
         : null, 
     // A requirement nothing can demonstrate will be signed off on an agent's word
@@ -1282,6 +1525,8 @@ const VIEWS = [
     { name: 'runs', label: 'Runs' },
     { name: 'decisions', label: 'Decisions' },
 ];
+/** How often a watched step's output is re-fetched while it is still running. */
+const OUTPUT_POLL_MS = 1000;
 class App {
     store = new Store();
     route = { view: 'overview' };
@@ -1298,6 +1543,10 @@ class App {
     drawer = el('aside', { class: 'drawer', 'aria-live': 'polite' });
     /** What was open when the current click began; see `dismissesOnClick`. */
     keyAtPress = null;
+    /** The timer following a live step's output; see `followStep`. */
+    outputPoll = null;
+    /** The step that timer is following, so a repaint does not restart it. */
+    watching = null;
     async start() {
         document.body.append(this.header(), this.body, this.drawer);
         this.store.onSnapshot(() => this.render());
@@ -1360,6 +1609,8 @@ class App {
             return `task:${this.route.task}`;
         if (this.route.run)
             return `run:${this.route.run}`;
+        if (this.route.step)
+            return `step:${this.route.step}`;
         return null;
     }
     /**
@@ -1501,6 +1752,7 @@ class App {
             onRun: (id) => this.go({ view: this.route.view, run: id }),
             onGoto: (view) => this.go({ view: view }),
             onSelect: (id) => this.go({ view: this.route.view, task: id }),
+            onStep: (id) => this.go({ view: this.route.view, step: id }),
         };
         switch (this.route.view) {
             case 'overview': {
@@ -1553,11 +1805,15 @@ class App {
             }
             case 'plan': {
                 const holder = el('div', { class: 'grid one' });
-                renderPlan(holder, snapshot.overview.plan, snapshot.findings, snapshot.coverage, snapshot.repairs, { filter: this.findingFilter }, { onTask: handlers.onTask });
+                renderPlan(holder, snapshot.overview.plan, snapshot.findings, snapshot.coverage, snapshot.repairs, { filter: this.findingFilter, phase: snapshot.phase, step: this.route.step ?? null }, { onTask: handlers.onTask, onStep: handlers.onStep });
                 this.body.replaceChildren(this.toolbar(this.filterBar(Object.keys(FINDING_FILTERS), this.findingFilter, (name) => {
                     this.findingFilter = name;
                     this.render();
                 }), el('span', { class: 'muted small' }, `revision ${snapshot.overview.plan.revision}`)), holder);
+                // After it is in the document: `getComputedTextLength` is zero for an SVG
+                // that has not been laid out, so clipping before the swap would measure
+                // nothing and clip nothing.
+                fitStepTitles(holder);
                 break;
             }
             case 'decisions': {
@@ -1605,12 +1861,15 @@ class App {
      * during a run — its criteria fill in as the agent reports them.
      */
     paintDrawer() {
-        const { task, run } = this.route;
-        if (!task && !run) {
+        const { task, run, step } = this.route;
+        if (!task && !run && !step) {
+            this.stopFollowing();
             this.drawer.classList.remove('open');
             this.drawer.replaceChildren();
             return;
         }
+        if (!step)
+            this.stopFollowing();
         this.drawer.classList.add('open');
         if (!this.drawer.querySelector('.detail-head')) {
             this.drawer.replaceChildren(el('p', { class: 'muted' }, 'Loading…'));
@@ -1622,6 +1881,10 @@ class App {
             onRun: (id) => this.go({ view: this.route.view, run: id }),
             onTask: (id) => this.go({ view: this.route.view, task: id }),
         };
+        if (step) {
+            this.paintStep(step, close);
+            return;
+        }
         if (run) {
             void this.store
                 .run(run)
@@ -1646,6 +1909,115 @@ class App {
         })
             .catch((error) => this.drawerError(close, error));
     }
+    /**
+     * A planning step: its record from the snapshot, its output from a poll.
+     *
+     * The record is already in hand — the phase graph was drawn from it — so the
+     * panel paints immediately and the output fills in. That matters for a running
+     * step: waiting on the fetch would leave the drawer saying "Loading…" for a
+     * second every time a snapshot arrived, which during planning is constantly.
+     */
+    paintStep(id, close) {
+        const phase = this.store.current?.phase;
+        const found = isPhase(phase) ? phase.steps.find((entry) => entry.id === id) : undefined;
+        if (!found) {
+            // The step is not on the current phase — an older attempt's link, or a
+            // record that has since been trimmed.
+            this.stopFollowing();
+            this.drawer.replaceChildren(close, el('p', { class: 'muted' }, 'That step is not part of the most recent planning attempt.'));
+            return;
+        }
+        if (this.watching !== found.id || this.outputPoll === null) {
+            // First paint, or one whose poll has stopped: show the record now and let
+            // the output arrive. Re-rendering a step already being followed would throw
+            // away output that is on screen and replace it with "Loading…".
+            const holder = el('div', { class: 'detail' });
+            renderStepDetail(holder, found, null);
+            this.drawer.replaceChildren(close, holder);
+        }
+        this.followStep(found.id, found.status === 'running');
+    }
+    /**
+     * Fetch a step's output, and keep fetching while it is still running.
+     *
+     * Polled rather than pushed, and only while the drawer is open on that step.
+     * `store.stepOutput` says why at length: a transcript grows without `state.json`
+     * moving, so the snapshot stream never learns there is more of it, and a second
+     * EventSource would take one of the handful of connections the browser allows.
+     */
+    followStep(id, live) {
+        // Already following it, so leave the timer alone. Snapshots arrive every few
+        // tenths of a second during planning and each one repaints the drawer; a
+        // restart per snapshot would fetch far more often than the interval says, and
+        // the interval itself would never get to fire.
+        if (live && this.watching === id && this.outputPoll !== null)
+            return;
+        this.stopFollowing();
+        this.watching = id;
+        const paint = () => {
+            void this.store
+                .stepOutput(id)
+                .then((output) => {
+                if (this.route.step !== id)
+                    return; // the reader moved on while fetching
+                const phase = this.store.current?.phase;
+                const found = isPhase(phase) ? phase.steps.find((entry) => entry.id === id) : undefined;
+                if (!found)
+                    return;
+                const holder = el('div', { class: 'detail' });
+                renderStepDetail(holder, found, output);
+                const close = el('button', { class: 'close', type: 'button', 'aria-label': 'close' }, '×');
+                close.addEventListener('click', () => this.dismiss());
+                const scrolled = this.drawerOffsets();
+                this.drawer.replaceChildren(close, holder);
+                this.restoreDrawerScroll(scrolled);
+                // Stop when the step does. A finished step's transcript is fixed, so
+                // polling it further would be asking the same question forever.
+                if (found.status !== 'running')
+                    this.stopFollowing();
+            })
+                .catch(() => undefined);
+        };
+        paint();
+        if (live)
+            this.outputPoll = window.setInterval(paint, OUTPUT_POLL_MS);
+    }
+    stopFollowing() {
+        this.watching = null;
+        if (this.outputPoll === null)
+            return;
+        window.clearInterval(this.outputPoll);
+        this.outputPoll = null;
+    }
+    /**
+     * Where the drawer's log panes are scrolled, so a poll does not rewind them.
+     *
+     * Same problem as the graph's offsets, and worse here: replacing the pane every
+     * second would throw a reader back to the top of an agent's output every second,
+     * which is exactly while they are reading it.
+     */
+    drawerOffsets() {
+        const saved = new Map();
+        for (const pane of this.drawer.querySelectorAll('[data-scroll-key]')) {
+            const key = pane.dataset.scrollKey;
+            if (key)
+                saved.set(key, [pane.scrollLeft, pane.scrollTop]);
+        }
+        return saved;
+    }
+    restoreDrawerScroll(saved) {
+        for (const pane of this.drawer.querySelectorAll('[data-scroll-key]')) {
+            const key = pane.dataset.scrollKey;
+            const offset = key ? saved.get(key) : undefined;
+            if (offset) {
+                [pane.scrollLeft, pane.scrollTop] = offset;
+                continue;
+            }
+            // A pane that was not there before starts at the tail, which for a live
+            // agent's output is the part worth reading.
+            pane.scrollTop = pane.scrollHeight;
+        }
+    }
     drawerError(close, error) {
         this.drawer.replaceChildren(close, el('p', { class: 'error' }, `Could not load: ${String(error)}`));
     }
@@ -1658,7 +2030,7 @@ class App {
     onKey(event) {
         if (event.target instanceof HTMLInputElement)
             return;
-        if (event.key === 'Escape' && (this.route.task || this.route.run)) {
+        if (event.key === 'Escape' && (this.route.task || this.route.run || this.route.step)) {
             this.dismiss();
             return;
         }
@@ -1683,6 +2055,8 @@ function parseHash(hash) {
         return { view: known, task: decodeURIComponent(id) };
     if (kind === 'run' && id)
         return { view: known, run: decodeURIComponent(id) };
+    if (kind === 'step' && id)
+        return { view: known, step: decodeURIComponent(id) };
     return { view: known };
 }
 function toHash(route) {
@@ -1690,6 +2064,8 @@ function toHash(route) {
         return `#/${route.view}/task/${encodeURIComponent(route.task)}`;
     if (route.run)
         return `#/${route.view}/run/${encodeURIComponent(route.run)}`;
+    if (route.step)
+        return `#/${route.view}/step/${encodeURIComponent(route.step)}`;
     return `#/${route.view}`;
 }
 void new App().start();

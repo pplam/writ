@@ -470,6 +470,133 @@ def test_plan_runs_three_analyses_then_synthesises(writ, project, design):
     assert _work(state.load(project)) == ["M01-001", "M01-002", "M02-001"]
 
 
+def test_each_stage_header_names_the_command_it_ran(writ, project, design):
+    """The header says how the stage was invoked, not just which agent.
+
+    A stage that hangs or writes nothing is diagnosed by running its own
+    invocation by hand, and each stage may resolve its own model and event
+    flags — so the agent name alone is not enough to reproduce it.
+    """
+    writ("init")
+    code, out, _ = writ("plan", str(design), *staged())
+    assert code == 0
+    headers = [line for line in out.splitlines() if "running:" in line]
+    assert len(headers) == len(analysis.STAGE_NAMES) + 1  # stages, then synthesis
+
+
+def test_the_waves_put_requirements_beside_inventory():
+    """What may run at once is derived from what each stage says it needs.
+
+    Only verification declares a need, so it is the only stage that cannot share
+    a wave — and it needs both of the others, which puts them together.
+    """
+    grouped = analysis.waves(analysis.STAGES)
+    assert [[stage.name for stage in wave] for wave in grouped] == [
+        ["requirements", "inventory"],
+        ["verification"],
+    ]
+    # A partition, not a filter: every chosen stage appears exactly once.
+    assert [stage for wave in grouped for stage in wave] == list(analysis.STAGES)
+
+
+def test_a_wave_of_one_stage_is_still_a_wave():
+    assert analysis.waves([analysis.STAGES[0]]) == [[analysis.STAGES[0]]]
+    assert analysis.waves([]) == []
+
+
+def test_parallel_stages_produce_the_same_plan(writ, project, design):
+    """Concurrency changes the wall-clock and nothing on disk.
+
+    The artifacts, the tasks and the order they are reported in are what a
+    sequential run produces, because a run's record should not depend on which
+    agent happened to finish first.
+    """
+    writ("init")
+    code, out, _ = writ("plan", str(design), "--parallel-stages", *staged())
+    assert code == 0
+    assert _work(state.load(project)) == ["M01-001", "M01-002", "M02-001"]
+    reported = [
+        line.split(":")[0].strip()
+        for line in out.splitlines()
+        if ": wrote " in line
+    ]
+    assert reported[: len(analysis.STAGE_NAMES)] == list(analysis.STAGE_NAMES)
+
+
+def test_parallel_stages_say_what_the_inventory_gives_up(writ, project, design):
+    """The cost is printed, because afterwards it is invisible.
+
+    An inventory that ran without the requirement ids writes a well-formed
+    artifact with one field empty. Nothing downstream objects to that, so the only
+    place the trade can be seen is the run that made it.
+    """
+    writ("init")
+    code, out, _ = writ("plan", str(design), "--parallel-stages", *staged())
+    assert code == 0
+    assert "requirements, inventory; then verification" in out
+    assert "claim no existing coverage" in out
+
+
+def test_an_inventory_running_blind_is_told_to_claim_no_coverage(tmp_path):
+    """The instruction is in the prompt, not only in the flag's help.
+
+    A stage that has no requirement ids and is asked for coverage anyway invents
+    them, so the prompt has to say which field to leave alone.
+    """
+    prompt = analysis.build_prompt(
+        analysis.STAGES[1],
+        root=tmp_path,
+        doc=tmp_path / "design.md",
+        artifact_path=tmp_path / "inventory.json",
+        artifacts=analysis.Artifacts(),
+    )
+    assert "leave `existing_coverage` empty" in prompt
+    # And when it does have them, that instruction is gone and the ids are there.
+    with_ids = analysis.build_prompt(
+        analysis.STAGES[1],
+        root=tmp_path,
+        doc=tmp_path / "design.md",
+        artifact_path=tmp_path / "inventory.json",
+        artifacts=analysis.Artifacts(
+            requirements=analysis.load_requirements(json.dumps(REQUIREMENTS))
+        ),
+    )
+    assert "leave `existing_coverage` empty" not in with_ids
+    assert "REQ-001" in with_ids
+
+
+def test_a_blind_inventory_citing_an_id_it_invented_fails_the_stage(
+    writ, project, design
+):
+    """The validation is deferred, not dropped.
+
+    Running without the ids is why the claim could not be checked when it was
+    written. It is still checked, once the requirements land — a hallucinated
+    obligation marked already-satisfied is exactly what that check exists for.
+    """
+    writ("init")
+    invented = dict(INVENTORY)
+    invented["existing_coverage"] = [
+        {"requirement_id": "REQ-099", "status": "full", "evidence": "tests/test_x.py"}
+    ]
+    code, out, err = writ(
+        "plan", str(design), "--parallel-stages", *staged(inventory=invented)
+    )
+    assert code == 1
+    assert "REQ-099" in out + err
+    assert "not in the requirement inventory" in out + err
+
+
+def test_a_sequential_inventory_is_validated_when_it_is_written():
+    """Nothing about the deferred check loosens the ordinary one."""
+    invented = dict(INVENTORY)
+    invented["existing_coverage"] = [
+        {"requirement_id": "REQ-099", "status": "full", "evidence": "tests/test_x.py"}
+    ]
+    with pytest.raises(WritError, match="REQ-099"):
+        analysis.load_inventory(json.dumps(invented), known=["REQ-001"])
+
+
 def test_every_stage_leaves_its_artifact_on_disk(writ, project, design):
     writ("init")
     writ("plan", str(design), *staged())

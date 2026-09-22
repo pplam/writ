@@ -347,6 +347,88 @@ def test_plan_rejects_a_dependency_on_nothing(writ, project, design):
     assert state.load(project)["tasks"] == {}
 
 
+def test_plan_commits_an_edge_onto_a_task_declared_later(writ, project, design):
+    """A dependency pointing forward in the plan is an edge, not an error.
+
+    Tasks are numbered in the order the plan lists them, but nothing says work in
+    an early milestone cannot need something from a late one — that is a backward
+    edge in the graph, and the graph is a DAG either way. Writ used to insert
+    tasks one at a time and demand each dependency already exist, so an ordering
+    writ imposed decided whether a valid plan committed at all: a 44-task plan was
+    refused for one such edge, after four agent runs had produced it.
+    """
+    writ("init")
+    forward = {
+        "milestones": [
+            {
+                "title": "Controls",
+                "tasks": [
+                    {
+                        "id": "A",
+                        "title": "User memory controls",
+                        "acceptances": ["controls work"],
+                        "depends_on": ["B"],
+                    }
+                ],
+            },
+            {
+                "title": "Instrumentation",
+                "tasks": [
+                    {
+                        "id": "B",
+                        "title": "Retrieval logging",
+                        "acceptances": ["scores are logged"],
+                    }
+                ],
+            },
+        ]
+    }
+    code, out, _ = writ(
+        "plan", str(design), "--no-stages", "--agent", agent_writing(forward)
+    )
+    assert code == 0 and "created 2 milestones and 2 tasks" in out
+    data = state.load(project)
+    assert data["tasks"]["M01-001"]["depends_on"] == ["M02-001"]
+    assert data["tasks"]["M02-001"]["depends_on"] == []
+
+
+def test_plan_still_rejects_a_cycle_between_milestones(writ, project, design):
+    """Deferring the edges must not defer the DAG check that reads them."""
+    writ("init")
+    circular = {
+        "milestones": [
+            {
+                "title": "One",
+                "tasks": [
+                    {
+                        "id": "A",
+                        "title": "First",
+                        "acceptances": ["a"],
+                        "depends_on": ["B"],
+                    }
+                ],
+            },
+            {
+                "title": "Two",
+                "tasks": [
+                    {
+                        "id": "B",
+                        "title": "Second",
+                        "acceptances": ["b"],
+                        "depends_on": ["A"],
+                    }
+                ],
+            },
+        ]
+    }
+    code, _, err = writ(
+        "plan", str(design), "--no-stages", "--agent", agent_writing(circular)
+    )
+    assert code == 2
+    assert "dependency cycle" in err
+    assert state.load(project)["tasks"] == {}
+
+
 def test_plan_append_can_depend_on_existing_tasks(planned, writ, project, design):
     followup = {
         "milestones": [

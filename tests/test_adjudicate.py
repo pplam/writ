@@ -54,6 +54,32 @@ sys.stdin.read()
 print("I would rather not")
 """
 
+#: a critic that reports one blocking finding the first time it reads the plan and
+#: nothing afterwards — a repair that actually worked, from the critic's side. The
+#: marker file is how it remembers across processes.
+CRITIC_ONCE = """
+import json, os, re, sys
+prompt = sys.stdin.read()
+path = re.search(r'Write your findings as JSON to this exact path:\\n  (\\S+)', prompt).group(1)
+marker = os.environ["WRIT_TEST_ONCE"]
+first = not os.path.exists(marker)
+open(marker, "a").write("x")
+findings = [] if not first else [{
+    "severity": "blocking",
+    "category": "missing-coverage",
+    "where": "REQ-003",
+    "message": "No task implements the queue depth view",
+    "suggested_action": "add a task, or mark it out of scope with a reason",
+    "requirement_ids": ["REQ-003"],
+    "evidence": "searched the plan and the repository for queue depth",
+}]
+open(path, "w").write(json.dumps({
+    "findings": findings,
+    "summary": "read it" if not first else "one hole",
+    "confidence": "high",
+}))
+"""
+
 
 def agent(script: str) -> str:
     return f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
@@ -701,3 +727,63 @@ def test_a_plan_request_is_never_dispatched_as_a_gate_repair(objected, project):
     assert job is None or job.role != "repair"
     # And `gate_requests` is the view the scheduler side should be reading.
     assert repair.gate_requests(data) == []
+
+
+# --------------------------------------------------------------------------
+# reached from `writ plan`
+
+
+def test_plan_repair_answers_what_the_critics_found_before_approval(
+    writ, project, design, tmp_path, monkeypatch
+):
+    """One command from document to runnable graph, findings answered on the way.
+
+    The loop existed but nothing in `writ plan` reached it, so an unattended run
+    that asked for the critics and `--auto-approve` stopped at `needs-approval`
+    with nobody whose job was to answer what they found. `--repair` is that path,
+    and approval still comes last: it approves the plan as repair left it.
+    """
+    artifact = tmp_path / "plan.json"
+    artifact.write_text(json.dumps(PLAN), encoding="utf-8")
+    writ("init")
+    # Reports on its first read and is satisfied on the re-read, which is what a
+    # repair that worked looks like from a critic's side. A stub that reported the
+    # same finding forever would be testing that a finding survives its own repair,
+    # which is a different claim and already covered above.
+    monkeypatch.setenv("WRIT_TEST_ONCE", str(tmp_path / "reported"))
+    patched(monkeypatch, ADDS_THE_TASK)
+    code, out, _ = writ(
+        "plan", str(design), "--from-plan", str(artifact),
+        "--critics", "coverage", "--critic-agent", agent(CRITIC_ONCE),
+        "--repair", "--adjudicator-agent", agent(ADJUDICATOR),
+        "--auto-approve", "--quiet",
+    )
+    assert code == 0
+    assert "repairing the plan" in out
+    data = state.load(project)
+    # The patch landed, the finding closed on the re-check, and approval followed.
+    assert repair.requests(data)
+    record = plans.plan_status(data)
+    assert record["status"] == "approved"
+    assert record["approved_by"] == "writ --auto-approve"
+
+
+def test_plan_without_repair_leaves_the_findings_standing(
+    writ, project, design, tmp_path, monkeypatch
+):
+    """Opt-in, like the critics: the loop spends agent runs, so it waits to be asked."""
+    artifact = tmp_path / "plan.json"
+    artifact.write_text(json.dumps(PLAN), encoding="utf-8")
+    writ("init")
+    monkeypatch.setenv("WRIT_TEST_ONCE", str(tmp_path / "reported"))
+    patched(monkeypatch, ADDS_THE_TASK)
+    code, out, _ = writ(
+        "plan", str(design), "--from-plan", str(artifact),
+        "--critics", "coverage", "--critic-agent", agent(CRITIC_ONCE),
+        "--auto-approve", "--quiet",
+    )
+    assert code == 0
+    assert "repairing the plan" not in out
+    data = state.load(project)
+    assert repair.requests(data) == []
+    assert plans.plan_status(data)["status"] == "needs-approval"

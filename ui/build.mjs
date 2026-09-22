@@ -35,6 +35,7 @@ const ORDER = [
   'format.js',
   'store.js',
   'views/graph.js',
+  'views/phase.js',
   'views/overview.js',
   'views/tasks.js',
   'views/runs.js',

@@ -123,6 +123,36 @@ def test_pipeline_matches_the_typescript_interface():
         assert set(row) == declared_fields("PipelineStage")
 
 
+def test_phase_matches_the_typescript_interfaces(writ, design, project):
+    """The phase payload, each step in it, and each edge.
+
+    Built by planning rather than from a literal, unlike the pipeline test above,
+    because the fields under test include the ones only a real run produces — the
+    resolved command, the transcript directory, the geometry.
+    """
+    from writ import phases
+
+    writ("init")
+    writ("plan", str(design), "--extract", "--auto-approve")
+    # `--extract` runs no agents, so there is no phase to describe; declare one
+    # directly to get a record with every field on it.
+    phase_id = phases.begin(
+        project,
+        doc=str(design),
+        plan_id="design-20250101T000000",
+        steps=phases.declare(stages=(), synthesis=True),
+    )
+    phases.start_step(project, phase_id, "synthesis")
+    phases.finish_step(project, phase_id, "synthesis", status="ok", exit_code=0)
+    payload = api.phase(state.load(project))
+    assert set(payload) == declared_fields("Phase")
+    assert set(payload["steps"][0]) == declared_fields("PhaseStep")
+    assert set(payload["edges"][0]) == declared_fields("PhaseEdge")
+    output = api.step_output(state.load(project), project, "synthesis")
+    assert set(output) == declared_fields("StepOutput")
+    assert set(output["text"]) == declared_fields("LogTail")
+
+
 def test_run_row_and_detail_match_the_typescript_interfaces(writ, design, project):
     writ("init")
     writ("plan", str(design), *LEGACY_PLAN)

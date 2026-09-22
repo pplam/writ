@@ -28,6 +28,9 @@ one does.
 from __future__ import annotations
 
 import json
+import threading
+from concurrent import futures
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -67,6 +70,11 @@ class Critic:
     #: what it must not spend its attention on, so five critics do not all
     #: report the same thing
     out_of_scope: str = ""
+    #: whether this critic is asked to *run* things in the repository, rather than
+    #: only read it. The distinction decides what may run concurrently: two readers
+    #: of the same tree do not disturb each other, while a critic running the test
+    #: suite alongside anything else produces findings about the interference.
+    runs_commands: bool = False
 
     @property
     def scope(self) -> str:
@@ -168,6 +176,9 @@ CRITICS: tuple[Critic, ...] = (
     ),
     Critic(
         name="feasibility",
+        # The one critic told to run the project's own commands, which is why it
+        # never shares the repository with another critic.
+        runs_commands=True,
         brief="whether this plan can be executed in this repository as it actually is",
         checks=(
             "Referenced paths exist, or are clearly new files this plan creates. "
@@ -400,6 +411,24 @@ def _shorten(text: str, limit: int = 200) -> str:
     return collapsed if len(collapsed) <= limit else collapsed[: limit - 1] + "…"
 
 
+def waves(chosen: Iterable[Critic]) -> list[list[Critic]]:
+    """The critics grouped into what may run at the same time.
+
+    Two critics that only read the repository do not disturb each other, so they
+    go in one wave. A critic that runs the project's commands gets a wave to
+    itself: the feasibility critic is asked to run the build and the tests, and a
+    test suite sharing a working tree with anything else reports interference as
+    if it were a finding about the plan.
+
+    Reading order is preserved inside a wave, and a command-running critic never
+    shares one, so the waves are a partition of `chosen` and nothing is dropped.
+    """
+    readers = [critic for critic in chosen if not critic.runs_commands]
+    runners = [critic for critic in chosen if critic.runs_commands]
+    grouped = ([readers] if readers else []) + [[critic] for critic in runners]
+    return grouped
+
+
 def review(
     *,
     root: Path,
@@ -413,80 +442,216 @@ def review(
     cwd: str | None,
     found: Iterable[Finding] = (),
     stream: bool = False,
+    parallel: bool = False,
     on_start: Callable[[Critic, agents.ResolvedAgent], None] | None = None,
     on_finish: Callable[[Report], None] | None = None,
+    on_launch: Callable[[Critic, agents.ResolvedAgent, Path], None] | None = None,
+    on_close: Callable[[Report], None] | None = None,
 ) -> list[Report]:
     """Run each critic and collect its report.
 
-    Sequential. Critics are independent, so they could run at once, but they are
-    reading a repository and running its tests — the feasibility critic is
-    explicitly asked to — and five agents doing that concurrently interfere with
-    each other in ways that show up as findings about a broken build.
+    Sequential by default. Critics are independent, so they could run at once, but
+    they are reading a repository and running its tests — the feasibility critic is
+    explicitly asked to — and agents doing that concurrently interfere with each
+    other in ways that show up as findings about a broken build.
+
+    With `parallel`, the critics that only read run together and each critic that
+    runs commands runs alone (see `waves`). That is the whole of the concurrency:
+    the interference writ was avoiding came from the commands, not from the
+    reading, and separating the two buys most of the wall-clock back without
+    putting two test runs in one working tree. Streamed output is serialised a
+    line at a time so the prefix naming each critic keeps meaning something.
 
     A critic that fails does not fail the review. Four reports and a named failure
     is worth more than nothing, and the failure is visible rather than silently
-    reducing the review to whoever happened to succeed.
+    reducing the review to whoever happened to succeed. Reports come back in the
+    order the critics were given, whatever order they finished in, so a review
+    reads the same whether or not it ran concurrently.
     """
     resolved = agents.resolve(agent, [], model, events=True)
     directory.mkdir(parents=True, exist_ok=True)
-    reports: list[Report] = []
-    for critic in chosen:
-        where = directory / critic.name
-        where.mkdir(parents=True, exist_ok=True)
-        report_path = where / REPORT_FILENAME
-        prompt = build_prompt(
-            critic,
-            root=root,
-            doc=doc,
-            plan_text=plan_text,
-            report_path=report_path,
-            found=found,
-        )
-        if on_start is not None:
-            on_start(critic, resolved)
-        report = Report(critic=critic.name, path=report_path)
-        try:
-            report.exit_code = runner.run_agent(
-                resolved.command,
-                prompt,
-                where,
-                cwd or root,
-                timeout,
+    chosen = list(chosen)
+    if not parallel:
+        return [
+            _review_one(
+                critic,
+                resolved=resolved,
+                root=root,
+                doc=doc,
+                plan_text=plan_text,
+                directory=directory,
+                timeout=timeout,
+                cwd=cwd,
+                found=found,
                 stream=stream,
-                prefix=f"  {critic.name} | " if stream else "",
-                event_shape=resolved.event_shape,
+                on_start=on_start,
+                on_finish=on_finish,
+                on_launch=on_launch,
+                on_close=on_close,
             )
-        except FileNotFoundError:
-            report.error = f"critic agent not found: {resolved.command[0]}"
-        except WritError as exc:
-            report.error = str(exc)
-        if not report.error:
-            missing = (
-                f"wrote no report to {report_path} "
-                f"(exit {report.exit_code}; see {where})"
+            for critic in chosen
+        ]
+
+    # One lock for the whole review, not one per wave: it guards the terminal,
+    # which is shared by everything that prints, including the callbacks that
+    # announce a critic starting and finishing.
+    lock = threading.Lock()
+    collected: dict[str, Report] = {}
+    for wave in waves(chosen):
+        if len(wave) == 1:
+            critic = wave[0]
+            collected[critic.name] = _review_one(
+                critic,
+                resolved=resolved,
+                root=root,
+                doc=doc,
+                plan_text=plan_text,
+                directory=directory,
+                timeout=timeout,
+                cwd=cwd,
+                found=found,
+                stream=stream,
+                on_start=on_start,
+                on_finish=on_finish,
+                on_launch=on_launch,
+                on_close=on_close,
             )
-            written = _report_text(where, report_path)
-            if written is None:
-                report.error = missing
-            else:
-                text, from_file = written
+            continue
+        with futures.ThreadPoolExecutor(max_workers=len(wave)) as pool:
+            submitted = {
+                pool.submit(
+                    _review_one,
+                    critic,
+                    resolved=resolved,
+                    root=root,
+                    doc=doc,
+                    plan_text=plan_text,
+                    directory=directory,
+                    timeout=timeout,
+                    cwd=cwd,
+                    found=found,
+                    stream=stream,
+                    on_start=on_start,
+                    on_finish=on_finish,
+                    on_launch=on_launch,
+                    on_close=on_close,
+                    lock=lock,
+                ): critic
+                for critic in wave
+            }
+            for future in futures.as_completed(submitted):
+                critic = submitted[future]
+                # `_review_one` turns a critic's own failure into a report, so an
+                # exception here is writ's bug rather than the critic's. It still
+                # must not lose the other four reports.
                 try:
-                    parsed = parse(text, critic)
-                except WritError as exc:
-                    # Unreadable stdout is not a malformed report. The file is the
-                    # contract and stdout only a courtesy for a critic that prints
-                    # its JSON instead of writing it, so prose on stdout means the
-                    # critic wrote no report -- calling that prose invalid JSON
-                    # blames the format of something that was never a report.
-                    report.error = str(exc) if from_file else missing
-                else:
-                    report.findings = parsed.findings
-                    report.summary = parsed.summary
-                    report.confidence = parsed.confidence
-        reports.append(report)
-        if on_finish is not None:
+                    collected[critic.name] = future.result()
+                except Exception as exc:  # pragma: no cover - defensive
+                    collected[critic.name] = Report(
+                        critic=critic.name,
+                        path=directory / critic.name / REPORT_FILENAME,
+                        error=f"review did not run: {exc}",
+                    )
+    return [collected[critic.name] for critic in chosen]
+
+
+def _review_one(
+    critic: Critic,
+    *,
+    resolved: agents.ResolvedAgent,
+    root: Path,
+    doc: Path | None,
+    plan_text: str,
+    directory: Path,
+    timeout: int | None,
+    cwd: str | None,
+    found: Iterable[Finding],
+    stream: bool,
+    on_start: Callable[[Critic, agents.ResolvedAgent], None] | None,
+    on_finish: Callable[[Report], None] | None,
+    on_launch: Callable[[Critic, agents.ResolvedAgent, Path], None] | None = None,
+    on_close: Callable[[Report], None] | None = None,
+    lock: threading.Lock | None = None,
+) -> Report:
+    """One critic's run, from prompt to parsed report.
+
+    Never raises for anything the critic did: a missing agent, a timeout, a missing
+    or malformed report all come back as a `Report` carrying the reason, because the
+    caller is collecting four other reviews that are still worth having.
+
+    `lock`, when the critic is one of several running at once, serialises both the
+    mirrored agent output and the start/finish announcements, so two critics cannot
+    interleave halfway through a line.
+
+    `on_launch` and `on_close` are the same two moments for a caller that records
+    rather than prints, and they are deliberately outside that lock: a state write
+    takes a file lock of its own and fsyncs twice, so holding the terminal across it
+    would stall another critic's output on something it has no stake in — and a
+    contended state lock raises, which inside `mirror_lock` would take a critic down
+    with it.
+    """
+    where = directory / critic.name
+    where.mkdir(parents=True, exist_ok=True)
+    report_path = where / REPORT_FILENAME
+    prompt = build_prompt(
+        critic,
+        root=root,
+        doc=doc,
+        plan_text=plan_text,
+        report_path=report_path,
+        found=found,
+    )
+    if on_launch is not None:
+        on_launch(critic, resolved, where)
+    if on_start is not None:
+        with lock if lock is not None else nullcontext():
+            on_start(critic, resolved)
+    report = Report(critic=critic.name, path=report_path)
+    try:
+        report.exit_code = runner.run_agent(
+            resolved.command,
+            prompt,
+            where,
+            cwd or root,
+            timeout,
+            stream=stream,
+            prefix=f"  {critic.name} | " if stream else "",
+            event_shape=resolved.event_shape,
+            mirror_lock=lock,
+        )
+    except FileNotFoundError:
+        report.error = f"critic agent not found: {resolved.command[0]}"
+    except WritError as exc:
+        report.error = str(exc)
+    if not report.error:
+        missing = (
+            f"wrote no report to {report_path} "
+            f"(exit {report.exit_code}; see {where})"
+        )
+        written = _report_text(where, report_path)
+        if written is None:
+            report.error = missing
+        else:
+            text, from_file = written
+            try:
+                parsed = parse(text, critic)
+            except WritError as exc:
+                # Unreadable stdout is not a malformed report. The file is the
+                # contract and stdout only a courtesy for a critic that prints
+                # its JSON instead of writing it, so prose on stdout means the
+                # critic wrote no report -- calling that prose invalid JSON
+                # blames the format of something that was never a report.
+                report.error = str(exc) if from_file else missing
+            else:
+                report.findings = parsed.findings
+                report.summary = parsed.summary
+                report.confidence = parsed.confidence
+    if on_finish is not None:
+        with lock if lock is not None else nullcontext():
             on_finish(report)
-    return reports
+    if on_close is not None:
+        on_close(report)
+    return report
 
 
 def _report_text(directory: Path, report_path: Path) -> tuple[str, bool] | None:

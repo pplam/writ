@@ -14,7 +14,8 @@
 
 import { classes, code, el, replace } from '../dom.js';
 import { ago, percent, plural } from '../format.js';
-import type { Coverage, Finding, Pipeline, PipelineStage, Plan, Repair } from '../types.js';
+import type { Coverage, Finding, Phase, Pipeline, PipelineStage, Plan, Repair } from '../types.js';
+import { isPhase, renderPhase, type PhaseHandlers } from './phase.js';
 
 /** Which findings a reader is shown first. */
 export const FINDING_FILTERS: Record<string, (finding: Finding) => boolean> = {
@@ -26,6 +27,7 @@ export const FINDING_FILTERS: Record<string, (finding: Finding) => boolean> = {
 
 export interface PlanHandlers {
   onTask?: (id: string) => void;
+  onStep?: (id: string) => void;
 }
 
 export function renderPlan(
@@ -34,22 +36,36 @@ export function renderPlan(
   findings: Finding[],
   coverage: Coverage[],
   repairs: Repair[],
-  options: { filter: string },
+  options: { filter: string; phase?: Phase | Record<string, never>; step?: string | null },
   handlers: PlanHandlers = {},
 ): void {
   const shown = findings.filter(FINDING_FILTERS[options.filter] ?? FINDING_FILTERS.open);
   const pipeline = plan.pipeline as Pipeline;
+  const phase = options.phase;
+  const watched = isPhase(phase);
   replace(host,
+    // First, because it comes first in time. The status card says whether work may
+    // start; this says whether the thing being judged has finished being built —
+    // and while planning is running it is the only card with news.
+    watched ? phaseCard(phase, options.step ?? null, handlers) : null,
     statusCard(plan),
     plan.held_gates.length ? heldCard(plan, handlers) : null,
     // Above the findings: the findings say what is wrong with the plan, and this
     // says what the plan was derived from. A reader deciding whether to trust a
     // finding about coverage wants to know whether a requirements stage ran at all.
-    pipeline && pipeline.plan_id ? pipelineCard(pipeline) : null,
+    pipeline && pipeline.plan_id ? pipelineCard(pipeline, !watched) : null,
     findingsCard(shown, findings, options.filter),
     coverage.length ? coverageCard(coverage, handlers) : null,
     repairs.length ? repairsCard(repairs, handlers) : null,
   );
+}
+
+/** The phase graph, in its own card so the Plan page stays a stack of cards. */
+function phaseCard(phase: Phase, step: string | null, handlers: PlanHandlers): HTMLElement {
+  const card = el('section', { class: classes('card', 'phase-card', phase.status === 'failed' && 'urgent') });
+  const forward: PhaseHandlers = { onStep: (id) => handlers.onStep?.(id) };
+  renderPhase(card, phase, step, forward);
+  return card;
 }
 
 /** How each stage ended, as a mark and a word. */
@@ -73,7 +89,7 @@ const STAGE_MARKS: Record<PipelineStage['state'], string> = {
  * was already failing when planning started will be blamed on whichever task first
  * runs into it.
  */
-function pipelineCard(pipeline: Pipeline): HTMLElement {
+function pipelineCard(pipeline: Pipeline, withStages: boolean): HTMLElement {
   const failed = pipeline.stage_rows.filter((stage) => stage.state === 'failed');
   const pending = pipeline.stage_rows.filter((stage) => stage.state === 'pending');
   const stopped = failed.length > 0 || pending.length > 0;
@@ -92,7 +108,11 @@ function pipelineCard(pipeline: Pipeline): HTMLElement {
       stopped
         ? 'The plan does not rest on every analysis: what is missing was never established.'
         : 'Each analysis ran and the synthesized plan was checked against all of them.'),
-    el('ol', { class: 'stage-list' }, ...pipeline.stage_rows.map(stageRow)),
+    // Only when there is no phase graph above. The graph draws the same steps and
+    // draws them live, so showing both would put two accounts of one pipeline on
+    // one page — and the reader would have to work out that they agree. Plans made
+    // by an older writ, which kept no phase record, still get the list.
+    withStages ? el('ol', { class: 'stage-list' }, ...pipeline.stage_rows.map(stageRow)) : null,
     el(
       'div',
       { class: 'meta-row' },

@@ -383,6 +383,87 @@ export interface Graph {
   levels: number;
 }
 
+/**
+ * One step of a planning attempt: an agent writ ran, or is about to.
+ *
+ * `wave` is the column and it is the server's, from `analysis.waves` and
+ * `critics.waves` — the same functions that decide what actually runs at once. So
+ * two boxes in one column is not a drawing convention, it is writ saying it will
+ * run those two together.
+ */
+export interface PhaseStep {
+  id: string;
+  kind: 'stage' | 'synthesis' | 'commit' | 'critic' | 'repair' | 'approval';
+  name: string;
+  summary: string;
+  wave: number;
+  status: 'pending' | 'running' | 'ok' | 'reused' | 'failed' | 'skipped' | 'abandoned';
+  /** The resolved invoke command, joined — what to paste to run this step by hand. */
+  command: string;
+  display: string;
+  model: string;
+  directory: string;
+  artifact: string;
+  event_shape: string;
+  started_at: string | null;
+  finished_at: string | null;
+  exit_code: number | null;
+  error: string;
+  note: string;
+  depends_on: string[];
+  duration: number | null;
+  x: number;
+  y: number;
+  column: number;
+  /** Whether there is a transcript to poll. False for writ's own steps. */
+  has_output: boolean;
+}
+
+export interface PhaseEdge {
+  from: string;
+  to: string;
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  satisfied: boolean;
+}
+
+/**
+ * A planning attempt, which may still be running.
+ *
+ * Empty (`id === ''`) for a project planned before writ kept this record, and for
+ * one planned by `--extract` or `--from-plan`, which run no agents at all. The Plan
+ * view falls back to `plan.pipeline.stage_rows` in that case.
+ */
+export interface Phase {
+  id: string;
+  plan_id: string;
+  doc: string;
+  label: string;
+  status: 'running' | 'done' | 'failed' | 'stopped' | 'abandoned';
+  running: boolean;
+  started_at: string;
+  finished_at: string;
+  note: string;
+  steps: PhaseStep[];
+  edges: PhaseEdge[];
+  width: number;
+  height: number;
+  counts: Record<string, number>;
+  live: string[];
+}
+
+/** One step's output, polled while a reader is watching it. */
+export interface StepOutput {
+  step: string;
+  status: string;
+  /** Activity lines as the terminal shows them, rendered by writ's own renderer. */
+  activity: string[];
+  text: LogTail;
+  directory: string;
+}
+
 export interface ActivityEvent {
   at: string;
   kind: 'run-started' | 'run-finished' | 'decision';
@@ -417,6 +498,7 @@ export interface Snapshot {
   runs: RunRow[];
   decisions: Decision[];
   graph: Graph;
+  phase: Phase | Record<string, never>;
   activity: ActivityEvent[];
   findings: Finding[];
   coverage: Coverage[];

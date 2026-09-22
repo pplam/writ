@@ -228,6 +228,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="re-run stages that already have an artifact, instead of reusing them",
     )
     p.add_argument(
+        "--parallel-stages",
+        action="store_true",
+        default=None,
+        help=(
+            "run the analysis stages that need nothing from each other at once "
+            "(requirements beside inventory). Costs the inventory its coverage "
+            "claims, which need the requirement ids it will not have yet"
+        ),
+    )
+    p.add_argument(
         "--stage-agent",
         metavar="CMD",
         help="agent for the analysis stages (default: --agent)",
@@ -263,11 +273,52 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--parallel-critics",
+        action="store_true",
+        default=None,
+        help=(
+            "run the critics that only read the repository at once, each critic "
+            "that runs its commands alone. Most of five agent runs' wall-clock, "
+            "without two test suites in one working tree"
+        ),
+    )
+    p.add_argument(
         "--critic-agent",
         metavar="CMD",
         help="agent for the critics (default: --agent). A different one reviews better",
     )
     p.add_argument("--critic-model", metavar="NAME", help="model for the critics")
+    p.add_argument(
+        "--repair",
+        action="store_true",
+        default=None,
+        help=(
+            "answer the plan's blocking findings with the bounded repair loop "
+            "before it is approved, the same one `writ adjudicate` runs. Spends "
+            "agent runs, so it is opt-in; what --auto-approve refuses to override "
+            "is exactly what this tries to remove"
+        ),
+    )
+    p.add_argument(
+        "--max-rounds",
+        type=int,
+        metavar="N",
+        help=(
+            "how many repairs may land before the plan stops for a human "
+            f"(--repair) (default: {repair.DEFAULT_MAX_REPAIR_ROUNDS})"
+        ),
+    )
+    p.add_argument(
+        "--adjudicator-agent",
+        metavar="CMD",
+        help=(
+            "agent that proposes repair patches (--repair) "
+            "(default: --critic-agent, else --agent)"
+        ),
+    )
+    p.add_argument(
+        "--adjudicator-model", metavar="NAME", help="model for the adjudicator"
+    )
     p.add_argument("--append", action="store_true", help="add to an existing plan")
     p.add_argument("--force", action="store_true", help="replace the existing plan")
     p.add_argument(
@@ -389,6 +440,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "which critics to run (default: all). "
             + ", ".join(critic.name for critic in critics.CRITICS)
+        ),
+    )
+    p.add_argument(
+        "--parallel-critics",
+        action="store_true",
+        default=None,
+        help=(
+            "run the critics that only read the repository at once, each critic "
+            "that runs its commands alone. Most of five agent runs' wall-clock, "
+            "without two test suites in one working tree"
         ),
     )
     p.add_argument(
