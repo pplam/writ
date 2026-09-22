@@ -493,6 +493,11 @@ def _run_row(run: dict[str, Any]) -> dict[str, Any]:
         "unmet": reported.get("unmet", []),
         "decisions": reported.get("decisions", []),
         "note": run.get("note") or "",
+        # How a run that did not finish was classified. An infrastructure failure
+        # and a rejected implementation both leave a run that did not complete, and
+        # a page that showed them identically would have a reader debugging code
+        # when the provider was down.
+        "failure": run.get("failure") or None,
     }
 
 

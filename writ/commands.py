@@ -1224,7 +1224,7 @@ def _list_runs(data, args):
             continue
         if args.active and run["status"] not in runner.ACTIVE_RUN_STATUSES:
             continue
-        alive = runner.process_alive(run.get("pid"))
+        alive = runner.run_alive(run)
         rows.append(
             [
                 render.mark(run["status"]),
@@ -1387,7 +1387,7 @@ def cmd_show(args) -> None:
                 milestone_tasks(data, args.id), key=lambda t: t["id"]
             )
         elif kind == "run":
-            item = {**item, "alive": runner.process_alive(item.get("pid"))}
+            item = {**item, "alive": runner.run_alive(item)}
         render.emit_json(item)
         return
     renderer = {
@@ -1520,7 +1520,7 @@ def _render_run(run: dict[str, Any]) -> str:
     lines.append(f"timeout: {run.get('timeout') or '-'}")
     lines.append(
         f"pid: {run.get('pid') or '-'}  "
-        f"alive: {'yes' if runner.process_alive(run.get('pid')) else 'no'}"
+        f"alive: {'yes' if runner.run_alive(run) else 'no'}"
     )
     if run.get("supervisor_pid"):
         lines.append(f"supervisor pid: {run['supervisor_pid']}")
@@ -1529,6 +1529,18 @@ def _render_run(run: dict[str, Any]) -> str:
     lines.append(f"finished: {run.get('finished_at') or '-'}")
     if run.get("note"):
         lines.append(f"note: {run['note']}")
+    failure = run.get("failure")
+    if failure:
+        # The first question about a run that did not finish is whether to look at
+        # the code or at the machine. An unclassified error string made a reader
+        # guess, and a provider outage guesses as "the agent did badly".
+        lines.append(
+            f"failure: {failure.get('category')}"
+            + ("  (retryable)" if failure.get("retryable") else "")
+            + f"\n  {failure.get('reason', '')}"
+        )
+        for frame in failure.get("where") or []:
+            lines.append(f"  at {frame}")
     lines.append(f"dir: {run.get('dir')}")
     lines.append(f"\noutput: writ logs {run['id']}")
     lines.append(f"prompt: writ show {run['id']} --prompt")
@@ -1756,7 +1768,7 @@ def _status_payload(data: dict[str, Any]) -> dict[str, Any]:
                 "status": run["status"],
                 "pid": run.get("pid"),
                 "started_at": run.get("started_at"),
-                "alive": runner.process_alive(run.get("pid")),
+                "alive": runner.run_alive(run),
             }
             for run in active_runs
         ],
@@ -2335,7 +2347,7 @@ def _run_agent_on_task(args, *, role: str, task_id: str, extra: list[str]) -> in
     if not args.quiet:
         print("" + "─" * 62)
         sys.stdout.flush()
-    code = runner.execute(root, run_id, stream=not args.quiet, prefix="| ")
+    code = runner.execute_guarded(root, run_id, stream=not args.quiet, prefix="| ")
     if not args.quiet:
         print("" + "─" * 62)
     print(f"run {run_id} finished with exit code {code}")
@@ -2536,7 +2548,7 @@ def _print_roles(configured: list[dict[str, Any]], root) -> None:
 
 def cmd_supervise(args) -> int:
     """Internal: owns a detached run until the agent exits."""
-    return runner.execute(Path(args.root), args.run_id)
+    return runner.execute_guarded(Path(args.root), args.run_id)
 
 
 def cmd_serve(args) -> None:
@@ -2728,6 +2740,7 @@ def cmd_run(args) -> int:
             timeout=args.timeout,
             cwd=args.cwd,
             max_rework=getattr(args, "max_rework", None),
+            max_infra_retries=getattr(args, "max_infra_retries", None),
             on_event=reporter,
             stream=stream,
             lock=output_lock,
@@ -2744,6 +2757,10 @@ def cmd_run(args) -> int:
                 "completed": session.completed,
                 "failed": session.failed,
                 "reworked": session.reworked,
+                # Separate keys, because these are not failures. A consumer that
+                # summed them into `failed` would report an outage as rejected work.
+                "infra_retries": session.infra_retries,
+                "infra_blocked": session.infra_blocked,
                 "errors": session.errors,
                 "stopped": session.stopped or session.aborted,
                 "remaining": [
@@ -2882,6 +2899,16 @@ class _RunReporter:
             return f"cancelled {payload['task']} (run {payload['run']})"
         if name == "error":
             return f"error    {payload['task']}: {payload['message']}"
+        if name == "retrying":
+            # Said explicitly, and said as infrastructure. A retry that printed
+            # like a rework would have the reader looking for a review that never
+            # happened, which is the confusion this whole classification removes.
+            return (
+                f"retry    {payload['task']}  infrastructure "
+                f"{payload['attempt']}/{payload['budget']} "
+                f"in {payload['in']}s"
+                + (f"  ({_first_line(payload['reason'])})" if payload.get("reason") else "")
+            )
         return None
 
     def _finished(self, payload: dict[str, Any]) -> str:
@@ -2916,10 +2943,21 @@ class _RunReporter:
             )
 
         line = "  ".join(parts)
+        if payload.get("retry_in") is not None:
+            # An infrastructure failure that bought another attempt. The status is
+            # whatever the task was returned to, which on its own reads as work
+            # that quietly went nowhere.
+            line += f"  (retrying in {payload['retry_in']}s)"
         if payload["error"]:
             line += f"  ({payload['error']})"
         elif payload["exit_code"] not in (0, None):
             line += f"  (exit {payload['exit_code']})"
+        if payload.get("failure"):
+            # The classified failure, in addition to the exit code rather than
+            # instead of it. The code says what happened to the process; this says
+            # whether the reader should be looking at their code or at their
+            # provider, and only one of those is answerable from a number.
+            line += f"  ({payload['failure']})"
 
         detail = []
         reason = payload.get("summary")

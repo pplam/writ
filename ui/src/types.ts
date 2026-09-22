@@ -303,6 +303,28 @@ export interface RunRow {
   unmet: number[];
   decisions: string[];
   note: string;
+  /**
+   * How a run that did not finish was classified. An infrastructure failure — a
+   * provider timeout, a spawn that failed, a lock writ could not take — is not a
+   * statement about the work: no reviewer read it. Null for a run that finished.
+   */
+  failure: RunFailure | null;
+}
+
+/** See writ/failures.py. */
+export interface RunFailure {
+  category:
+    | 'infrastructure'
+    | 'unavailable'
+    | 'task'
+    | 'rejection'
+    | 'blocked'
+    | 'internal';
+  reason: string;
+  /** Whether another attempt could succeed with nothing else changing. */
+  retryable: boolean;
+  exception?: string;
+  where?: string[];
 }
 
 export interface LogTail {

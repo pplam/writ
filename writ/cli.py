@@ -29,6 +29,7 @@ import argparse
 import sys
 
 from . import analysis, commands, config, critics, repair
+from .failures import DEFAULT_MAX_INFRA_RETRIES
 from .server import DEFAULT_HOST, DEFAULT_PORT
 from .decisions import SETTABLE_DECISION_STATUSES
 from .model import DEFAULT_MAX_REWORK, JUDGED_STATUSES, SETTABLE_STATUSES
@@ -792,6 +793,17 @@ def build_parser() -> argparse.ArgumentParser:
             f"times a rejected task is re-dispatched with the review attached "
             f"before it is left failed (default: {DEFAULT_MAX_REWORK}, 0 to fail "
             "on the first rejection)"
+        ),
+    )
+    p.add_argument(
+        "--max-infra-retries",
+        type=int,
+        metavar="N",
+        help=(
+            "times a task is retried after an infrastructure failure — a provider "
+            "timeout, a failed spawn, a lock writ could not take (default: "
+            f"{DEFAULT_MAX_INFRA_RETRIES}, 0 to disable). Separate from "
+            "--max-rework: nothing here is a judgement of the work"
         ),
     )
     p.add_argument(

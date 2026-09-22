@@ -11,123 +11,213 @@ issues let an unsound plan reach execution.
 
 ## Priority 1 — correctness and durability
 
-### 1. Worker exceptions leave prepared runs unreconciled
+### 1. Worker exceptions leave prepared runs unreconciled — **implemented**
 
-**Confirmed.** `_prepare` claims the task by writing `task["status"] = "running"` or
-`"reviewing"` (`writ/runner.py:1069-1071`) and appends the run id. `runner.execute` is
-then called at `writ/orchestrator.py:694` with no `try/finally` that restores state:
-both handlers (`writ/orchestrator.py:701-703`) return an `Outcome` carrying an error
-string and never touch the task record.
+**The diagnosis held.** `_prepare` claimed the task and `runner.execute` was called
+with no `try/finally`; both handlers returned an `Outcome` carrying an error string
+and never touched the task record.
 
-A provider crash, subprocess failure, or any unexpected exception therefore strands the
-task mid-status with no durable outcome. The run looks active, the process is gone, and
-recovery depends on a later `reap`.
+**What was built.** `runner.reconcile` (`writ/runner.py`), called from
+`orchestrator._stranded` on the way out of every worker that raises, and from
+`runner.execute_guarded` for the single-shot entry points — `writ dispatch`,
+`writ review` and the detached supervisor had the same exposure.
 
-Possible stuck states:
+The invariant is now: **for every prepared run, exactly one of the worker's own
+recording or `reconcile` happens.**
 
-- task remains `running` or `reviewing`;
-- run remains active;
-- process has already disappeared.
-
-**Recommended solution.** Guarantee reconciliation for every prepared run:
-
-- wrap the worker lifecycle in `try/finally`;
-- if execution raises, mark the run failed or interrupted;
-- restore implementation tasks to `planned` and review tasks to `awaiting-review`;
-- persist the exception type, message, and traceback location;
-- refresh milestone state before returning.
-
-This is the failure that silently wedges a project, and the fix is contained.
-
----
-
-### 2. State replacement lacks crash durability
-
-**Confirmed.** `_write` (`writ/state.py:170-178`) calls `tmp.write_text(...)` then
-`tmp.replace(target)`. `os.replace` is atomic against concurrent *readers*, not against
-power loss: neither the file nor the containing directory is flushed, so a machine crash
-can lose the most recent committed state.
-
-**Recommended solution.** For durable state transitions:
-
-1. Write the temporary file.
-2. Flush and `fsync` the temporary file.
-3. Atomically replace the target.
-4. `fsync` the containing directory where supported.
-5. Clean up orphaned temporary files during startup.
-
-Make this the default for state and critical run metadata, with an explicitly documented
-performance option if needed. Roughly four lines, and it is the durability floor every
-other guarantee sits on.
+- `except BaseException`, not `Exception`. A `KeyboardInterrupt` delivered to a
+  worker thread strands a run identically, and leaving the store inconsistent is
+  not better for having been caused by a signal.
+- The run is marked `interrupted` when the failure is retryable and `failed` when
+  it is not — the distinction `reap` already drew, so a provider timeout does not
+  read forever after as a run that failed on its merits.
+- Implementation tasks return to `planned`, review tasks to `awaiting-review`
+  (`INTERRUPTED_STATUS`, reused rather than restated).
+- A repair run reopens its request. `prepare` moves it to `planning`, and a
+  request stuck there is one the scheduler will never pick up again — the same
+  treatment a refused patch already gets.
+- The exception type, message and the innermost three traceback frames are
+  persisted to `run["failure"]`, and milestones are refreshed before returning.
+- **Idempotent.** A worker can raise *after* `_finish` committed, in which case
+  the recorded outcome is the true one and only the classification is attached.
+  `Reconciliation.settled` says which happened.
+- Reconciliation can itself fail — if the state lock is what broke, writing the
+  reconciliation needs that lock. That is reported in the outcome rather than
+  raised, because losing the other agents in flight would turn one stranded run
+  into a lost session. `reap` remains the backstop.
 
 ---
 
-### 3. Process identity is a bare PID, across locks, sessions, and cancellation
+### 2. State replacement lacks crash durability — **implemented**
 
-Three separate symptoms, one root cause and one fix. Do them as a single piece of work.
+**The diagnosis held.** `tmp.write_text` then `tmp.replace` is atomic against
+concurrent readers and says nothing about power loss.
 
-**3a. Age-only stale-lock breaking — confirmed.** `_lock_is_stale`
-(`writ/state.py:213-218`) compares `st_mtime` against a flat `LOCK_STALE_SECONDS = 60.0`
-(`writ/state.py:36`), and `_release` (`writ/state.py:221`) unlinks the lock regardless of
-owner. The mtime is written once at acquire and never refreshed, so any transaction
-holding the lock longer than 60s — a slow agent write, an OS-paused process, a slow
-filesystem — has its lock stolen while still inside the critical section. That is
-concurrent writes to `state.json` with no detection.
+**What was built.** `state._write` now does the four steps in order: write the
+temporary file, `fsync` it, `os.replace` (the commit point), `fsync` the
+containing directory. `_fsync_dir` is best effort by design — not every
+filesystem allows opening a directory for it, and a platform that refuses leaves
+the rename exactly as durable as it was before, with the file's own contents
+still flushed.
 
-**3b. PID-only process identity — confirmed.** Ownership is recorded as a bare pid
-(`writ/runner.py:1058` `owner_pid`, `writ/orchestrator.py:215`) and checked with
-`process_alive` (`writ/runner.py:1587`), which is a `kill(pid, 0)` liveness probe. PIDs
-are reused after a process exits, so an unrelated process can be mistaken for the
-original owner: stale runs treated as active, recovery skipped, or cancellation
-(`os.killpg` at `writ/runner.py:1579`) targeting the wrong process group.
-
-**3c. Session claiming is not atomic — confirmed.** `claim_session`
-(`writ/orchestrator.py:197-215`) reads the existing pid, checks `process_alive`, then
-writes the replacement. Two processes can pass the check before either writes — a
-textbook TOCTOU on the file that is supposed to prevent double dispatch.
-
-**Recommended solution.** Record and verify a composite identity everywhere:
-
-```json
-{"pid": 4711, "start_time": 1758500000.0, "hostname": "...", "token": "..."}
-```
-
-- treat a process as the recorded owner only when the full identity matches;
-- refresh a heartbeat while a lock is held when long operations are possible;
-- break a lock only when its owner is confirmed dead or its token is demonstrably
-  orphaned;
-- use OS-level advisory locks where available;
-- keep the age timeout only as last-resort recovery, with an explicit warning;
-- create the session file with `O_CREAT | O_EXCL` or store ownership inside the state
-  transaction, and release it only when the stored token belongs to the releasing
-  process.
-
-Ranking note: 3a outranks 3b and 3c because a stolen state lock corrupts data, whereas a
-bad session claim mostly produces a confusing error.
+- A write that fails before the replace leaves the previous document intact and
+  removes its own temporary file. Better an old state than a truncated one.
+- `state.sweep_temporaries` clears debris from a crash, at `initialize` and inside
+  `reap` — the one place writ already runs to clean up after a death. A temporary
+  whose writing process is still alive is left alone: the pid is in the filename
+  precisely so a concurrent writer's work in progress can be told from a dead
+  one's leavings.
+- `WRIT_FSYNC=0` opts out, documented as making the store only as durable as the
+  page cache.
 
 ---
 
-### 4. Transient infrastructure failures are not separated from task failures
+### 3. Process identity is a bare PID — **implemented**
 
-**Confirmed.** The error path at `writ/orchestrator.py:701-703` flattens a provider
-timeout, a subprocess-spawn failure, a state-lock timeout, and a genuine reviewer
-rejection into the same `Outcome.error` string. Tasks burn rework attempts on transient
-failures and are then reported as having failed on technical merit.
+**The diagnosis held**, in all three parts. One new module, `writ/procs.py`, and
+one composite identity recorded everywhere ownership is: `{pid, start_time, host,
+token}`.
 
-The task rework budget is not an appropriate mechanism for infrastructure retries, and
-this corrupts the signal the whole review loop depends on.
+The probe is two-stage, because it matters that it is cheap: `os.kill(pid, 0)` is
+a syscall, while reading a start time costs a `/proc` read or a `ps` fork, so the
+expensive half only runs for pids that are alive — and start times are cached, as
+this is now on the path of every state transaction.
 
-**Recommended solution.** Classify failures into separate categories:
+Three predicates, and the asymmetry between them is the design:
 
-- retryable infrastructure failure;
-- non-retryable task failure;
-- reviewer rejection;
-- human-blocked decision.
+- `alive` — is this still the process that was recorded. A record from another
+  host is *alive*, because this machine has no standing to say otherwise.
+- `confirmed_dead` — can this machine **prove** the owner is gone. Breaking a
+  lock, reaping a run and stealing a session are all destructive, so they need
+  proof rather than a failed probe.
+- `safe_to_signal` — the pid to signal, or None. Guards `killpg`, the one
+  irreversible thing writ does to something outside itself, and also refuses a pid
+  that resolves to writ's own process group.
 
-For retryable infrastructure failures add a separate bounded retry budget, exponential
-backoff with jitter, durable retry timestamps, a recorded classification and reason, and
-idempotency keys. Report clearly that the task was not rejected on technical merit. Do
-not consume task rework attempts.
+Where a start time cannot be read, identity degrades to the pid alone — no worse
+than before. A bare pid from an older writ is honoured, so an in-flight project
+keeps running across the upgrade.
+
+**3a, the ranked-highest one.** `state._lock` now uses `fcntl.flock` where the
+platform has it, which makes the hard half the kernel's: a lock held by a process
+that dies is released when its descriptors close, so there is no stale lock to
+guess about and **no timeout at which a held lock can be taken from a holder that
+is merely slow**. The lock file is deliberately never unlinked — unlinking is what
+would reintroduce the race, since the next writer would create a fresh inode and
+lock that instead.
+
+The no-`flock` fallback keeps create-exclusive locking, with three changes that
+make the age timeout a last resort rather than the first rule: a lock is broken
+immediately when its owner is *proven* gone; a holder heartbeats its own mtime
+while it works, so age measures abandonment rather than duration; and release
+unlinks only a lock this process still owns.
+
+**3b.** `runner.run_owner` is the precedence chain — supervisor, then the agent's
+own process, then the claiming process — and `run_alive` / `run_abandoned` are the
+two questions asked of it. The precedence is load-bearing: asking whether
+*anything* on the list is running would report every crashed agent as working for
+as long as the terminal that started it stayed open.
+
+**3c.** `claim_session` creates the claim with `O_EXCL`, so the kernel picks the
+winner. Two subtleties the tests found:
+
+- creating the file and *then* writing it leaves a window in which the claim
+  exists but is empty, and a rival inside that window reads no owner — which is
+  indistinguishable from a claim whose writer died. Fixed by staging the content
+  and `os.link`-ing it into place, so the name appears already holding an
+  identity.
+- `release_session` releases only its own claim. After a `--force` start, an
+  unconditional unlink would delete the *new* session's file.
+
+---
+
+### 4. Transient infrastructure failures are not separated from task failures — **implemented**
+
+**The diagnosis held.** One `Outcome.error` string carried a provider timeout, a
+spawn failure, a lock timeout and a genuine rejection alike.
+
+**What was built.** `writ/failures.py`: six categories (`infrastructure`,
+`unavailable`, `task`, `rejection`, `blocked`, `internal`), a `retryable` flag, and
+an `on_merit` predicate — whether the failure is a statement about the *work* —
+which is the one the session summary reads.
+
+`classify` is deliberately conservative: an exception it does not recognise is
+`internal` and never retryable, because spending a budget on an unknown failure
+mode is how a crash loop gets mistaken for patience. `unavailable` exists because
+not every infrastructure failure is worth retrying — a missing agent binary is
+missing on the next attempt too.
+
+The retry budget is separate from rework in every respect that matters:
+
+- **Its own allowance.** `--max-infra-retries`, default 2, per task rather than
+  per session.
+- **Durable.** Attempts are recorded on the task with a timestamp, the run, the
+  category, the reason and an idempotency key, so a session killed mid-backoff and
+  resumed does not hand out a fresh allowance. The scheduler reads the count back
+  from the store rather than from its own memory.
+- **Backoff with jitter**, capped, applied as a reduction from the nominal delay
+  so the schedule stays testable.
+- **Never charged to rework.** `reconcile` writes the infrastructure record and
+  deliberately does not call `open_rework`.
+- **Reported as what it is.** `session.infra_retries` and `session.infra_blocked`
+  are kept apart from `failed`, `_record` returns early for anything not
+  `on_merit`, and a task that exhausts the budget gets an evidence line saying in
+  words that it was not rejected on technical merit. `writ show <run>` names the
+  category.
+
+A prepare-time failure is classified too: a state-lock timeout there says nothing
+about the task, and the old code abandoned the task for the rest of the session.
+
+**The two failures that never raise.** `classify` only ever sees an exception, and
+the two commonest infrastructure failures do not produce one. A hung agent is
+killed by writ itself and returns 124. An agent that cannot reach a model — wrong
+model id, missing credentials, exhausted quota — exits 0 having printed nothing.
+Both arrived as an ordinary unjudged run and landed the task at `failed`, which is
+the word for work a reviewer read and rejected.
+
+So `failures.from_run` classifies a run that *finished* without a usable verdict:
+124 is retryable `infrastructure`, an empty transcript is `unavailable`, and
+everything else is `None`. `runner._finish` calls it before deciding where the task
+goes, and a classified failure returns the task to the status `prepare` claimed it
+from rather than to `failed` — `planned` for an implementation, `awaiting-review`
+for a review, the same distinction `reap` draws. Under the scheduler the retry
+comes out of the infrastructure budget; under a bare `dispatch` it means fixing the
+timeout or the model id is the only thing left to do, instead of first having to
+undo a status that says the work failed.
+
+The classification is reported without becoming a session error: `Outcome` carries
+it in `failure_reason` rather than `error`, because an outage the scheduler is
+retrying should not make `writ run` exit non-zero.
+
+---
+
+### Testing
+
+`tests/test_resilience.py` — 48 tests, one per injected failure, each asserting
+**both** the persisted run record and the resulting task state, because a run
+marked failed while its task is still `running` reads as consistent from either
+side alone.
+
+Covered: worker exceptions after preparation, on a review, and on a repair run;
+reconciliation of an already-finished run; reconciliation that cannot write;
+single-shot dispatch; spawn failure; fsync on commit and its opt-out; write
+failure before and after the replace; orphaned temporaries; pid reuse across
+reaping, cancellation and session claiming; a remote owner; a live owner; a live
+lock under a zero stale timeout; a dead owner's lock; the fallback heartbeat;
+release by a process that lost its lock; eight threads claiming one session;
+classification of timeouts, missing agents, lock timeouts, ordinary `WritError`s,
+unknown exceptions and `errno` subsets; backoff bounds and jitter; a retry that
+succeeds; a budget that exhausts; retries disabled; a real timeout through writ's
+own kill, on an implementation and on a review; an agent that printed nothing; a
+timeout retried end to end by the scheduler; and the control — a reviewer rejection
+still spends rework.
+
+Suite at 886.
+
+**Not covered, deliberately.** An agent that *exits* non-zero having said something
+has run and reported for itself, and writ still reads its transcript and its
+verdict rather than second-guessing the exit code. The classification is for the
+ways a job ends without ever reporting: killed, or never started.
 
 ---
 
@@ -307,21 +397,16 @@ If shared-tree execution remains supported:
 
 ## Testing
 
-Failure-injection coverage is the verification for issues 1 through 4, not a separate work
-item. Write each test alongside the fix it covers, and have every test assert both the
-persisted run record and the resulting task state:
+The failure-injection list this section used to hold is done, and the coverage it
+asked for is written up under issue 4's own Testing heading
+(`tests/test_resilience.py`).
 
-- PID reuse and mismatched process identity;
-- stale and live lock handling;
-- concurrent session claims;
-- state write failure before and after replacement;
-- subprocess spawn failure;
-- timeout and process-group termination;
-- worker exceptions after run preparation;
-- missing, malformed, or misplaced verdicts;
-- reviewer interruption and supervisor disappearance;
-- transient provider and filesystem failures;
-- resume after every interrupted lifecycle stage.
+Three items on that list were already covered elsewhere and were left where they
+were rather than duplicated: missing, malformed and misplaced verdicts
+(`tests/test_verdict.py`), timeout and process-group termination
+(`tests/test_dispatch.py`), and resume after an interrupted lifecycle stage
+(`tests/test_run.py`, which resumes a killed review and asserts the
+implementation was not redone).
 
 ---
 
@@ -347,5 +432,8 @@ persisted run record and the resulting task state:
 
 ## Note on file concentration
 
-`writ/state.py` is 234 lines and carries both issue 2 and issue 3a. It is the
-highest-leverage file in the repository right now.
+`writ/state.py` carried both issue 2 and issue 3a, which was the observation that
+made it the highest-leverage file in the repository. Both are now fixed. It grew
+from 234 to 516 lines doing it, and the durability and locking halves are the
+obvious seam if it needs splitting later — `writ/procs.py` already took the
+process-identity half out of it.

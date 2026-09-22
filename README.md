@@ -87,7 +87,10 @@ writ review M01-001 --agent codex      # a different agent checks the claim
                       `writ run` behaves. Written once by `writ init` holding
                       writ's own defaults, and never touched again
   decisions.md        human-readable mirror of the decision log
-  run.session         the pid of the active `writ run`, if any
+  state.lock          advisory lock around each write. An OS-level `flock` where
+                      the platform has one, so it is released if a holder dies
+                      and cannot be taken from a holder that is merely slow
+  run.session         the identity of the active `writ run`, if any
   plans/<plan-id>/
     prompt.txt        what the planning agent was asked
     plan.json         the plan it returned, before validation
@@ -566,6 +569,36 @@ slot it had already spent. And `awaiting-review` still does not unblock dependen
 work built on a task whose review might send it back is work built on a premise
 that has not been checked.
 
+### Rework is not for broken machinery
+
+Rework is what a task spends when a reviewer read its work and said no. A provider
+timeout, a subprocess that would not spawn, a state lock writ could not take — none
+of those are readings of the work, and charging them to rework did two kinds of
+damage at once: the task lost attempts it never used, and when they ran out writ
+reported it as having failed on technical merit. The record then said a reviewer
+rejected work no reviewer had seen.
+
+So a failure is classified before anything is charged for it, and an
+infrastructure failure gets its own budget: `--max-infra-retries`, 2 by default,
+with exponential backoff and jitter. The retries are counted on the task in the
+store, so a session killed mid-backoff and resumed does not hand out a fresh
+allowance.
+
+```
+retry    M01-002  infrastructure 1/2 in 1.8s  (the agent exceeded its timeout (600s) and was killed)
+```
+
+A task that exhausts the budget is reported as *out of infrastructure retries*,
+not as failed, and its status is whatever it was returned to — it is still waiting
+to be attempted. `writ show <run>` names the category, so the first question about
+a run that did not finish (look at the code, or look at the machine) has an answer
+without guessing.
+
+```
+failure: infrastructure  (retryable)
+  the agent exceeded its timeout (600s) and was killed
+```
+
 ### The decision log
 
 A task's verdict also carries the choices the design document did not make. An
@@ -791,7 +824,7 @@ operates on.
 
 | Command | Purpose |
 |---|---|
-| `writ run [--parallel N] [--order id\|depth\|unlocks] [--max-tasks N] [--max-rework N] [--agent CMD] [--model M] [--reviewer CMD] [--reviewer-model M] [--reviewer-timeout S] [--timeout S] [--cwd D] [--force] [--quiet] [--no-stream] [--dry-run]` | walk the whole graph until it is done or stuck |
+| `writ run [--parallel N] [--order id\|depth\|unlocks] [--max-tasks N] [--max-rework N] [--max-infra-retries N] [--agent CMD] [--model M] [--reviewer CMD] [--reviewer-model M] [--reviewer-timeout S] [--timeout S] [--cwd D] [--force] [--quiet] [--no-stream] [--dry-run]` | walk the whole graph until it is done or stuck |
 | `writ dispatch <id> [--agent CMD] [--model M] [--detach] [--force] [--timeout S] [--cwd D] [--quiet] [--dry-run] [-- args]` | an agent implements the task and reports a verdict |
 | `writ review [id] [--agent CMD] [--model M] [--timeout S] [--cwd D] [--max-rework N] [--force] [--quiet] [--dry-run]` | a second agent verifies and signs off; no id reviews all awaiting |
 | `writ cancel [run-id]` | stop a run, or reap dead ones when given no id |
@@ -1151,7 +1184,7 @@ One task, one step at a time. `writ run` does exactly this, repeatedly:
          │
    1. select    ── the graph says M01-002 is ready
          │
-   2. claim     ── status: planned -> running, owner_pid recorded
+   2. claim     ── status: planned -> running, owner identity recorded
          │          (from here the task is no longer selectable)
          │
    3. prompt    ── runs/M01-002-…/prompt.txt
@@ -1172,6 +1205,19 @@ Step 2 is what makes concurrency safe. The claim is a write inside the same
 advisory lock as every other write, so a task stops being selectable *before* its
 agent starts rather than after. Two schedulers cannot both pick it up, and
 neither can a `writ dispatch` running alongside.
+
+The owner is recorded as a composite identity — pid, process start time, hostname
+and a token — rather than a bare pid. PIDs are reused, and every question writ
+asks about an owner is load-bearing: whether to return a task to the queue, and
+whether to send a signal to a process group. A recycled pid would answer both
+wrongly, in the two directions that hurt most: a wedged task nothing reclaims, and
+a `kill` aimed at a stranger.
+
+And every prepared run is settled exactly once. If the worker reaches the end it
+records its own outcome; if it raises — a provider that fell over, a subprocess
+that would not spawn — writ reconciles the run and returns the task to the queue
+before reporting the failure. Neither path can leave a task claimed by a process
+that no longer exists.
 
 Step 4 is what makes progress real. The task's status comes from the file the
 agent wrote, not from its exit code — a process can exit 0 having done nothing.
