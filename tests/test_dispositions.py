@@ -230,3 +230,51 @@ def test_a_finding_disposition_is_not_a_task_status(held, writ, project):
     code, _, err = writ("set", task_id, "declined", "--reason", "x")
     assert code == 2
     assert "not a task status" in err
+
+
+def test_a_finding_writ_closed_says_writ_closed_it():
+    """`writ show` reads two different fields for "who answered this".
+
+    A person's judgement is recorded as `disposed_by`; writ closing its own finding
+    because the check stopped reporting it is `resolved_by`. Reading only the first
+    made every resolved finding claim it did not know who closed it.
+    """
+    from writ import commands
+
+    record = {
+        "id": "F-0002",
+        "category": "unobservable-acceptance",
+        "severity": "warning",
+        "where": "M01-003",
+        "source": "writ",
+        "message": "criterion 4 names no command, path, or observable behaviour",
+        "disposition": "resolved",
+        "resolved_by": "writ",
+        "resolved_at": "2026-09-23T17:13:39+00:00",
+    }
+    text = commands._render_finding({"tasks": {}}, record)
+    assert "resolved by writ" in text
+    assert "2026-09-23T17:13:39+00:00" in text
+    assert "resolved by ?" not in text
+
+
+def test_a_person_who_answered_a_finding_is_still_named():
+    """The human case keeps precedence: their reason is the record."""
+    from writ import commands
+
+    record = {
+        "id": "F-0003",
+        "category": "missing-coverage",
+        "severity": "error",
+        "where": "REQ-009",
+        "source": "critic:coverage",
+        "message": "nothing covers the queue depth view",
+        "disposition": "accepted",
+        "disposed_by": "tim",
+        "disposed_at": "2026-09-23T18:00:00+00:00",
+        "reason": "shipping without it on purpose",
+        "resolved_by": "writ",
+    }
+    text = commands._render_finding({"tasks": {}}, record)
+    assert "accepted by tim" in text
+    assert "shipping without it on purpose" in text

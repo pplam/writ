@@ -31,6 +31,7 @@ being a way to make a bad plan pass:
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -91,6 +92,7 @@ def build_prompt(
     findings: Iterable[Finding],
     requirements: Iterable[dict[str, Any]] = (),
     prior_refusals: Iterable[Finding] = (),
+    accepted_entries: Iterable[str] = (),
     round_number: int = 1,
     base_revision: int = 0,
 ) -> str:
@@ -104,6 +106,7 @@ def build_prompt(
     """
     blocking = [f for f in findings if f.severity == "error"]
     advisory = [f for f in findings if f.severity == "warning"]
+    accepted_entries = list(accepted_entries)
     lines = [
         "You are repairing a PLAN that has not been executed yet.",
         "",
@@ -145,15 +148,29 @@ def build_prompt(
             ]
         )
         lines.extend(f"  {finding.line()}" for finding in refused)
+        if accepted_entries:
+            lines.extend(
+                [
+                    "",
+                    "Nothing was wrong with the rest of that patch. These entries "
+                    "were sound and a patch is all-or-nothing, so send them again "
+                    "unchanged and fix only what is listed above:",
+                ]
+            )
+            lines.extend(f"  {entry}" for entry in accepted_entries)
+    # The inventory is not repeated here. It travels inside `plan_text`, whose
+    # `requirements` array is the same rows — and this copy was truncated at 6000
+    # characters, which on a plan with 180 obligations meant the adjudicator was
+    # handed a JSON array cut off mid-object and a rule saying it may not drop any
+    # of the ids it could no longer read. The count is what this line was for.
     inventory = list(requirements)
     if inventory:
         lines.extend(
             [
                 "",
-                "The requirement inventory. A patch may not drop or invent one:",
-                "```json",
-                json.dumps(inventory, indent=2)[:6000],
-                "```",
+                f"The plan states {len(inventory)} requirement(s); they are in "
+                "`requirements` in the plan below. A patch may not drop or invent "
+                "one.",
             ]
         )
     lines.extend(
@@ -349,7 +366,8 @@ def _one_round(
         request_id = request["id"]
         base_revision = plans.revision(data)
         prior = _refusal_findings(request)
-        plan_text = _plan_json(data)
+        sound = _refusal_accepted(request)
+        plan_text = _plan_json(data, blocking)
         inventory = [dict(record) for record in plans.requirements(data).values()]
     round_ = Round(
         number=number,
@@ -365,6 +383,7 @@ def _one_round(
         findings=blocking,
         requirements=inventory,
         prior_refusals=prior,
+        accepted_entries=sound,
         round_number=number,
         base_revision=base_revision,
     )
@@ -421,6 +440,14 @@ def _one_round(
                         "at": utcnow(),
                         "round": number,
                         "reasons": [finding.to_dict() for finding in refused],
+                        # What the refusal was *not* about. A patch is atomic, so one
+                        # bad entry costs all of it — on the plan this was written
+                        # for, eleven sound revisions were discarded over a single
+                        # objection to a twelfth, three rounds running, because the
+                        # adjudicator was told only what broke and rewrote everything
+                        # each time. Naming the entries that passed makes the retry a
+                        # targeted edit instead of a fresh attempt.
+                        "accepted_entries": _sound_entries(patch, refused),
                     }
                 )
                 return round_
@@ -475,6 +502,31 @@ def _raise_questions(
     request["questions"] = list(patch.questions)
 
 
+def _sound_entries(patch: repair.Patch, refused: Iterable[Finding]) -> list[str]:
+    """The ids in a refused patch that nothing objected to.
+
+    A refusal's `where` is `<request>.revise_tasks[3]`-shaped, so the objected-to
+    entries are identifiable by index and everything else in the patch stood.
+    """
+    faulted: set[str] = set()
+    for finding in refused:
+        match = re.search(r"\.(revise_tasks|add_tasks)\[(\d+)\]", str(finding.where or ""))
+        if match is not None:
+            faulted.add(f"{match.group(1)}[{match.group(2)}]")
+    sound: list[str] = []
+    for field_name, entries in (
+        ("add_tasks", patch.add_tasks),
+        ("revise_tasks", patch.revise_tasks),
+    ):
+        for index, entry in enumerate(entries):
+            if f"{field_name}[{index}]" in faulted:
+                continue
+            ref = str(entry.get("id", "")).strip()
+            if ref:
+                sound.append(f"{field_name}: {ref}")
+    return sound
+
+
 def _reopen(root: Path, request_id: str) -> None:
     """Leave a failed round's request open so the next one continues it."""
     with state.transaction(root) as data:
@@ -498,6 +550,14 @@ def _refusal_findings(request: dict[str, Any]) -> list[Finding]:
         Finding.from_dict(payload)
         for payload in (refusals[-1].get("reasons") or [])
     ]
+
+
+def _refusal_accepted(request: dict[str, Any]) -> list[str]:
+    """The entries writ did not object to in this request's last refused patch."""
+    refusals = request.get("refusals") or []
+    if not refusals:
+        return []
+    return [str(entry) for entry in (refusals[-1].get("accepted_entries") or [])]
 
 
 def _summary(blocking: list[Finding]) -> str:
@@ -534,40 +594,185 @@ def _patch_text(directory: Path, patch_path: Path) -> str | None:
     return extract_json(text)
 
 
-def _plan_json(data: dict[str, Any]) -> str:
+#: what an adjudicator needs of a requirement record.
+#:
+#: Not `verification`, which is the hints the requirements stage collected and by
+#: far the largest field — 38KB of 57KB on the plan this was measured against — and
+#: not the timestamps, which say when a row was written and nothing about the
+#: obligation. A patch is judged on which ids it covers and whether it weakened a
+#: `must`, so that is what is sent.
+REQUIREMENT_FIELDS = (
+    "id",
+    "text",
+    "priority",
+    "status",
+    "source",
+    "evidence",
+    "reason",
+)
+
+
+def _requirement_view(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: record[key]
+        for key in REQUIREMENT_FIELDS
+        if record.get(key) not in (None, "", [])
+    }
+
+
+#: how many tasks the adjudicator is shown in full before the view is narrowed.
+#:
+#: Below this the whole graph is cheaper to send than to explain, and a small plan
+#: read whole is a better-informed patch. Above it, the full graph is mostly tasks
+#: no finding mentions: on the plan this bound was written for, 58 tasks and 180
+#: requirements made a 240KB prompt of which the 5 blocking findings touched 6 tasks.
+FULL_VIEW_TASKS = 25
+
+
+def _plan_json(
+    data: dict[str, Any], findings: Iterable[Finding] = (), *, full: bool = False
+) -> str:
     """The committed plan, as the adjudicator reads it.
 
     Statuses are included, which the critics' view does not need: an adjudicator has
     to know which tasks it may revise, and `planned` is the only answer.
+
+    Narrowed to what the findings are about once the plan is large. An adjudicator
+    is answering specific objections, not re-planning, and a patch is validated
+    against the whole graph afterwards whatever it was shown — so the tasks a
+    finding names, everything those depend on or that depends on them, and their
+    milestones' gates are the working set. The rest is listed by id and title so
+    nothing is invisible and the ids stay citable, and the requirement inventory is
+    filtered to what the findings and the shown tasks actually reference.
+
+    `full` forces the whole graph, which is what a small plan gets anyway.
     """
-    return json.dumps(
+    tasks = data.get("tasks", {})
+    requirements = plans.requirements(data)
+    shown = set(tasks)
+    if not full and len(tasks) > FULL_VIEW_TASKS:
+        shown = _relevant_tasks(data, findings)
+    detailed = [
         {
-            "revision": plans.revision(data),
-            "requirements": [
-                dict(record) for record in plans.requirements(data).values()
-            ],
-            "milestones": [
-                {"id": m["id"], "title": m.get("title", "")}
-                for m in data.get("milestones", {}).values()
-            ],
-            "tasks": [
-                {
-                    "id": task["id"],
-                    "title": task.get("title", ""),
-                    "kind": task.get("kind", "task"),
-                    "status": task.get("status"),
-                    "milestone": task.get("milestone"),
-                    "notes": task.get("notes", ""),
-                    "design_section": task.get("design_section"),
-                    "requirement_ids": task.get("requirement_ids", []),
-                    "depends_on": task.get("depends_on", []),
-                    "allowed": task.get("allowed", []),
-                    "forbidden": task.get("forbidden", []),
-                    "acceptances": task.get("acceptances", []),
-                }
-                for task in data.get("tasks", {}).values()
-            ],
-        },
-        indent=2,
-        sort_keys=True,
-    )
+            "id": task["id"],
+            "title": task.get("title", ""),
+            "kind": task.get("kind", "task"),
+            "status": task.get("status"),
+            "milestone": task.get("milestone"),
+            "notes": task.get("notes", ""),
+            "design_section": task.get("design_section"),
+            "requirement_ids": task.get("requirement_ids", []),
+            "depends_on": task.get("depends_on", []),
+            "allowed": task.get("allowed", []),
+            "forbidden": task.get("forbidden", []),
+            "acceptances": task.get("acceptances", []),
+        }
+        for task_id, task in tasks.items()
+        if task_id in shown
+    ]
+    payload: dict[str, Any] = {
+        "revision": plans.revision(data),
+        "milestones": [
+            {"id": m["id"], "title": m.get("title", "")}
+            for m in data.get("milestones", {}).values()
+        ],
+        "tasks": detailed,
+    }
+    if len(shown) < len(tasks):
+        payload["tasks_not_shown"] = [
+            {
+                "id": task["id"],
+                "title": task.get("title", ""),
+                "milestone": task.get("milestone"),
+                "requirement_ids": task.get("requirement_ids", []),
+            }
+            for task_id, task in tasks.items()
+            if task_id not in shown
+        ]
+        payload["note"] = (
+            "`tasks` holds every task the findings touch, in full. "
+            "`tasks_not_shown` is the rest of the plan by id, so you can see it "
+            "exists and depend on it — ask for nothing from it and revise none of "
+            "it. Writ validates your patch against the whole graph."
+        )
+        wanted = {
+            req
+            for task_id in shown
+            for req in (tasks[task_id].get("requirement_ids") or [])
+        }
+        wanted.update(
+            req for finding in findings for req in (finding.requirement_ids or [])
+        )
+        payload["requirements"] = [
+            _requirement_view(record)
+            for req_id, record in requirements.items()
+            if req_id in wanted
+        ]
+        payload["requirements_not_shown"] = sorted(set(requirements) - wanted)
+    else:
+        payload["requirements"] = [
+            _requirement_view(record) for record in requirements.values()
+        ]
+    return json.dumps(payload, indent=2, sort_keys=True)
+
+
+def _relevant_tasks(
+    data: dict[str, Any], findings: Iterable[Finding]
+) -> set[str]:
+    """The tasks a set of findings is about, plus one hop of graph around them.
+
+    One hop in both directions, because the commonest plan repair is an ordering or
+    ownership problem between a task and its neighbour, and a patch that cannot see
+    the neighbour cannot fix it. Gates of the affected milestones come too: a gate's
+    criteria are what the tasks under it are held to, and an adjudicator that cannot
+    read them will propose work the gate does not ask for.
+    """
+    tasks = data.get("tasks", {})
+    seeds: set[str] = set()
+    for finding in findings:
+        for token in re.split(r"[\s,/]+", str(finding.where or "")):
+            token = token.strip().strip("().")
+            if token in tasks:
+                seeds.add(token)
+    if not seeds:
+        # No finding named a task, so fall back to what covers the requirements they
+        # are about. Second choice, not first: a `must` can be covered by a dozen
+        # tasks, and seeding on it pulled in most of the graph — which is how the
+        # narrowing came out 212KB against 223KB and bought nothing.
+        wanted_reqs = {
+            req for finding in findings for req in (finding.requirement_ids or ())
+        }
+        for task_id, task in tasks.items():
+            if set(task.get("requirement_ids") or ()) & wanted_reqs:
+                seeds.add(task_id)
+    if not seeds:
+        # Nothing resolvable at all. Better to send the whole plan than a view
+        # chosen by an empty seed set.
+        return set(tasks)
+    plain = {
+        task_id
+        for task_id, task in tasks.items()
+        if task.get("kind") != "gate"
+    }
+    wanted = set(seeds)
+    for task_id in seeds:
+        wanted.update(
+            dep
+            for dep in (tasks[task_id].get("depends_on") or ())
+            if dep in plain
+        )
+    # The reverse hop is restricted to ordinary tasks. Every gate depends on its
+    # milestone's tasks, so following dependents blindly drew in all eleven gates
+    # and the final gate, which depends on everything, drew in the whole plan.
+    for task_id in plain:
+        if set(tasks[task_id].get("depends_on") or ()) & seeds:
+            wanted.add(task_id)
+    milestones = {
+        tasks[task_id].get("milestone")
+        for task_id in seeds
+        if tasks[task_id].get("kind") != "gate"
+    } - {None}
+    for task_id, task in tasks.items():
+        if task.get("kind") == "gate" and task.get("milestone") in milestones:
+            wanted.add(task_id)
+    return wanted

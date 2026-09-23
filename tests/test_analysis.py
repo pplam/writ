@@ -752,6 +752,62 @@ def test_a_dropped_requirement_holds_the_staged_plan(writ, project, design):
     assert "writ check" in out
 
 
+def test_a_reconcile_finding_closes_once_the_graph_no_longer_earns_it(
+    writ, project, design
+):
+    """A staged finding is a fact about the graph, so a later check must retire it.
+
+    These were produced once, at plan time, and passed into `run_check` as `extra`.
+    Every later check omitted them, and because they carry `source="stage:synthesis"`
+    no reporter claimed the authority to close them — so a finding the very next
+    patch answered stayed open for the life of the plan and counted toward the
+    repeat-finding bound that ends the repair loop. On a real plan, 32 of them sat
+    open at revision 1 while the graph had moved to revision 4.
+    """
+    writ("init")
+    ignored = json.loads(json.dumps(PLAN))
+    # Only T-log's bar drops its cited command, so exactly one requirement's
+    # verification goes unused and the count below is unambiguous.
+    ignored["milestones"][0]["tasks"][0]["acceptances"] = [
+        "the writer appends records in order",
+        "the writer rejects a short write",
+    ]
+    writ("plan", str(design), *staged(plan=ignored))
+
+    def unused(data):
+        return [
+            finding
+            for finding in plans.findings(data, open_only=True)
+            if finding.category == "unused-verification"
+        ]
+
+    assert len(unused(state.load(project))) == 1
+
+    # State the bar the verification stage worked out, as a repair would.
+    with state.transaction(project) as data:
+        task = next(
+            item
+            for item in data["tasks"].values()
+            if "REQ-001" in (item.get("requirement_ids") or ())
+            and item.get("kind") != "gate"
+        )
+        task["acceptances"].append(
+            {"text": "`pytest -q tests/test_store.py` passes", "status": "pending"}
+        )
+        plans.bump(data)
+
+    writ("check")
+    data = state.load(project)
+    assert unused(data) == []
+    records = [
+        payload
+        for payload in plans.finding_records(data)
+        if payload.get("category") == "unused-verification"
+    ]
+    assert records and records[0]["disposition"] == "resolved"
+    assert records[0]["resolved_revision"] == plans.revision(data)
+
+
 def test_no_stages_is_the_older_single_shot_planner(writ, project, design):
     writ("init")
     code, out, _ = writ(

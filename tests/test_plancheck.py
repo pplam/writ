@@ -317,6 +317,53 @@ def test_a_missing_path_is_only_a_note(tmp_path: Path):
     assert "nowhere/at/all.py" in finding.message
 
 
+def test_a_greenfield_plan_gets_no_path_notes(tmp_path: Path):
+    """The noise that buried everything else.
+
+    A plan that builds a project from nothing fences every task to files that do
+    not exist yet. One note per path made 104 findings on a real plan and told the
+    reader nothing, because "does not exist" was true of the whole plan.
+    """
+    findings = plancheck.check(
+        snapshot(
+            task("M01-001", allowed=["mmm/__init__.py", "mmm/schema.sql"]),
+            task("M01-002", allowed=["tests/conftest.py", "pyproject.toml"]),
+            root=tmp_path,
+        )
+    )
+    assert "unknown-path" not in categories(findings)
+    assert "suspect-path" not in categories(findings)
+
+
+def test_a_path_beside_real_siblings_is_a_suspect_path(tmp_path: Path):
+    """A missing file in a directory that exists is the case worth a warning."""
+    (tmp_path / "writ").mkdir()
+    (tmp_path / "writ" / "state.py").write_text("x", encoding="utf-8")
+    findings = plancheck.check(
+        snapshot(task("M01-001", allowed=["writ/stat.py"]), root=tmp_path)
+    )
+    finding = find(findings, "suspect-path")
+    assert finding.severity == "warning"
+    assert "writ/stat.py" in finding.message
+
+
+def test_missing_paths_are_reported_once_per_task(tmp_path: Path):
+    """One finding per task, not per path, so a wide fence cannot flood the ledger."""
+    (tmp_path / "writ").mkdir()
+    findings = plancheck.check(
+        snapshot(
+            task(
+                "M01-001",
+                allowed=[f"gone/file{n}.py" for n in range(8)],
+            ),
+            root=tmp_path,
+        )
+    )
+    notes = [f for f in findings if f.category == "unknown-path"]
+    assert len(notes) == 1
+    assert "8 paths" in notes[0].message
+
+
 def test_paths_are_not_checked_without_a_root():
     findings = plancheck.check(snapshot(task("M01-001", allowed=["nowhere/"])))
     assert "unknown-path" not in categories(findings)

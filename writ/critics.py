@@ -77,6 +77,13 @@ class Critic:
     #: that are not are told to leave that suite alone so the baseline means
     #: something.
     runs_commands: bool = False
+    #: whether this critic is shown each requirement's `verification` hints. Only
+    #: coverage is: its second check asks whether a requirement has any way of being
+    #: verified at all. On a real inventory those hints are the single largest thing
+    #: in the plan view, and the other four critics are told in as many words that
+    #: they belong to somebody else — so sending them is paying for attention spent
+    #: on the wrong question.
+    reads_verification: bool = False
 
     @property
     def scope(self) -> str:
@@ -94,6 +101,7 @@ class Critic:
 CRITICS: tuple[Critic, ...] = (
     Critic(
         name="coverage",
+        reads_verification=True,
         brief=(
             "whether this plan actually builds what the design asked for, or only "
             "something adjacent to it"
@@ -283,12 +291,21 @@ def by_name(names: Iterable[str]) -> list[Critic]:
     return [critic for critic in CRITICS if critic.name in wanted]
 
 
+#: the plan as a critic reads it: either one text for all of them, or a function of
+#: the critic, for a caller that tailors the view to the question being asked.
+PlanView = str | Callable[[Critic], str]
+
+
+def plan_for(critic: Critic, plan_text: PlanView) -> str:
+    return plan_text if isinstance(plan_text, str) else plan_text(critic)
+
+
 def build_prompt(
     critic: Critic,
     *,
     root: Path,
     doc: Path | None,
-    plan_text: str,
+    plan_text: PlanView,
     report_path: Path,
     found: Iterable[Finding] = (),
 ) -> str:
@@ -353,7 +370,7 @@ def build_prompt(
             "",
             "The plan under review:",
             "```json",
-            plan_text.strip(),
+            plan_for(critic, plan_text).strip(),
             "```",
             "",
             "Write your findings as JSON to this exact path:",
@@ -469,7 +486,7 @@ def review(
     *,
     root: Path,
     doc: Path | None,
-    plan_text: str,
+    plan_text: PlanView,
     directory: Path,
     chosen: Iterable[Critic],
     agent: str,
@@ -596,7 +613,7 @@ def _review_one(
     resolved: agents.ResolvedAgent,
     root: Path,
     doc: Path | None,
-    plan_text: str,
+    plan_text: PlanView,
     directory: Path,
     timeout: int | None,
     cwd: str | None,

@@ -790,12 +790,25 @@ def _commit_plan(
             )
         plans.bump(data)
         plans.set_status(data, "draft")
-        # The reconcile findings go in beside writ's structural ones rather than
-        # into a channel of their own: a dropped requirement holds the plan the
-        # same way a cycle does, and `writ approve` should not need to know which
-        # kind it is overruling.
+        # The reconcile findings land beside writ's structural ones rather than in a
+        # channel of their own: a dropped requirement holds the plan the same way a
+        # cycle does, and `writ approve` should not need to know which kind it is
+        # overruling. `run_check` derives them itself from the artifacts recorded
+        # just above, against the ids writ minted — passing the pre-commit copy as
+        # well recorded each finding twice, once under the synthesizer's own task id
+        # (`T-log`) and once under writ's (`M01-001`), and the first could never be
+        # closed because no later check speaks that id.
+        #
+        # `untraceable_requirements` still comes through `extra`: it reads the design
+        # document, which the committed graph does not carry.
         findings = plans.run_check(
-            data, root=root.resolve(), extra=extra_findings
+            data,
+            root=root.resolve(),
+            extra=[
+                finding
+                for finding in extra_findings
+                if finding.category == "untraceable-requirement"
+            ],
         )
     return created, findings
 
@@ -1476,7 +1489,15 @@ def _run_critics(args, *, root, doc, chosen, plan_path, phase=None):
     exist — which are what will be executed, and not always what the plan proposed.
     """
     data = state.load(root)
-    plan_text = _plan_json(data)
+    # Built per critic rather than once: only coverage is asked about verification,
+    # and on a real inventory those hints are most of the requirement block.
+    views = {
+        wants: _plan_json(data, verification=wants) for wants in (False, True)
+    }
+
+    def plan_text(critic):
+        return views[critic.reads_verification]
+
     found = plans.findings(data, open_only=True)
     revision = plans.revision(data)
     directory = state.store_dir(root) / "reviews" / f"r{revision}"
@@ -1627,12 +1648,40 @@ def _critic_steps(root, phase, chosen, *, revision: int, data, parallel: bool):
     return lambda name: f"critic:{name}{suffix}"
 
 
-def _plan_json(data: dict[str, Any]) -> str:
+#: what a critic is shown of a requirement.
+#:
+#: Not `created_at`/`updated_at`: a critic judges a plan, not its chronology, and on
+#: a real inventory those two fields alone are 9KB of digits that say nothing about
+#: whether the plan builds the right thing. `verification` is held back too — it is
+#: the largest field by far, and four of the five critics are told in as many words
+#: that it is another critic's job. Coverage is the exception and asks for it.
+CRITIC_REQUIREMENT_FIELDS = (
+    "id",
+    "text",
+    "priority",
+    "status",
+    "source",
+    "reason",
+    "evidence",
+)
+
+
+def _requirement_view(record: dict[str, Any], *, verification: bool) -> dict[str, Any]:
+    view = {
+        field: record[field] for field in CRITIC_REQUIREMENT_FIELDS if field in record
+    }
+    if verification and record.get("verification"):
+        view["verification"] = record["verification"]
+    return view
+
+
+def _plan_json(data: dict[str, Any], *, verification: bool = True) -> str:
     """The committed plan as the critics read it: ids, edges, fences, bars."""
     return json.dumps(
         {
             "requirements": [
-                dict(record) for record in plans.requirements(data).values()
+                _requirement_view(record, verification=verification)
+                for record in plans.requirements(data).values()
             ],
             "tasks": [
                 {
@@ -2066,8 +2115,11 @@ def _render_finding(data: dict[str, Any], record: dict[str, Any]) -> str:
         # How it was answered is the point of reading a closed finding. A plan that
         # ran with a known objection is legible only if the reason it was overruled
         # is here, next to the objection, rather than in an approval note somewhere.
-        who = record.get("disposed_by", "?")
-        when = record.get("disposed_at", "")
+        # A person's judgement is `disposed_by`; writ closing its own finding is
+        # `resolved_by`. Reading either one only ever printed the first, so every
+        # resolved finding said "resolved by ?" about something it knew.
+        who = record.get("disposed_by") or record.get("resolved_by") or "?"
+        when = record.get("disposed_at") or record.get("resolved_at") or ""
         lines.append(f"\n{disposition} by {who}{f' ({when})' if when else ''}")
         if record.get("reason"):
             lines.append(f"reason: {record['reason']}")

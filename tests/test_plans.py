@@ -563,3 +563,139 @@ def test_a_gate_is_not_held_to_a_requirement_the_plan_disowns(inventoried, proje
     assert "REQ-005" not in claimed
     assert "REQ-003" in claimed
     assert gates.answerable_requirements(data) == claimed
+
+
+def _wordy_finding(where="REQ-003", head="nothing covers the queue depth view"):
+    """A finding whose message is longer than a compacted one is allowed to be."""
+    return plancheck.Finding(
+        severity="error",
+        category="missing-coverage",
+        message=(
+            f"{head}: the design calls for an operator to see how far behind the "
+            "consumer is, and no task in the graph reads the offset, exposes it, or "
+            "asserts on it. Nothing downstream would fail if it were never built."
+        ),
+        where=where,
+        source="critic:coverage",
+    )
+
+
+def _resolve_then_advance(data, project, finding):
+    """Raise a finding, let it go away, then move the plan on a revision."""
+    plans.record_findings(data, [finding], scope="critic:coverage",
+                          reporter="critic:coverage")
+    record = plans.finding_records(data)[-1]
+    plans.bump(data)
+    plans.record_findings(data, [], scope="critic:coverage",
+                          reporter="critic:coverage")
+    plans.bump(data)
+    plans.record_findings(data, [], scope="critic:coverage",
+                          reporter="critic:coverage")
+    return record
+
+
+def test_a_long_resolved_finding_stops_carrying_its_argument(inventoried, project):
+    """The prose is dropped once the objection is closed and a revision has passed.
+
+    Findings are the bulk of a mature state file, and almost all of them are closed.
+    Every agent that loads state pays to parse the paragraph explaining a defect that
+    no longer exists.
+    """
+    with state.transaction(project) as data:
+        record = _resolve_then_advance(data, project, _wordy_finding())
+    assert record["disposition"] == "resolved"
+    assert record["compacted"] is True
+    assert "suggested_action" not in record
+    # Still says what it was.
+    assert record["message"].startswith("nothing covers the queue depth view")
+    assert len(record["message"]) <= plans.RESOLVED_TEXT_CHARS + 1
+
+
+def test_a_compacted_finding_is_still_the_same_finding(inventoried, project):
+    """Shortening the message must not change what the finding *is*.
+
+    Identity is category, place, source and the head of the message. Cut the message
+    below that prefix and the same objection coming back would file as a new finding
+    with a fresh `seen_count` — and the repeat bound that stops a repair loop from
+    retrying one failed fix forever reads `seen_count`.
+    """
+    with state.transaction(project) as data:
+        record = _resolve_then_advance(data, project, _wordy_finding())
+        compacted_key = plans._finding_key(record)
+        original_id = record["id"]
+        before = len(plans.finding_records(data))
+
+        # The critic reads the plan again and objects to the same thing.
+        plans.record_findings(data, [_wordy_finding()], scope="critic:coverage",
+                              reporter="critic:coverage")
+        records = plans.finding_records(data)
+
+    assert len(records) == before, "the same objection filed twice"
+    came_back = next(r for r in records if r["id"] == original_id)
+    assert plans._finding_key(came_back) == compacted_key
+    assert came_back["disposition"] == "open"
+    assert came_back["seen_count"] == 2
+    assert came_back["reopened_at"]
+    # Rewritten from the fresh report, so the full text is back.
+    assert came_back["message"] == _wordy_finding().message
+
+
+def test_a_finding_keeps_its_text_the_revision_it_is_resolved(inventoried, project):
+    """A repair loop reads what it just closed. Compaction waits a revision."""
+    with state.transaction(project) as data:
+        finding = _wordy_finding()
+        plans.record_findings(data, [finding], scope="critic:coverage",
+                              reporter="critic:coverage")
+        plans.bump(data)
+        plans.record_findings(data, [], scope="critic:coverage",
+                              reporter="critic:coverage")
+        record = plans.finding_records(data)[-1]
+    assert record["disposition"] == "resolved"
+    assert not record.get("compacted")
+    assert record["message"] == finding.message
+
+
+def test_a_person_who_overruled_a_finding_keeps_every_word(inventoried, project):
+    """A human judgement is the one thing here nobody may summarise.
+
+    The objection's own text, sitting next to the reason someone overruled it, is the
+    record of what they decided to ship. Shortening it would leave an approval whose
+    subject had been paraphrased by a tool.
+    """
+    with state.transaction(project) as data:
+        finding = _wordy_finding()
+        plans.record_findings(data, [finding], scope="critic:coverage",
+                              reporter="critic:coverage")
+        record = plans.finding_records(data)[-1]
+        plans.dispose(data, record["id"], "accepted", actor="tim",
+                      reason="shipping without the depth view on purpose")
+        plans.bump(data)
+        plans.record_findings(data, [], scope="critic:coverage",
+                              reporter="critic:coverage")
+        plans.bump(data)
+        plans.record_findings(data, [], scope="critic:coverage",
+                              reporter="critic:coverage")
+        record = next(r for r in plans.finding_records(data) if r["id"] == record["id"])
+    assert record["disposition"] == "accepted"
+    assert not record.get("compacted")
+    assert record["message"] == finding.message
+
+
+def test_a_shortened_message_still_contains_the_whole_identity_prefix():
+    """The two constants are coupled, and only one of them is obvious.
+
+    `_finding_key` hashes the head of the message, so a compacted message shorter
+    than that prefix would change a finding's identity — silently, and only visibly
+    much later as a repair loop that stopped noticing repeats. Lowering
+    `RESOLVED_TEXT_CHARS` under `_KEY_PREFIX` should fail here rather than there.
+    """
+    assert plans.RESOLVED_TEXT_CHARS > plans._KEY_PREFIX
+    text = "x" * 500
+    assert plans._shorten(text, plans.RESOLVED_TEXT_CHARS)[: plans._KEY_PREFIX] == (
+        text[: plans._KEY_PREFIX]
+    )
+    # Even a message that is all one word keeps the prefix intact.
+    spaced = ("word " * 200)
+    assert plans._shorten(spaced, plans.RESOLVED_TEXT_CHARS)[: plans._KEY_PREFIX] == (
+        spaced[: plans._KEY_PREFIX]
+    )

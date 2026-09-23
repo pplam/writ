@@ -593,6 +593,14 @@ def _validate_revisions(
         for entry in patch.add_tasks
         if str(entry.get("id", "")).strip()
     }
+    # Every requirement this patch leaves covered, anywhere. A revision that stops
+    # covering an obligation is only dropping it if *nothing else in the same patch*
+    # picks it up — and splitting one overloaded task into two is exactly a patch
+    # where something else does. Judging each revision against its own before-state
+    # alone refused the only valid repair for `task-too-broad`: the adjudicator
+    # moved the requirement to a task the same patch added, was told it had dropped
+    # it, and had no move left that would not be refused for the same reason.
+    covered_by_patch = _patch_coverage(data, patch)
     for index, entry in enumerate(patch.revise_tasks):
         where = f"{request['id']}.revise_tasks[{index}]"
         ref = str(entry.get("id", "")).strip()
@@ -678,9 +686,45 @@ def _validate_revisions(
                 where,
                 known_requirements,
                 proposed_ids=proposed_ids,
+                covered_by_patch=covered_by_patch,
             )
         )
     return found
+
+
+def _patch_coverage(data: dict[str, Any], patch: Patch) -> set[str]:
+    """Every requirement still covered once this whole patch has been applied.
+
+    The graph as it would be *after* the patch, not before: tasks the patch adds
+    contribute their requirements, a revised task contributes what its revision
+    states rather than what it holds now, and every task the patch does not mention
+    contributes what it already has. That is the set a "dropped" requirement has to
+    be missing from, because a requirement moved from an overloaded task to a new
+    one has not been dropped by the plan — only by that task.
+    """
+    revised = {
+        str(entry.get("id", "")).strip(): entry
+        for entry in patch.revise_tasks
+        if str(entry.get("id", "")).strip()
+    }
+    covered: set[str] = set()
+    for task_id, task in (data.get("tasks") or {}).items():
+        # Gates are skipped. A gate carries the union of the requirements its
+        # milestone's tasks claim, so counting it would make every requirement look
+        # covered by something and this check could never fire: a revision could
+        # drop the one task that implements an obligation and the gate that merely
+        # judges it would vouch for it.
+        if task.get("kind") == "gate":
+            continue
+        entry = revised.get(str(task_id))
+        if entry is not None and "requirement_ids" in entry:
+            source: Iterable[Any] = entry.get("requirement_ids") or ()
+        else:
+            source = task.get("requirement_ids") or ()
+        covered.update(str(req) for req in source)
+    for entry in patch.add_tasks:
+        covered.update(str(req) for req in (entry.get("requirement_ids") or ()))
+    return covered
 
 
 def _validate_revision_fields(
@@ -691,6 +735,7 @@ def _validate_revision_fields(
     known_requirements: set[str],
     *,
     proposed_ids: frozenset[str] | set[str] = frozenset(),
+    covered_by_patch: set[str] | None = None,
 ) -> list[Finding]:
     found: list[Finding] = []
     ref = task["id"]
@@ -728,7 +773,11 @@ def _validate_revision_fields(
     if "requirement_ids" in entry:
         proposed = {str(req) for req in (entry.get("requirement_ids") or [])}
         held = {str(req) for req in (task.get("requirement_ids") or [])}
-        dropped = sorted(held - proposed)
+        # What this task stops covering, minus whatever the rest of the patch
+        # takes on. The message already told the adjudicator it could "move it to
+        # a task this patch adds"; this is the check finally agreeing with it.
+        elsewhere = set() if covered_by_patch is None else set(covered_by_patch)
+        dropped = sorted(held - proposed - elsewhere)
         if dropped:
             found.append(
                 Finding(
