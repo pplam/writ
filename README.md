@@ -407,6 +407,19 @@ keep coming back, stops for a human rather than cycling; so does a planner whose
 patches writ keeps refusing. `writ run` reports a held gate as waiting, not as
 failed, because the work behind it is not broken — it is parked on a decision.
 
+The bound counts patches that **landed**, not agent runs. A refused patch changed
+nothing and is handed straight back with the reason it broke, so spending a round
+on it would stop the loop over a plan that had never actually been repaired.
+
+A finding closes when the party that raised it stops reporting it. Writ's own
+checks re-run every time the plan changes, so their silence is evidence
+immediately; a critic's finding closes when that critic reads the patched plan and
+no longer objects, which is what the re-review after each applied patch is for.
+Nobody closes anybody else's objection: a structural pass never looked for what a
+critic found. The adjudicator's `accepted` is a claim in the meantime — the same
+claim a returning finding overturns — and it becomes `resolved` once a check
+agrees, so a repaired plan stops carrying what its repair answered.
+
 ### Extraction fallback
 
 `writ plan --extract` uses the old deterministic parser: level-2 headings become

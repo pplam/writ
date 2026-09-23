@@ -692,6 +692,11 @@ def record(
                 data,
                 report.findings,
                 scope=f"critic:{report.critic}",
+                # This critic is the reporter, so this is the one pass that may
+                # close its own earlier findings. A critic that read the patched
+                # plan and no longer objects has produced the evidence; nobody
+                # else's re-check can speak for it.
+                reporter=f"critic:{report.critic}",
             )
         )
         reviews(data).append(

@@ -569,6 +569,17 @@ def _validate_revisions(
     found: list[Finding] = []
     existing = data.get("tasks", {})
     known_requirements = set(data.get("requirements", {}))
+    # The ids this same patch is adding. A revision may depend on one of them: the
+    # commonest plan repair is "the work this task needs does not exist yet", whose
+    # answer is one new task plus an edge to it from the task that needs it. Judging
+    # the revision against the *committed* graph alone refuses that patch for naming
+    # a task the patch itself is introducing, and the adjudicator's only way out is
+    # to drop the edge — which is the finding, unrepaired.
+    proposed_ids = {
+        str(entry.get("id", "")).strip()
+        for entry in patch.add_tasks
+        if str(entry.get("id", "")).strip()
+    }
     for index, entry in enumerate(patch.revise_tasks):
         where = f"{request['id']}.revise_tasks[{index}]"
         ref = str(entry.get("id", "")).strip()
@@ -646,7 +657,16 @@ def _validate_revisions(
                 )
             )
             continue
-        found.extend(_validate_revision_fields(data, entry, task, where, known_requirements))
+        found.extend(
+            _validate_revision_fields(
+                data,
+                entry,
+                task,
+                where,
+                known_requirements,
+                proposed_ids=proposed_ids,
+            )
+        )
     return found
 
 
@@ -656,6 +676,8 @@ def _validate_revision_fields(
     task: dict[str, Any],
     where: str,
     known_requirements: set[str],
+    *,
+    proposed_ids: frozenset[str] | set[str] = frozenset(),
 ) -> list[Finding]:
     found: list[Finding] = []
     ref = task["id"]
@@ -743,14 +765,16 @@ def _validate_revision_fields(
                         source="writ",
                     )
                 )
-            elif str(dep) not in tasks:
+            elif str(dep) not in tasks and str(dep) not in proposed_ids:
                 found.append(
                     Finding(
                         severity="error",
                         category="unknown-dependency",
                         message=f"revision of {ref} depends on unknown {dep}",
                         where=where,
-                        suggested_action="depend on a task that exists",
+                        suggested_action=(
+                            "depend on a task that exists, or on one this patch adds"
+                        ),
                         source="writ",
                     )
                 )
@@ -1105,7 +1129,7 @@ def apply_patch(
         if target not in task["depends_on"]:
             task["depends_on"].append(target)
             task["updated_at"] = utcnow()
-    revised = _apply_revisions(data, patch, request)
+    revised = _apply_revisions(data, patch, request, translate=translate)
     if gate is not None:
         # The gate waits for its repair. Without this the gate is ready the moment
         # it is un-held and would re-review the identical tree.
@@ -1151,7 +1175,11 @@ def apply_patch(
 
 
 def _apply_revisions(
-    data: dict[str, Any], patch: Patch, request: dict[str, Any]
+    data: dict[str, Any],
+    patch: Patch,
+    request: dict[str, Any],
+    *,
+    translate: dict[str, str] | None = None,
 ) -> list[str]:
     """Replace the named fields on each revised task.
 
@@ -1159,6 +1187,12 @@ def _apply_revisions(
     nothing else leaves the fence, the requirements and the edges exactly as they
     were — which is what makes a narrow fix narrow, and keeps the diff a reader has
     to check small.
+
+    `translate` maps the ids a patch used for the tasks it adds onto the ids writ
+    minted for them. A revision may depend on a task the same patch adds, and the
+    patch calls it by the name it proposed; without the mapping that edge names
+    nothing and is dropped, so the patch would apply having silently left out the
+    ordering it was written to add.
     """
     revised: list[str] = []
     for entry in patch.revise_tasks:
@@ -1197,10 +1231,13 @@ def _apply_revisions(
                 str(req) for req in (entry.get("requirement_ids") or [])
             ]
         if "depends_on" in entry:
-            task["depends_on"] = [
-                str(dep)
+            mapped = translate or {}
+            wanted = [
+                mapped.get(str(dep), str(dep))
                 for dep in (entry.get("depends_on") or [])
-                if str(dep) in data["tasks"] and str(dep) != ref
+            ]
+            task["depends_on"] = [
+                dep for dep in wanted if dep in data["tasks"] and dep != ref
             ]
         history = task.setdefault("revisions", [])
         history.append(

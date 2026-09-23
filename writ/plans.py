@@ -310,7 +310,11 @@ def finding_records(data: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def record_findings(
-    data: dict[str, Any], incoming: Iterable[Finding], *, scope: str = "plan"
+    data: dict[str, Any],
+    incoming: Iterable[Finding],
+    *,
+    scope: str = "plan",
+    reporter: str = "writ",
 ) -> list[Finding]:
     """Write findings to the ledger, keeping the ones already there.
 
@@ -320,6 +324,15 @@ def record_findings(
     revision that resolved it, rather than silently vanishing. That history is
     what makes a repair loop auditable — see the repeat-finding detection in
     `repair.py`.
+
+    `reporter` is who just looked, and it is what decides whose findings this batch
+    may close. Only the party that raised an objection can stop reporting it: writ's
+    deterministic check re-runs every rule it has, so its own silence is evidence;
+    a critic that read the plan again and no longer objects is evidence about *its*
+    finding and nothing else. Without that distinction a critic's objection could
+    never close at all — which is what left a repaired plan carrying every finding
+    the repair had answered — or, worse, one reporter's pass would close another's
+    finding it never looked for.
     """
     store = finding_records(data)
     current = revision(data)
@@ -361,19 +374,18 @@ def record_findings(
         by_key[key] = payload
         written.append(finding)
     for key, payload in by_key.items():
-        if (
-            key not in seen_keys
-            and payload.get("scope") == scope
-            and payload.get("disposition") == "open"
-            and payload.get("source") in ("writ", None)
-        ):
-            # Only Writ's own findings are auto-closed. A critic's or a gate's
-            # objection is not disproved by a deterministic re-check that never
-            # looked for it.
-            payload["disposition"] = "resolved"
-            payload["resolved_at"] = utcnow()
-            payload["resolved_by"] = "writ"
-            payload["resolved_revision"] = current
+        if key in seen_keys or payload.get("scope") != scope:
+            continue
+        if payload.get("source") not in (reporter, None):
+            # Somebody else's objection. A pass by this reporter is not evidence
+            # about a finding it never looked for.
+            continue
+        if not _closeable(payload):
+            continue
+        payload["disposition"] = "resolved"
+        payload["resolved_at"] = utcnow()
+        payload["resolved_by"] = reporter
+        payload["resolved_revision"] = current
     return written
 
 
@@ -382,6 +394,28 @@ def record_findings(
 #: An agent closing its own objection is a claim, not a fact. A human doing it is a
 #: judgement, and judgements stand.
 AGENT_ACTORS = ("adjudicator", "repair-planner", "writ")
+
+
+def _closeable(payload: dict[str, Any]) -> bool:
+    """Whether this reporter's silence may close the finding.
+
+    `open` is the ordinary case. An *agent's* acceptance also closes, and that is
+    the half that was missing: the adjudicator accepts a finding and says which
+    work answers it, and `accepted` is exactly a claim awaiting evidence — the same
+    reasoning `_reopens` uses to overturn it when the finding comes back. A check
+    that then stops reporting it is the evidence, so it becomes `resolved` and the
+    plan stops carrying an objection that has been dealt with.
+
+    A *person's* disposition is left alone in both directions. A human who accepted
+    a known objection, or declined it, has made a judgement, and a check going quiet
+    does not retract a judgement — it only means there is nothing more to weigh.
+    """
+    disposition = payload.get("disposition", "open")
+    if disposition == "open":
+        return True
+    if disposition != "accepted":
+        return False
+    return str(payload.get("disposed_by", "")) in AGENT_ACTORS
 
 
 def _reopens(payload: dict[str, Any]) -> bool:

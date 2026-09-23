@@ -296,6 +296,103 @@ def test_a_finding_that_goes_away_is_resolved_not_deleted(inventoried, project):
         assert records[finding_id]["disposition"] == "resolved"
 
 
+def test_a_critic_that_stops_objecting_closes_its_own_finding(inventoried, project):
+    """The critic read the patched plan and no longer objects. That closes it.
+
+    Nothing could close a critic's finding before this. Auto-closing was restricted
+    to findings writ itself had raised, on the sound reasoning that a deterministic
+    re-check cannot disprove an objection it never looked for — but the restriction
+    was written as "source is writ" rather than "whoever is reporting", so the one
+    party whose silence *is* evidence about the finding could not close it either. A
+    repaired plan went on carrying every objection its repair had answered.
+    """
+    with state.transaction(project) as data:
+        written = plans.record_findings(
+            data,
+            [_critic_finding()],
+            scope="critic:coverage",
+            reporter="critic:coverage",
+        )
+        # The same critic, reading the plan again, with nothing to say about it.
+        plans.record_findings(
+            data, [], scope="critic:coverage", reporter="critic:coverage"
+        )
+        record = plans.get_finding(data, written[0].id)
+    assert record["disposition"] == "resolved"
+    assert record["resolved_by"] == "critic:coverage"
+    assert record["resolved_revision"]
+
+
+def test_one_reporters_silence_does_not_close_anothers_finding(inventoried, project):
+    """Only the party that raised it may stop reporting it.
+
+    A structural re-check never looks for what a critic objected to, so its passing
+    says nothing about that finding. The same in reverse: the acceptance critic's
+    pass is not evidence about what the coverage critic found.
+    """
+    with state.transaction(project) as data:
+        written = plans.record_findings(
+            data,
+            [_critic_finding()],
+            scope="critic:coverage",
+            reporter="critic:coverage",
+        )
+        # Writ's own deterministic pass over the same scope, which did not look.
+        plans.record_findings(data, [], scope="critic:coverage")
+        record = plans.get_finding(data, written[0].id)
+    assert record["disposition"] == "open"
+
+
+def test_an_agents_acceptance_is_resolved_once_the_check_agrees(inventoried, project):
+    """`accepted` by an agent is a claim awaiting evidence. Silence is the evidence.
+
+    The mirror of the reopening rule: if a finding coming back overturns an agent's
+    acceptance, a finding that does not come back settles it. Leaving it `accepted`
+    forever made a repaired plan read as one whose objections had merely been
+    asserted away.
+    """
+    with state.transaction(project) as data:
+        written = plans.record_findings(
+            data,
+            [_critic_finding()],
+            scope="critic:coverage",
+            reporter="critic:coverage",
+        )
+        plans.dispose(
+            data, written[0].id, "accepted", actor="adjudicator", change="added a task"
+        )
+        plans.record_findings(
+            data, [], scope="critic:coverage", reporter="critic:coverage"
+        )
+        record = plans.get_finding(data, written[0].id)
+    assert record["disposition"] == "resolved"
+
+
+def test_a_persons_disposition_is_not_overwritten_by_silence(inventoried, project):
+    """A judgement stands in both directions.
+
+    A person who accepted an objection knowingly, or declined it with evidence, has
+    made a ruling. A check going quiet is not a reason to rewrite whose decision the
+    record says it was.
+    """
+    with state.transaction(project) as data:
+        written = plans.record_findings(
+            data,
+            [_critic_finding()],
+            scope="critic:coverage",
+            reporter="critic:coverage",
+        )
+        plans.dispose(
+            data, written[0].id, "accepted", actor="tim", reason="shipping without it"
+        )
+        plans.record_findings(
+            data, [], scope="critic:coverage", reporter="critic:coverage"
+        )
+        record = plans.get_finding(data, written[0].id)
+    assert record["disposition"] == "accepted"
+    assert record["disposed_by"] == "tim"
+
+
 def test_only_a_blocking_finding_holds_the_plan(inventoried, project):
     data = state.load(project)
     # The committed plan has warnings (the design's generic criteria) and

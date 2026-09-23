@@ -285,6 +285,77 @@ def test_a_revision_leaves_unnamed_fields_alone(objected, project, monkeypatch):
     assert after["requirement_ids"] == requirements
 
 
+#: the commonest plan repair there is: the work a task needs does not exist, so the
+#: patch adds it and points the task at it. Both halves in one patch, which is the
+#: only way to write it — a patch is applied atomically, so there is no earlier one
+#: for the new task to have landed in.
+ADDS_AND_DEPENDS_ON_IT = {
+    "analysis": "M01-002 needs work that is not in the plan",
+    "add_tasks": [
+        {
+            "id": "proposed-queue-depth",
+            "title": "Expose queue depth to the operator",
+            "milestone": "M01",
+            "requirement_ids": ["REQ-003"],
+            "acceptances": [
+                "a failing test in ops/depth_test.go reproduces the missing view",
+                "`go test ./ops` reports queue depth",
+            ],
+            "allowed": ["ops/depth.go", "ops/depth_test.go"],
+        }
+    ],
+    "revise_tasks": [
+        {
+            "id": "M01-002",
+            "depends_on": ["M01-001", "proposed-queue-depth"],
+        }
+    ],
+}
+
+
+def test_a_revision_may_depend_on_a_task_the_same_patch_adds(
+    objected, project, monkeypatch
+):
+    """The patch is one transaction, so the new task's id is only the patch's word.
+
+    This was refused. `unknown-dependency` was judged against the committed graph
+    alone, which cannot contain a task the patch is introducing — so the one shape a
+    missing-dependency finding actually calls for was the one shape writ would not
+    accept, and the adjudicator's only way past the refusal was to drop the edge and
+    leave the finding unrepaired.
+    """
+    patched(monkeypatch, ADDS_AND_DEPENDS_ON_IT)
+    code, _, _ = objected("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics")
+    data = state.load(project)
+    request = repair.requests(data)[-1]
+    assert not request.get("refusals"), request.get("refusals")
+    assert request["status"] == "applied"
+    # And the edge points at the id writ minted, not the one the patch made up.
+    added = request["applied_tasks"][0]
+    assert added in data["tasks"]["M01-002"]["depends_on"]
+    assert "proposed-queue-depth" not in data["tasks"]["M01-002"]["depends_on"]
+    assert code == 0
+
+
+def test_a_revision_still_may_not_depend_on_nothing(objected, project, monkeypatch):
+    """The rule it relaxes, still enforced: a task the patch does not add either."""
+    patched(
+        monkeypatch,
+        {
+            "analysis": "points at thin air",
+            "revise_tasks": [{"id": "M01-002", "depends_on": ["M09-999"]}],
+        },
+    )
+    objected("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics")
+    data = state.load(project)
+    reasons = [
+        reason["category"]
+        for refusal in repair.requests(data)[-1].get("refusals") or []
+        for reason in refusal["reasons"]
+    ]
+    assert "unknown-dependency" in reasons
+
+
 def test_a_revision_may_not_drop_a_criterion(objected, project, monkeypatch):
     """The failure the review warned about: closing a finding by lowering the bar."""
     patched(
@@ -511,6 +582,46 @@ def test_the_loop_stops_at_its_budget(objected, project, monkeypatch):
     assert code == 1
 
 
+def test_a_refused_patch_does_not_spend_a_round(objected, project, monkeypatch):
+    """A refusal is information for the next attempt, not a repair that happened.
+
+    Counting agent runs against the budget instead of landed patches meant two
+    refusals — the one thing writ hands straight back with the reason — exhausted a
+    plan's whole repair allowance. The loop then reported the plan as adjudicated
+    twice when it had not been adjudicated once, and the critics never re-read
+    anything because nothing had changed for them to read.
+    """
+    patched(
+        monkeypatch,
+        [
+            # Refused: the edge points at a task that does not exist and is not
+            # being added either.
+            {
+                "analysis": "first try",
+                "revise_tasks": [{"id": "M01-002", "depends_on": ["M09-999"]}],
+            },
+            # Then the patch that answers the finding.
+            dict(ADDS_THE_TASK),
+        ],
+    )
+    code, out, _ = objected(
+        "adjudicate",
+        "--agent",
+        agent(ADJUDICATOR),
+        "--no-critics",
+        "--max-rounds",
+        "1",
+    )
+    data = state.load(project)
+    applied = [r for r in repair.requests(data) if r["status"] == "applied"]
+    assert applied, out
+    # The refusal is on the record, and the patch after it still landed inside a
+    # budget of one. `MAX_PATCH_ATTEMPTS` is what bounds refusals.
+    assert applied[-1].get("refusals"), applied[-1]
+    assert repair.plan_rounds(data) == 1
+    assert code == 0
+
+
 def test_zero_rounds_adjudicates_nothing(objected, project, monkeypatch):
     patched(monkeypatch, ADDS_THE_TASK)
     code, out, _ = objected(
@@ -522,6 +633,9 @@ def test_zero_rounds_adjudicates_nothing(objected, project, monkeypatch):
         "0",
     )
     assert repair.requests(state.load(project)) == []
+    # Says what happened rather than reporting a budget spent: nothing was tried,
+    # which is not the same fact as a plan that has been repaired to its limit.
+    assert "no repair was allowed" in out
     assert code == 1
 
 
@@ -766,6 +880,44 @@ def test_plan_repair_answers_what_the_critics_found_before_approval(
     record = plans.plan_status(data)
     assert record["status"] == "approved"
     assert record["approved_by"] == "writ --auto-approve"
+
+
+def test_check_stops_listing_what_the_repair_answered(
+    writ, project, design, tmp_path, monkeypatch
+):
+    """The end of the loop, from the reader's side.
+
+    Three things had to be true for this to work and none of them was: the patch
+    had to be accepted, the critic's re-read had to be able to close its own
+    finding, and the adjudicator's `accepted` had to become `resolved` once nothing
+    reported it. Until then `writ check` listed every objection the repair had just
+    answered, which is what a person reads to decide whether to approve.
+    """
+    artifact = tmp_path / "plan.json"
+    artifact.write_text(json.dumps(PLAN), encoding="utf-8")
+    writ("init")
+    monkeypatch.setenv("WRIT_TEST_ONCE", str(tmp_path / "reported"))
+    patched(monkeypatch, ADDS_THE_TASK)
+    writ(
+        "plan", str(design), "--from-plan", str(artifact),
+        "--critics", "coverage", "--critic-agent", agent(CRITIC_ONCE),
+        "--repair", "--adjudicator-agent", agent(ADJUDICATOR),
+        "--quiet",
+    )
+    data = state.load(project)
+    answered = [
+        record["id"]
+        for record in plans.finding_records(data)
+        if record["category"] == "missing-coverage"
+    ]
+    assert answered
+    for finding_id in answered:
+        assert plans.get_finding(data, finding_id)["disposition"] == "resolved"
+    code, out, _ = writ("check")
+    # Not listed, because it is not open — and the plan is no longer held by it.
+    for finding_id in answered:
+        assert finding_id not in out
+    assert code == 0
 
 
 def test_plan_without_repair_leaves_the_findings_standing(

@@ -209,6 +209,10 @@ def loop(
     refused — a refusal is information for the next attempt, and
     `repair.patches_left` bounds those separately.
 
+    The budget counts patches that *landed*, not agent runs. A refused patch changed
+    nothing, so spending the plan's repair allowance on it would stop the loop over
+    a plan that had never been repaired once.
+
     `recheck` is how the critics get re-run between rounds. It is injected rather
     than called directly because that is a command-layer concern — it spends agents,
     it prints, and it belongs to whoever asked for the loop. Without it the loop
@@ -220,9 +224,17 @@ def loop(
     result = Result()
     budget = repair.DEFAULT_MAX_REPAIR_ROUNDS if max_rounds is None else max_rounds
     opened = _blocking_ids(state.load(root))
-    number = 0
+    # Two counters, because a refusal is not a round. `attempt` numbers the agent
+    # runs, so each one gets its own directory and its own place in the record;
+    # `landed` counts the patches that actually changed the plan, which is what the
+    # budget is about. Counting attempts against the budget made two refused patches
+    # spend the whole allowance — the adjudicator was never told what was wrong a
+    # second time, the critics never re-read anything, and the loop stopped saying
+    # the plan had been adjudicated twice when it had not been adjudicated at all.
+    attempt = 0
+    landed = 0
     while True:
-        number += 1
+        attempt += 1
         data = state.load(root)
         blocking = [
             finding
@@ -232,24 +244,28 @@ def loop(
         if not blocking:
             result.stopped = "clean"
             break
-        if number > budget:
+        if landed >= budget:
             result.stopped = (
-                f"the plan has been adjudicated {budget} time(s), its budget. What "
-                "is still open needs a decision rather than another patch."
+                (
+                    f"the plan has been repaired {landed} time(s), its budget. What "
+                    "is still open needs a decision rather than another patch."
+                )
+                if landed
+                else "no repair was allowed (--max-rounds 0), so nothing was tried."
             )
             break
         stop = repair.plan_exhausted(data, max_rounds=budget)
-        if stop and number > 1:
+        if stop and attempt > 1:
             result.stopped = stop
             break
         round_ = _one_round(
             root=root,
             doc=doc,
-            directory=directory / f"round-{number}",
+            directory=directory / f"round-{attempt}",
             resolved=resolved,
             timeout=timeout,
             cwd=cwd,
-            number=number,
+            number=attempt,
             blocking=blocking,
             stream=stream,
             on_start=on_start,
@@ -277,11 +293,13 @@ def loop(
                 )
                 break
             continue
-        if round_.progressed and recheck is not None:
-            # The patch landed, so every critic that passed the old revision has now
-            # reviewed something else. Re-running them is what closes a finding on
-            # evidence rather than on the patch's word.
-            recheck()
+        if round_.progressed:
+            landed += 1
+            if recheck is not None:
+                # The patch landed, so every critic that passed the old revision has
+                # now reviewed something else. Re-running them is what closes a
+                # finding on evidence rather than on the patch's word.
+                recheck()
     data = state.load(root)
     still_open = _blocking_ids(data)
     result.resolved = len(opened - still_open)
