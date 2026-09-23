@@ -527,6 +527,96 @@ def test_a_valid_patch_is_applied_and_closes_the_request(approved, project):
         assert plans.revision(data) > before
 
 
+def test_two_tasks_added_to_one_milestone_get_two_ids(approved, project):
+    """The collision that rolled back a real round-3 patch.
+
+    `_next_repair_id` reads the ids already in the plan, and the loop that mints
+    them used to run to completion before the loop that inserts them. So two tasks
+    added to one milestone both saw the same graph and minted the same id: the
+    first insert succeeded, the second raised `task M06-006 already exists`, and
+    the whole patch rolled back naming an id that was nowhere in the plan.
+    """
+    request_id, finding_id = _request(project)
+    with state.transaction(project) as data:
+        request = repair.get_request(data, request_id)
+        patch = repair.load_patch(json.dumps({
+            "base_revision": plans.revision(data),
+            "add_tasks": [
+                {
+                    "id": "first",
+                    "title": "Reinforce the seam on a confirmed read",
+                    "milestone": "M02",
+                    "resolves_findings": [finding_id],
+                    "acceptances": ["`go test ./internal/store` passes"],
+                },
+                {
+                    "id": "second",
+                    "title": "Forget what the policy says to forget",
+                    "milestone": "M02",
+                    # The second task orders itself after the first, which is only
+                    # expressible if the two have distinct ids.
+                    "depends_on": ["first"],
+                    "acceptances": ["`go test ./internal/policy` passes"],
+                },
+            ],
+            "dispositions": [
+                {"finding_id": finding_id, "resolution": "accepted",
+                 "change": "added both"}
+            ],
+        }))
+        assert [f.line() for f in repair.validate(data, patch, request) if f.blocking] == []
+        applied = repair.apply_patch(data, patch, request, actor="planner")
+        minted = applied["tasks"]
+        assert len(minted) == 2, minted
+        assert len(set(minted)) == 2, f"both tasks minted {minted}"
+        for task_id in minted:
+            assert task_id in data["tasks"]
+        # And the edge between them survived the translation from proposed ids.
+        assert minted[0] in data["tasks"][minted[1]]["depends_on"]
+
+
+def test_a_patch_may_not_use_one_id_for_two_tasks(approved, project):
+    """`translate` is keyed on the proposed id, so the second would erase the first.
+
+    A patch like this used to apply cleanly: both tasks were created, but every
+    edge naming the shared id pointed at whichever task registered last, and the
+    other was left unreachable — an ordering silently dropped from a patch written
+    to add it.
+    """
+    request_id, finding_id = _request(project)
+    with state.transaction(project) as data:
+        request = repair.get_request(data, request_id)
+        patch = repair.load_patch(json.dumps({
+            "base_revision": plans.revision(data),
+            "add_tasks": [
+                {
+                    "id": "same",
+                    "title": "One piece of work",
+                    "milestone": "M02",
+                    "resolves_findings": [finding_id],
+                    "acceptances": ["`go test ./internal/store` passes"],
+                },
+                {
+                    "id": "same",
+                    "title": "A different piece of work",
+                    "milestone": "M02",
+                    "acceptances": ["`go test ./internal/policy` passes"],
+                },
+            ],
+            "dispositions": [
+                {"finding_id": finding_id, "resolution": "accepted",
+                 "change": "added both"}
+            ],
+        }))
+        findings = repair.validate(data, patch, request)
+        collisions = [
+            f for f in findings
+            if f.blocking and f.category == "task-collision"
+        ]
+        assert collisions, [f.line() for f in findings]
+        assert "two tasks under the id same" in collisions[0].message
+
+
 # --------------------------------------------------------------------------
 # reporting
 

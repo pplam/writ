@@ -685,6 +685,41 @@ def test_an_adjudicator_that_writes_nothing_stops_the_loop(
     assert request["status"] == "open"
 
 
+def test_a_patch_that_cannot_be_applied_leaves_the_request_open(
+    objected, project, monkeypatch
+):
+    """The failure that stranded a real plan at `needs-approval`.
+
+    `apply_patch` was the one call in the round not wrapped: a patch that passed
+    validation and then raised on the way in took the exception out through `loop`,
+    so `writ adjudicate` died printing `repair did not run: task M06-006 already
+    exists` and left the request at `planning` — a status that is neither finished
+    nor retryable by anything. The plan could not be repaired and could not be
+    tried again.
+
+    The raise is simulated rather than reproduced: the id collision that caused it
+    is fixed in `repair._next_repair_id`, and what this test is about is that *any*
+    apply failure is survivable.
+    """
+    patched(monkeypatch, ADDS_THE_TASK)
+
+    def explode(data, patch, request, **kwargs):
+        raise WritError("task M01-003 already exists")
+
+    monkeypatch.setattr(repair, "apply_patch", explode)
+    code, out, err = objected("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics")
+    assert repair.apply_patch is explode
+    text = out + err
+    # Named as writ's failure, not the adjudicator's: it wrote a patch writ accepted.
+    assert "could not be applied" in text, text
+    assert "adjudicator failed" not in text, text
+    # And the request is retryable rather than stuck mid-planning.
+    request = repair.requests(state.load(project))[0]
+    assert request["status"] == "open", request["status"]
+    # Nothing half-applied: the transaction rolled back.
+    assert "proposed-queue-depth" not in state.load(project)["tasks"]
+
+
 def test_a_question_stops_the_loop_and_reaches_the_decision_log(
     objected, project, monkeypatch
 ):

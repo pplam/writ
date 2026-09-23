@@ -281,7 +281,15 @@ def loop(
             )
             break
         if round_.error:
-            result.stopped = f"the adjudicator failed: {round_.error}"
+            # Named for whose failure it was. A patch writ validated and then could
+            # not apply is writ's bug, and telling someone their adjudicator failed
+            # sends them to read a transcript of an agent that did nothing wrong.
+            whose = (
+                "the repair could not be applied"
+                if round_.error.startswith("the patch could not be applied")
+                else "the adjudicator failed"
+            )
+            result.stopped = f"{whose}: {round_.error}"
             break
         if round_.refused and not round_.progressed:
             request = _open_request(root)
@@ -392,37 +400,55 @@ def _one_round(
         round_.error = f"unusable patch: {exc}"
         _reopen(root, request_id)
         return round_
-    with state.transaction(root) as data:
-        request = repair.get_request(data, request_id)
-        found = repair.validate(data, patch, request)
-        refused = [finding for finding in found if finding.blocking]
-        if refused:
-            round_.refused = refused
-            request["status"] = "open"
-            request.setdefault("refusals", []).append(
-                {
-                    "at": utcnow(),
-                    "round": number,
-                    "reasons": [finding.to_dict() for finding in refused],
-                }
+    # `validate` decides what may be applied, so a patch that fails *during* apply
+    # has broken an invariant validation does not cover — writ's bug, not the
+    # adjudicator's. It still must not take the loop down with it: raising here
+    # escaped `loop` entirely, so `writ adjudicate` died on the round, printed
+    # `repair did not run`, and left the request at `planning` with no attempt on
+    # its record. The plan was then stuck: unrepaired, and out of anything that
+    # would try again. A round that cannot apply is a failed round, which is what
+    # every other failure in this function already is.
+    try:
+        with state.transaction(root) as data:
+            request = repair.get_request(data, request_id)
+            found = repair.validate(data, patch, request)
+            refused = [finding for finding in found if finding.blocking]
+            if refused:
+                round_.refused = refused
+                request["status"] = "open"
+                request.setdefault("refusals", []).append(
+                    {
+                        "at": utcnow(),
+                        "round": number,
+                        "reasons": [finding.to_dict() for finding in refused],
+                    }
+                )
+                return round_
+            if patch.empty and patch.questions:
+                round_.questions = list(patch.questions)
+                _raise_questions(data, patch, request)
+                return round_
+            round_.applied = repair.apply_patch(
+                data, patch, request, actor="adjudicator"
             )
-            return round_
-        if patch.empty and patch.questions:
-            round_.questions = list(patch.questions)
-            _raise_questions(data, patch, request)
-            return round_
-        round_.applied = repair.apply_patch(
-            data, patch, request, actor="adjudicator"
-        )
-        # Deterministic checks run against the patched plan immediately. A patch that
-        # closed one finding and opened another says so here, before the critics are
-        # spent on it.
-        plans.run_check(data, root=root.resolve())
-        round_.blocking_after = sum(
-            1
-            for finding in plans.findings(data, open_only=True)
-            if finding.severity == "error"
-        )
+            # Deterministic checks run against the patched plan immediately. A patch
+            # that closed one finding and opened another says so here, before the
+            # critics are spent on it.
+            plans.run_check(data, root=root.resolve())
+            round_.blocking_after = sum(
+                1
+                for finding in plans.findings(data, open_only=True)
+                if finding.severity == "error"
+            )
+    except WritError as exc:
+        # The transaction rolled back on the way out, so no half-applied patch is
+        # in the store and the round left the plan as it found it.
+        round_.error = f"the patch could not be applied: {exc}"
+        # Not `None`: `progressed` reads this, and a round that applied nothing is
+        # a round that changed nothing.
+        round_.applied = {}
+        _reopen(root, request_id)
+        return round_
     return round_
 
 

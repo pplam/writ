@@ -801,6 +801,7 @@ def _validate_new_tasks(
     existing = data.get("tasks", {})
     proposed_ids = {str(entry.get("id", "")) for entry in patch.add_tasks}
     known_requirements = set(data.get("requirements", {}))
+    seen_refs: set[str] = set()
     for index, entry in enumerate(patch.add_tasks):
         where = f"{request['id']}.add_tasks[{index}]"
         ref = str(entry.get("id", "")).strip()
@@ -816,6 +817,26 @@ def _validate_new_tasks(
                     source="writ",
                 )
             )
+        if ref and ref in seen_refs:
+            # Two entries under one id. `translate` is keyed on the proposed id, so
+            # the second would overwrite the first and every edge naming it would
+            # point at one task while the other became unreachable — a patch that
+            # applies cleanly and quietly drops an ordering it was written to add.
+            found.append(
+                Finding(
+                    severity="error",
+                    category="task-collision",
+                    message=(
+                        f"proposes two tasks under the id {ref}; each needs its own, "
+                        "because the edges in this patch name them"
+                    ),
+                    where=where,
+                    suggested_action="give the second task a distinct id",
+                    source="writ",
+                )
+            )
+        if ref:
+            seen_refs.add(ref)
         if ref and ref in existing:
             found.append(
                 Finding(
@@ -1096,7 +1117,11 @@ def apply_patch(
         # gate, so the patch says where the task belongs and an unplaced one falls
         # back to `R-00n`.
         into = milestone_id or (str(entry.get("milestone", "")).strip() or None)
-        task_id = _next_repair_id(data, into if into in data.get("milestones", {}) else None)
+        task_id = _next_repair_id(
+            data,
+            into if into in data.get("milestones", {}) else None,
+            minted=added,
+        )
         ref = str(entry.get("id", "")).strip()
         if ref:
             translate[ref] = task_id
@@ -1272,24 +1297,29 @@ def _apply_revisions(
     return revised
 
 
-def _next_repair_id(data: dict[str, Any], milestone_id: str | None) -> str:
+def _next_repair_id(
+    data: dict[str, Any],
+    milestone_id: str | None,
+    minted: Iterable[str] = (),
+) -> str:
     """The next free task id, numbered into its milestone like any other task.
 
     A repair is ordinary work and is numbered as such. Nothing downstream should
     have to know a task arrived by patch — that is what the `repair` record on the
     task is for.
+
+    `minted` is the ids this same patch has already claimed but not yet inserted.
+    Without it, two tasks a patch adds to one milestone both read the same
+    `data["tasks"]` and mint the same id: the first insert succeeds, the second
+    raises `task M06-006 already exists`, and the patch rolls back naming an id
+    that is nowhere in the plan. Which is a confusing way to say "twice", so the
+    ids a patch has handed out count as taken.
     """
-    if milestone_id:
-        prefix = f"{milestone_id}-"
-        taken = [
-            int(task_id[len(prefix) :])
-            for task_id in data["tasks"]
-            if task_id.startswith(prefix) and task_id[len(prefix) :].isdigit()
-        ]
-        return f"{prefix}{(max(taken) + 1) if taken else 1:03d}"
+    claimed = set(data["tasks"]) | {str(task_id) for task_id in minted}
+    prefix = f"{milestone_id}-" if milestone_id else "R-"
     taken = [
-        int(task_id[len("R-") :])
-        for task_id in data["tasks"]
-        if task_id.startswith("R-") and task_id[len("R-") :].isdigit()
+        int(task_id[len(prefix) :])
+        for task_id in claimed
+        if task_id.startswith(prefix) and task_id[len(prefix) :].isdigit()
     ]
-    return f"R-{(max(taken) + 1) if taken else 1:03d}"
+    return f"{prefix}{(max(taken) + 1) if taken else 1:03d}"
