@@ -22,6 +22,7 @@ never the session's.
 """
 from __future__ import annotations
 
+import json
 import os
 import signal
 import threading
@@ -32,7 +33,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from . import agents, gates, plans, repair, runner, state
+from . import agents, failures, gates, plans, procs, repair, runner, state
 from .model import acceptance_summary, effective_status, rework_attempts
 from .state import WritError, utcnow
 
@@ -47,6 +48,15 @@ GRACE_SECONDS = 5.0
 #: be the limit. Below that it changes almost nothing, so `id` stays the default.
 ORDERS = ("id", "depth", "unlocks")
 DEFAULT_ORDER = "id"
+
+#: How each role is tagged when its output is mirrored to the terminal. Padded to
+#: one width so the labels form a column and the agents' own text stays aligned.
+ROLE_TAGS = {
+    "agent": "impl  ",
+    "reviewer": "review",
+    "gate": "gate  ",
+    "repair": "repair",
+}
 
 
 @dataclass
@@ -132,10 +142,39 @@ class Outcome:
     refused: str = ""
     #: gate findings recorded by this run
     findings: list[str] = field(default_factory=list)
+    #: what kind of failure this was, if it was one — see `failures`. An empty
+    #: string means the job ran and whatever it produced is a statement about the
+    #: work rather than about the machinery.
+    category: str = ""
+    #: whether another attempt could succeed with nothing else changing
+    retryable: bool = False
+    #: the classified failure as one line, when the failure was not a judgement
+    #: of the work. Kept apart from `error`: `error` is a session error and makes
+    #: `writ run` exit non-zero, and an outage the scheduler is retrying is
+    #: neither of those — it still has to be *said*, which is what this is for.
+    failure_reason: str = ""
+    #: how many infrastructure retries this task has had, counted from the store
+    infra_attempt: int = 0
+    #: seconds until this job is retried, when the scheduler granted one
+    retry_in: float | None = None
 
     @property
     def ok(self) -> bool:
         return self.error is None and self.exit_code == 0
+
+    @property
+    def on_merit(self) -> bool:
+        """Whether this outcome says anything about the quality of the work.
+
+        False for every infrastructure failure. The distinction is what keeps the
+        session summary honest: a task that never got an agent in front of it has
+        not failed its acceptance criteria, and reporting it in the same list as
+        one that did is how a broken provider comes to look like bad code.
+        """
+        return not self.category or self.category in (
+            failures.TASK,
+            failures.REJECTION,
+        )
 
 
 @dataclass
@@ -163,6 +202,14 @@ class Session:
     #: repair budget. The run is not finished when one of these is outstanding —
     #: it is waiting, which is a different thing and has to read differently.
     held: list[str] = field(default_factory=list)
+    #: tasks retried because the machinery around them failed. Kept apart from
+    #: `failed` and from `reworked`: nobody read this work, so it is neither a
+    #: rejection nor a judgement, and counting it as either is what made a broken
+    #: provider look like a failing implementation.
+    infra_retries: list[str] = field(default_factory=list)
+    #: tasks that ran out of infrastructure retries. Outstanding work, not failed
+    #: work — the difference a person needs in order to know what to fix.
+    infra_blocked: list[str] = field(default_factory=list)
     stopped: bool = False
     aborted: bool = False
     started_at: str = field(default_factory=utcnow)
@@ -177,6 +224,126 @@ class Stop(Exception):
     """Raised inside the scheduler when the operator asks it to stop."""
 
 
+@dataclass
+class _Retry:
+    """One job waiting out a backoff before its next infrastructure attempt."""
+
+    job: Job
+    #: monotonic time at which it may run again
+    ready_at: float
+    #: which infrastructure attempt this will be, 1-based
+    attempt: int
+    #: the delay that was granted, for the log
+    delay: float
+
+
+class _Retries:
+    """The infrastructure retry budget, and the jobs currently waiting on it.
+
+    Separate from the rework budget on purpose, and this is the whole point of
+    issue 4: rework is what a task spends when a reviewer reads its work and says
+    no. A provider timeout, a subprocess that would not spawn, a state lock that
+    could not be taken — none of those are readings of the work, and charging them
+    to rework both robs the task of attempts it never used and makes the eventual
+    failure read as a technical rejection that never happened.
+
+    Budget is per task rather than per session. A session with one flaky task
+    should not exhaust the allowance that a second, unrelated flaky task would
+    need, and the count each task has spent is read back from the store, so a
+    resumed session does not hand out a fresh allowance for retries already made.
+    """
+
+    def __init__(self, *, budget: int) -> None:
+        self.budget = max(0, budget)
+        self._waiting: dict[str, _Retry] = {}
+        #: attempts made for failures that never produced a run record, keyed by
+        #: ledger key. `prepare` failing is the case: there is nothing durable to
+        #: count, because nothing was claimed.
+        self._unrecorded: dict[str, int] = {}
+
+    def schedule(
+        self,
+        job: Job,
+        session: Session,
+        emit: Callable[[str, dict[str, Any]], None],
+        *,
+        outcome: Outcome | None = None,
+    ) -> bool:
+        """Grant this job another attempt, or report the budget spent.
+
+        The attempt number comes from the store when there is a run record to
+        read it from (`outcome.infra_attempt`, written by `runner.reconcile`), and
+        from an in-process tally only for failures that never got that far.
+        """
+        if self.budget <= 0:
+            return False
+        if outcome is not None and outcome.infra_attempt:
+            attempt = outcome.infra_attempt
+        else:
+            attempt = self._unrecorded.get(job.key, 0) + 1
+            self._unrecorded[job.key] = attempt
+        if attempt > self.budget:
+            return False
+        delay = failures.backoff(attempt)
+        self._waiting[job.task_id] = _Retry(
+            job=job,
+            ready_at=time.monotonic() + delay,
+            attempt=attempt,
+            delay=delay,
+        )
+        session.infra_retries.append(job.task_id)
+        emit(
+            "retrying",
+            {
+                "task": job.task_id,
+                "role": job.role,
+                "attempt": attempt,
+                "budget": self.budget,
+                "in": round(delay, 1),
+                "reason": (
+                    (outcome.failure_reason or outcome.error) if outcome else ""
+                ) or "",
+                "category": (outcome.category if outcome else "") or "",
+            },
+        )
+        return True
+
+    def delay_for(self, job: Job) -> float | None:
+        entry = self._waiting.get(job.task_id)
+        return None if entry is None else entry.delay
+
+    def due(self) -> Job | None:
+        """A job whose backoff has elapsed, removed from the queue."""
+        now = time.monotonic()
+        for task_id, entry in sorted(self._waiting.items()):
+            if entry.ready_at <= now:
+                del self._waiting[task_id]
+                return entry.job
+        return None
+
+    def pending(self) -> list[str]:
+        """Tasks that must not be selected while they wait.
+
+        Handed to `next_job` as busy. A task waiting out a backoff is not idle —
+        it has an attempt queued — and letting the selector pick it up again in
+        another role would run two things against it at once.
+        """
+        return list(self._waiting)
+
+    def waiting(self) -> bool:
+        return bool(self._waiting)
+
+    def wait(self, stop: threading.Event, abort: threading.Event) -> None:
+        """Sleep until the next retry comes due, or until the operator intervenes."""
+        if not self._waiting:  # pragma: no cover - guarded by the caller
+            return
+        deadline = min(entry.ready_at for entry in self._waiting.values())
+        while time.monotonic() < deadline:
+            if stop.is_set() or abort.is_set():
+                return
+            time.sleep(0.05)
+
+
 # --------------------------------------------------------------------------
 # session ownership
 
@@ -185,44 +352,144 @@ def _session_path(root: Path) -> Path:
     return state.store_dir(root) / "run.session"
 
 
+#: the identity this process wrote into the session file, so release can tell its
+#: own claim from a claim that replaced it. Process-wide because the session is:
+#: one `writ run` per process is the thing being enforced.
+_session_claim: procs.Identity | None = None
+
+
 def claim_session(root: Path, *, force: bool = False) -> None:
     """Refuse to start while another `writ run` owns this project.
 
     Two schedulers would each believe they were the only selector, which is
     exactly the double-dispatch this design avoids within one process.
+
+    The claim is made by *creating* the file, not by checking and then writing it.
+    The old order — read the pid, probe it, write ours — is a race with a window
+    wide enough to lose: two processes starting together both read a stale file,
+    both find its pid dead, and both write themselves in. One overwrites the
+    other, and the file that is supposed to prevent double dispatch records a
+    single owner while two schedulers select from the same graph.
+
+    `O_CREAT | O_EXCL` moves the decision into the kernel, so exactly one of them
+    creates it. The loser looks at what is there and decides whether it is a live
+    owner (refuse) or a dead one's leavings (take it over).
     """
+    global _session_claim
     path = _session_path(root)
-    if path.exists():
-        try:
-            existing = int(path.read_text(encoding="utf-8").split()[0])
-        except (ValueError, IndexError, OSError):
-            existing = None
-        if existing and runner.process_alive(existing) and not force:
-            raise WritError(
-                f"another writ run is active (pid {existing}). Wait for it, stop "
-                f"it, or pass --force if you know it is gone."
-            )
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"{os.getpid()} {utcnow()}\n", encoding="utf-8")
+    identity = procs.identify()
+    payload = json.dumps({**identity.to_dict(), "at": utcnow()}) + "\n"
+    # Written first, linked into place second. Creating the file and then writing
+    # it leaves a window in which the claim exists but is empty, and a rival
+    # arriving inside that window reads no owner — which is indistinguishable from
+    # a claim left by a process that died before it could write one. `os.link`
+    # closes the window: the name appears already holding the identity, and the
+    # link itself fails if the name is taken.
+    staging = path.with_name(f"{path.name}.{identity.token}")
+    staging.write_text(payload, encoding="utf-8")
+    try:
+        while True:
+            try:
+                os.link(staging, path)
+            except FileExistsError:
+                owner = _session_owner(path)
+                if owner is not None and not force and not procs.confirmed_dead(owner):
+                    raise WritError(
+                        f"another writ run is active ({owner.described}). Wait for "
+                        f"it, stop it, or pass --force if you know it is gone."
+                    ) from None
+                if owner is None and not _abandoned_claim(path):
+                    # Unreadable, and too new to be debris. Something is writing
+                    # it right now by a route this build does not use; refuse
+                    # rather than assume the project is free.
+                    raise WritError(
+                        f"another writ run is starting (unreadable claim at "
+                        f"{path}). Wait for it, or pass --force if you know it "
+                        "is gone."
+                    ) from None
+                # The owner is provably gone, or the operator has overruled it.
+                # Remove the claim and go round again rather than writing over it
+                # in place: if a third process wins the re-creation, this one must
+                # lose to it too, which an in-place write would not respect.
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                continue
+            _session_claim = identity
+            return
+    finally:
+        try:
+            staging.unlink()
+        except FileNotFoundError:  # pragma: no cover - defensive
+            pass
+
+
+#: how long an unreadable claim is given the benefit of the doubt. Only reached by
+#: a claim written by something other than this build, since `claim_session` now
+#: publishes the file and its contents in one step.
+UNREADABLE_CLAIM_GRACE_SECONDS = 10.0
+
+
+def _abandoned_claim(path: Path) -> bool:
+    """Whether an unreadable claim is old enough to be debris rather than a race."""
+    try:
+        age = time.time() - path.stat().st_mtime
+    except OSError:  # pragma: no cover - raced with its own removal
+        return True
+    return age > UNREADABLE_CLAIM_GRACE_SECONDS
 
 
 def release_session(root: Path) -> None:
+    """Drop this process's claim, and only this process's claim.
+
+    A `--force` start deletes a claim whose owner it believes dead. If that owner
+    is in fact alive and later releases, an unconditional unlink deletes the
+    *new* session's file — leaving a live run with nothing recording it, and the
+    next `writ run` free to start alongside it.
+    """
+    global _session_claim
+    path = _session_path(root)
+    claim = _session_claim
+    if claim is not None:
+        owner = _session_owner(path)
+        if owner is not None and owner.token and owner.token != claim.token:
+            _session_claim = None
+            return
+    _session_claim = None
     try:
-        _session_path(root).unlink()
+        path.unlink()
     except FileNotFoundError:
         pass
 
 
-def active_session(root: Path) -> int | None:
-    """The pid of a live `writ run`, if there is one."""
-    path = _session_path(root)
-    if not path.exists():
+def _session_owner(root_or_path: Path) -> procs.Identity | None:
+    """The identity in a session file, accepting the older `<pid> <time>` form."""
+    path = root_or_path
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not text:
         return None
     try:
-        pid = int(path.read_text(encoding="utf-8").split()[0])
-    except (ValueError, IndexError, OSError):
+        return procs.normalize(json.loads(text))
+    except json.JSONDecodeError:
+        return procs.normalize(text)
+
+
+def active_session(root: Path) -> int | None:
+    """The pid of a live `writ run`, if there is one.
+
+    Identity-checked: a session file whose pid has been recycled by an unrelated
+    process is not a live run, and reporting it as one is a refusal to start that
+    no amount of waiting will clear.
+    """
+    owner = _session_owner(_session_path(root))
+    if owner is None:
         return None
-    return pid if runner.process_alive(pid) else None
+    return owner.pid if procs.alive(owner) else None
 
 
 # --------------------------------------------------------------------------
@@ -279,6 +546,12 @@ def next_job(
     # that is merely available.
     for request in repair.open_requests(data):
         if request.get("status") not in ("open", "planning"):
+            continue
+        if repair.is_plan_request(request):
+            # A plan-scoped request has no gate to dispatch against. It belongs to
+            # `writ adjudicate`, which runs before execution; reaching it here would
+            # mean a plan was approved mid-adjudication, and the repair it is still
+            # waiting for is not this scheduler's to plan.
             continue
         if not repair.patches_left(request):
             # Writ has refused everything this planner proposed. The gate is held
@@ -466,11 +739,27 @@ def run(
     cwd: str | None = None,
     agent_args: list[str] | None = None,
     max_rework: int | None = None,
+    max_infra_retries: int | None = None,
     on_event: Callable[[str, dict[str, Any]], None] | None = None,
+    stream: bool = False,
+    lock: threading.Lock | None = None,
 ) -> Session:
-    """Walk the DAG until it runs out of work, an error stops it, or you do."""
+    """Walk the DAG until it runs out of work, an error stops it, or you do.
+
+    With `stream`, each agent's own output is mirrored to this terminal as it
+    arrives, every line labelled with the task and role it came from. The progress
+    log from `on_event` is interleaved with it and remains the thing that says what
+    happened; the mirror is there so a long run is visibly working rather than
+    silent for ten minutes. Transcripts are written either way.
+    """
     session = Session()
     emit = on_event or (lambda name, payload: None)
+    # One lock for the whole session: every worker mirrors to this one terminal, and
+    # a per-run lock would not stop two runs interleaving. The caller passes its own
+    # when it also writes there — `writ run` prints a progress log to the same
+    # terminal, and a transition line spliced into an agent's sentence would be the
+    # very thing the lock exists to prevent.
+    mirror_lock = (lock or threading.Lock()) if stream else None
 
     # The approval gate. Checked here rather than only in the CLI so that any
     # caller of `run` — the supervisor, the server, a test — is held to it: an
@@ -494,14 +783,110 @@ def run(
 
     in_flight: dict[Future[Outcome], Job] = {}
     started: list[str] = []
+    retries = _Retries(
+        budget=(
+            failures.DEFAULT_MAX_INFRA_RETRIES
+            if max_infra_retries is None
+            else max_infra_retries
+        )
+    )
     pool = ThreadPoolExecutor(max_workers=max(1, parallel))
+
+    def launch(job: Job, *, retry: bool = False) -> None:
+        """Prepare one job and hand it to a worker.
+
+        Shared by first attempts and infrastructure retries, because a retry is
+        the same job run again: a fresh run record, a fresh prompt, and the task
+        back in the status `prepare` claims from. Nothing about the *work* is
+        different, which is the reason this is not its own code path.
+        """
+        try:
+            run_id, resolved = _prepare(
+                root,
+                job,
+                agent=agent,
+                model=model,
+                reviewer=reviewer,
+                reviewer_model=reviewer_model,
+                reviewer_timeout=reviewer_timeout,
+                timeout=timeout,
+                cwd=cwd,
+                agent_args=agent_args or [],
+                max_rework=max_rework,
+            )
+        except WritError as exc:
+            # Claiming the task failed, so there is no run to reconcile — nothing
+            # was ever written down. Some of these are still infrastructure: a
+            # state lock that timed out says nothing about the task, and treating
+            # it as a job that cannot run abandons a perfectly good task for the
+            # rest of the session.
+            failure = failures.classify(exc)
+            if failure.retryable and retries.schedule(job, session, emit):
+                return
+            # A job that cannot even be started is recorded and skipped, not
+            # allowed to stall the whole walk. It must be marked attempted in the
+            # ledger for its own role: a failed review leaves the task at
+            # `awaiting-review`, which is the state that selected it, so anything
+            # else re-selects it forever. The same is true of a repair job, whose
+            # request stays open.
+            session.errors.append(f"{job.task_id}: {exc}")
+            emit(
+                "error",
+                {
+                    "task": job.task_id,
+                    "message": str(exc),
+                    "category": failure.category,
+                },
+            )
+            if job.role == "reviewer":
+                session.review_attempts.append(job.key)
+            else:
+                started.append(job.key)
+            return
+        if job.role == "agent":
+            started.append(job.key)
+            session.dispatched.append(job.task_id)
+        elif job.role == "gate":
+            started.append(job.key)
+            session.gated.append(job.task_id)
+        elif job.role == "repair":
+            started.append(job.key)
+        else:
+            session.reviewed.append(job.task_id)
+            session.review_attempts.append(job.key)
+        emit(
+            "started",
+            {
+                "task": job.task_id,
+                "role": job.role,
+                "run": run_id,
+                "command": resolved.display,
+                "attempt": job.attempt,
+                "retry": retry,
+                "in_flight": len(in_flight) + 1,
+            },
+        )
+        future = pool.submit(
+            _execute, root, job, run_id, stream=stream, lock=mirror_lock
+        )
+        in_flight[future] = job
+
     try:
         while True:
             while not stop.is_set() and len(in_flight) < max(1, parallel):
+                # Retries first, and only ones whose backoff has elapsed. A job
+                # waiting out a provider failure is not selectable by `next_job` —
+                # its ledger key is still spent — so nothing else will pick it up,
+                # and taking it before new work keeps a stalled task from being
+                # overtaken by the whole rest of the graph.
+                job = retries.due()
+                if job is not None:
+                    launch(job, retry=True)
+                    continue
                 data = state.load(root)
                 job = next_job(
                     data,
-                    busy=[j.task_id for j in in_flight.values()],
+                    busy=[j.task_id for j in in_flight.values()] + retries.pending(),
                     budget=max_tasks,
                     started=started,
                     reviewed=session.review_attempts,
@@ -509,69 +894,25 @@ def run(
                 )
                 if job is None:
                     break
-                try:
-                    prepared = _prepare(
-                        root,
-                        job,
-                        agent=agent,
-                        model=model,
-                        reviewer=reviewer,
-                        reviewer_model=reviewer_model,
-                        reviewer_timeout=reviewer_timeout,
-                        timeout=timeout,
-                        cwd=cwd,
-                        agent_args=agent_args or [],
-                        max_rework=max_rework,
-                    )
-                except WritError as exc:
-                    # A job that cannot even be started is recorded and skipped,
-                    # not allowed to stall the whole walk. It must be marked
-                    # attempted in the ledger for its own role: a failed review
-                    # leaves the task at `awaiting-review`, which is the state
-                    # that selected it, so anything else re-selects it forever.
-                    # The same is true of a repair job, whose request stays open.
-                    session.errors.append(f"{job.task_id}: {exc}")
-                    emit("error", {"task": job.task_id, "message": str(exc)})
-                    if job.role == "reviewer":
-                        session.review_attempts.append(job.key)
-                    else:
-                        started.append(job.key)
-                    continue
-                run_id, resolved = prepared
-                if job.role == "agent":
-                    started.append(job.key)
-                    session.dispatched.append(job.task_id)
-                elif job.role == "gate":
-                    started.append(job.key)
-                    session.gated.append(job.task_id)
-                elif job.role == "repair":
-                    started.append(job.key)
-                else:
-                    session.reviewed.append(job.task_id)
-                    session.review_attempts.append(job.key)
-                emit(
-                    "started",
-                    {
-                        "task": job.task_id,
-                        "role": job.role,
-                        "run": run_id,
-                        "command": resolved.display,
-                        "attempt": job.attempt,
-                        "in_flight": len(in_flight) + 1,
-                    },
-                )
-                future = pool.submit(_execute, root, job, run_id)
-                in_flight[future] = job
+                launch(job)
 
             if not in_flight:
-                # Nothing running and nothing selectable: the walk is over. That is
-                # a weaker claim than it used to be, and it holds only because
-                # everything a finished job can create — a gate becoming ready, a
-                # repair request, the tasks a repair adds — is committed inside that
-                # job's own transaction before it returns. So by the time this line
-                # is reached, `next_job` has already had the chance to see it. The
-                # run ends with work outstanding only when that work needs a person,
-                # and `summary` says which of those it is rather than reporting the
+                if retries.waiting() and not stop.is_set() and not abort.is_set():
+                    # Nothing to do but wait out a backoff. Slept in short slices
+                    # so ^C still lands, and so a retry that comes due while the
+                    # pool is idle is taken promptly rather than at the end of a
+                    # long sleep.
+                    retries.wait(stop, abort)
+                    continue
+                # Nothing running, nothing selectable, nothing waiting to be
+                # retried: the walk is over. That is a weaker claim than it used
+                # to be, and it holds only because everything a finished job can
+                # create — a gate becoming ready, a repair request, the tasks a
+                # repair adds — is committed inside that job's own transaction
+                # before it returns. So by the time this line is reached,
+                # `next_job` has already had the chance to see it. The run ends
+                # with work outstanding only when that work needs a person, and
+                # `summary` says which of those it is rather than reporting the
                 # project as done.
                 break
 
@@ -579,6 +920,21 @@ def run(
             for future in done:
                 job = in_flight.pop(future)
                 outcome = future.result()
+                if outcome.retryable:
+                    # The machinery failed, not the work. Another attempt comes
+                    # out of the infrastructure budget, never the rework budget:
+                    # no reviewer read this task, so it has not used up a chance
+                    # to satisfy its criteria.
+                    if retries.schedule(job, session, emit, outcome=outcome):
+                        outcome.retry_in = retries.delay_for(job)
+                    else:
+                        runner.mark_infrastructure_exhausted(
+                            root,
+                            job.task_id,
+                            outcome.failure_reason
+                            or outcome.error
+                            or "repeated failures",
+                        )
                 _record(session, outcome)
                 emit("finished", _finished_payload(outcome))
 
@@ -640,18 +996,52 @@ def _prepare(
     return run_id, resolved
 
 
-def _execute(root: Path, job: Job, run_id: str) -> Outcome:
+def _label(job: Job) -> str:
+    """The tag on every mirrored line of one agent's output.
+
+    Both the task and the role, because a task's implementation and its review are
+    two different agents saying different things about the same id, and with several
+    running at once the id alone does not say which one is talking.
+    """
+    return f"{job.task_id} {ROLE_TAGS.get(job.role, job.role)} | "
+
+
+def _execute(
+    root: Path,
+    job: Job,
+    run_id: str,
+    *,
+    stream: bool = False,
+    lock: threading.Lock | None = None,
+) -> Outcome:
     """Run one agent to completion. Errors become outcomes, never exceptions.
 
     A worker that raised would take the scheduler down with it and lose the
     other agents' work, so everything is reported back as data.
+
+    Reporting it as data was not enough on its own. `_prepare` has already claimed
+    the task by marking it `running` or `reviewing`, and the outcome returned here
+    is in memory: an exception used to produce an error string and leave the store
+    saying an agent was working on a task in a process that had ceased to exist.
+    The run read as active, so nothing reselected the task; the pid was gone, so
+    nothing finished it. Every prepared run is now settled exactly once — by
+    `runner._finish` on the way out, or by `runner.reconcile` here.
     """
     try:
-        code = runner.execute(root, run_id, stream=False)
-    except WritError as exc:
-        return Outcome(job=job, run_id=run_id, error=str(exc))
-    except Exception as exc:  # pragma: no cover - defensive
-        return Outcome(job=job, run_id=run_id, error=f"{type(exc).__name__}: {exc}")
+        code = runner.execute(
+            root,
+            run_id,
+            stream=stream,
+            prefix=_label(job) if stream else "",
+            lock=lock,
+        )
+    except BaseException as exc:
+        # BaseException, not Exception: a KeyboardInterrupt delivered to a worker
+        # thread strands the run in exactly the same way, and leaving the store
+        # inconsistent is not a better outcome for being caused by a signal. The
+        # failure is always re-described and returned, never swallowed.
+        failure = failures.classify(exc)
+        return _stranded(root, job, run_id, failure)
     data = state.load(root)
     task = data["tasks"].get(job.task_id, {})
     run = data["runs"].get(run_id, {})
@@ -659,6 +1049,14 @@ def _execute(root: Path, job: Job, run_id: str) -> Outcome:
     held = task.get("held") or {}
     applied = run.get("patch_applied") or {}
     attempts = task.get("gate_attempts") or []
+    # A run can finish and still be an infrastructure failure: `runner._finish`
+    # classifies a killed hang and an agent that never reached a model, because
+    # neither raises and neither is a judgement of the work. Read back here so
+    # the scheduler can spend an infrastructure retry on it instead of reporting
+    # the task as failed.
+    recorded = run.get("failure") or {}
+    category = str(recorded.get("category", ""))
+    retryable = bool(recorded.get("retryable"))
     return Outcome(
         job=job,
         run_id=run_id,
@@ -675,6 +1073,46 @@ def _execute(root: Path, job: Job, run_id: str) -> Outcome:
         repaired=list(applied.get("tasks", [])),
         refused=str(run.get("patch_error", "")),
         findings=list(attempts[-1].get("findings", [])) if attempts else [],
+        category=category,
+        retryable=retryable,
+        failure_reason=failures.describe(recorded),
+        infra_attempt=runner.infrastructure_attempts(task) if retryable else 0,
+    )
+
+
+def _stranded(
+    root: Path, job: Job, run_id: str, failure: failures.Failure
+) -> Outcome:
+    """Reconcile a run whose worker raised, and report what it cost.
+
+    Reconciliation can itself fail — if the state lock is what broke, writing the
+    reconciliation needs the same lock. That second failure is recorded in the
+    outcome rather than raised: the scheduler has other agents in flight, and
+    losing them to a store that is briefly unavailable would turn one stranded run
+    into a lost session. `reap` still recovers the run, which is the guarantee that
+    was missing in the first place.
+    """
+    try:
+        settlement = runner.reconcile(root, run_id, failure)
+    except Exception as exc:  # pragma: no cover - the store is unavailable
+        return Outcome(
+            job=job,
+            run_id=run_id,
+            error=(
+                f"{failure.described} — and writ could not record it "
+                f"({type(exc).__name__}: {exc}); `writ cancel` will recover the run"
+            ),
+            category=failure.category,
+        )
+    return Outcome(
+        job=job,
+        run_id=run_id,
+        status=settlement.task_status,
+        error=failure.described,
+        failure_reason=failure.described,
+        category=failure.category,
+        retryable=failure.retryable,
+        infra_attempt=settlement.attempt,
     )
 
 
@@ -717,10 +1155,21 @@ def _record(session: Session, outcome: Outcome) -> None:
         session.errors.append(f"{outcome.job.task_id}: {outcome.error}")
     if outcome.rework:
         session.reworked.append(outcome.job.task_id)
+    if outcome.retryable and outcome.retry_in is None:
+        # Retryable, and no retry was granted: the budget is spent. Recorded as
+        # blocked on infrastructure rather than failed, because the task's own
+        # status is whatever `reconcile` restored it to — it is still waiting to
+        # be attempted, and the thing that needs fixing is not the code.
+        session.infra_blocked.append(outcome.job.task_id)
     status = outcome.status
     if outcome.job.role == "repair":
         if outcome.repaired:
             session.repaired.append(outcome.job.task_id)
+        return
+    if not outcome.on_merit:
+        # An infrastructure failure is not a verdict. The task may well sit at
+        # `planned` or `awaiting-review` — the status `reconcile` returned it to —
+        # and listing that as failed work would report an outage as a rejection.
         return
     if status == "completed":
         session.completed.append(outcome.job.task_id)
@@ -752,6 +1201,12 @@ def _finished_payload(outcome: Outcome) -> dict[str, Any]:
         "repaired": outcome.repaired,
         "refused": outcome.refused,
         "findings": outcome.findings,
+        "category": outcome.category,
+        "retryable": outcome.retryable,
+        "failure": outcome.failure_reason or None,
+        "retry_in": (
+            None if outcome.retry_in is None else round(outcome.retry_in, 1)
+        ),
     }
 
 
@@ -864,6 +1319,18 @@ def summary(data: dict[str, Any], session: Session) -> list[str]:
         lines.append(f"awaiting review: {', '.join(awaiting)}")
     if remaining:
         lines.append(f"ready to dispatch: {', '.join(remaining)}")
+    if session.infra_retries:
+        retried = sorted(set(session.infra_retries))
+        lines.append(
+            f"retried after infrastructure failures: {', '.join(retried)}"
+            "   (not rejections — no reviewer read this work)"
+        )
+    if session.infra_blocked:
+        stuck = sorted(set(session.infra_blocked))
+        lines.append(
+            f"out of infrastructure retries: {', '.join(stuck)}"
+            "   (the machinery kept failing; the work was never judged)"
+        )
     blocked = _stalled(data)
     if blocked:
         # Name what failed, not only what is waiting. "blocked by failed work:

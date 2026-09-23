@@ -22,7 +22,7 @@ def snapshot(writ, project, design, tmp_path):
     artifact = tmp_path / "plan.json"
     artifact.write_text(json.dumps(PLAN), encoding="utf-8")
     writ("init")
-    writ("plan", str(design), "--from-plan", str(artifact))
+    writ("plan", str(design), "--from-plan", str(artifact), "--auto-approve")
     with state.transaction(project) as data:
         plans.record_findings(
             data,

@@ -28,8 +28,9 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import commands, config, critics
-from .server import DEFAULT_PORT
+from . import analysis, commands, config, critics, repair
+from .failures import DEFAULT_MAX_INFRA_RETRIES
+from .server import DEFAULT_HOST, DEFAULT_PORT
 from .decisions import SETTABLE_DECISION_STATUSES
 from .model import DEFAULT_MAX_REWORK, JUDGED_STATUSES, SETTABLE_STATUSES
 from .orchestrator import DEFAULT_ORDER, ORDERS
@@ -67,10 +68,14 @@ ids are resolved by shape, so one command serves every kind of thing:
 
 every command accepts --root <project> and --json.
 
-defaults marked `agents.x` or `run.x` come from <root>/.writ/config.json, so a
-project's planner, reviewer and parallelism are chosen once rather than retyped.
-A flag always overrides it; `writ agents` prints what is in effect. The repository
-ships a commented config.example.json.
+defaults come from <root>/.writ/config.json, so a project's planner, reviewer,
+parallelism — and whether the staged pipeline runs, and which critics read a plan —
+are chosen once rather than retyped. Every flag that is a standing decision is in
+there, under a section named for its command; what is not is anything naming one
+piece of work, the filters on list and coverage, and every --force. A flag always
+overrides it, both ways for a boolean; `writ agents` prints what is in effect.
+`writ init` writes that file holding writ's own defaults, with a line explaining
+each setting, so changing one is an edit rather than a lookup.
 """
 
 
@@ -99,15 +104,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="project directory containing .writ (default: current directory)",
     )
     parser.add_argument(
-        "--json", action="store_true", help="machine-readable output where supported"
+        "--json",
+        action="store_true",
+        default=None,
+        help="machine-readable output where supported (common.json)",
     )
     sub = parser.add_subparsers(
         dest="command", required=True, metavar="<command>", parser_class=_Parser
     )
 
     # ---------------------------------------------------------------- setup
-    p = sub.add_parser("init", help="create a Writ project in --root")
-    p.add_argument("--force", action="store_true", help="overwrite existing state")
+    p = sub.add_parser(
+        "init", help="create a Writ project, and a default config.json, in --root"
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="reset existing state; your config.json is kept either way",
+    )
     p.set_defaults(func=commands.cmd_init)
 
     p = sub.add_parser(
@@ -133,6 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--extract",
         action="store_true",
+        default=None,
         help="skip the agent; derive tasks from headings and gate markers only",
     )
     p.add_argument(
@@ -141,11 +156,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="import a plan JSON artifact instead of running an agent",
     )
     p.add_argument(
-        "--level", type=int, default=2, help="heading level for milestones (--extract)"
+        "--level",
+        type=int,
+        help="heading level for milestones (--extract) (default: plan.level)",
     )
     p.add_argument(
         "--flat",
         action="store_true",
+        default=None,
         help="one task per milestone, do not split sub-sections (--extract)",
     )
     p.add_argument(
@@ -156,6 +174,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--chain",
         action="store_true",
+        default=None,
         help=(
             "order tasks the plan left independent, each after the last. Off by "
             "default: an omitted dependency stays omitted, so a plan that forgot "
@@ -165,11 +184,82 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--gates",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help=(
             "add a review gate per milestone and a final gate over the plan "
             "(default: on). A gate judges integrated work against the "
             "requirements and can ask for the plan to be repaired"
+        ),
+    )
+    p.add_argument(
+        "--stages",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "run the staged planning pipeline (default: on). Three analyses — "
+            + ", ".join(stage.name for stage in analysis.STAGES)
+            + " — write artifacts before a synthesis agent decomposes the work "
+            "from them. --no-stages is the older single-shot planner, which makes "
+            "every one of those judgements in one response"
+        ),
+    )
+    p.add_argument(
+        "--stage",
+        metavar="NAME",
+        choices=analysis.STAGE_NAMES,
+        help=(
+            "run the analyses up to and including this stage, then stop without "
+            "synthesising or committing anything. Continue later with --plan-id"
+        ),
+    )
+    p.add_argument(
+        "--plan-id",
+        metavar="ID",
+        help=(
+            "reuse an existing pipeline directory under .writ/plans/. Stages whose "
+            "artifact is already there are not re-run, so a pipeline that failed "
+            "part-way resumes instead of paying for its analyses again"
+        ),
+    )
+    p.add_argument(
+        "--refresh",
+        action="store_true",
+        default=None,
+        help="re-run stages that already have an artifact, instead of reusing them",
+    )
+    p.add_argument(
+        "--parallel-stages",
+        action="store_true",
+        default=None,
+        help=(
+            "run the analysis stages that need nothing from each other at once "
+            "(requirements beside inventory). Costs the inventory its coverage "
+            "claims, which need the requirement ids it will not have yet"
+        ),
+    )
+    p.add_argument(
+        "--stage-agent",
+        metavar="CMD",
+        help="agent for the analysis stages (default: --agent)",
+    )
+    p.add_argument(
+        "--stage-model", metavar="NAME", help="model for the analysis stages"
+    )
+    p.add_argument(
+        "--stage-timeout",
+        type=int,
+        metavar="S",
+        help="seconds before an analysis stage is killed (default: --timeout)",
+    )
+    p.add_argument(
+        "--auto-approve",
+        action="store_true",
+        default=None,
+        help=(
+            "approve the plan without a human when no blocking finding stands "
+            "against it. For automation: a clean check means writ proved nothing "
+            "wrong, not that anyone read it. Blocking findings are never "
+            "overridden this way — that is `writ approve --force --reason ...`"
         ),
     )
     p.add_argument(
@@ -183,25 +273,71 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--parallel-critics",
+        action="store_true",
+        default=None,
+        help=(
+            "run all the critics at once rather than one after another: five agent "
+            "runs' wall-clock for one. Only one of them runs the test suite, and "
+            "the rest are told to leave it alone"
+        ),
+    )
+    p.add_argument(
         "--critic-agent",
         metavar="CMD",
         help="agent for the critics (default: --agent). A different one reviews better",
     )
     p.add_argument("--critic-model", metavar="NAME", help="model for the critics")
+    p.add_argument(
+        "--repair",
+        action="store_true",
+        default=None,
+        help=(
+            "answer the plan's blocking findings with the bounded repair loop "
+            "before it is approved, the same one `writ adjudicate` runs. Spends "
+            "agent runs, so it is opt-in; what --auto-approve refuses to override "
+            "is exactly what this tries to remove"
+        ),
+    )
+    p.add_argument(
+        "--max-rounds",
+        type=int,
+        metavar="N",
+        help=(
+            "how many repairs may land before the plan stops for a human "
+            f"(--repair) (default: {repair.DEFAULT_MAX_REPAIR_ROUNDS})"
+        ),
+    )
+    p.add_argument(
+        "--adjudicator-agent",
+        metavar="CMD",
+        help=(
+            "agent that proposes repair patches (--repair) "
+            "(default: --critic-agent, else --agent)"
+        ),
+    )
+    p.add_argument(
+        "--adjudicator-model", metavar="NAME", help="model for the adjudicator"
+    )
     p.add_argument("--append", action="store_true", help="add to an existing plan")
     p.add_argument("--force", action="store_true", help="replace the existing plan")
     p.add_argument(
         "--quiet",
         "-q",
         action="store_true",
+        default=None,
         help="do not mirror the planning agent's output to this terminal",
     )
     p.add_argument(
         "--dry-run",
         action="store_true",
+        default=None,
         help="print the planning prompt, or a previewed plan, without writing state",
     )
-    p.set_defaults(func=commands.cmd_plan)
+    # Not a flag: a slot only the config fills, so `plan.critics: true` can run the
+    # set `critique.critics` names without that set being restated under `plan`.
+    # `--critics coverage` still names them outright and still wins.
+    p.set_defaults(func=commands.cmd_plan, critic_names=None)
 
     p = sub.add_parser(
         "check",
@@ -210,15 +346,79 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--all",
         action="store_true",
+        default=None,
         help="include findings already accepted or resolved",
     )
     p.add_argument(
         "--quiet",
         "-q",
         action="store_true",
+        default=None,
         help="print nothing; exit 1 if anything blocking stands",
     )
     p.set_defaults(func=commands.cmd_check)
+
+    p = sub.add_parser(
+        "adjudicate",
+        help="repair the plan against its open findings, bounded, before it runs",
+    )
+    p.add_argument(
+        "doc",
+        nargs="?",
+        help="the design document, if the adjudicator should read it",
+    )
+    p.add_argument(
+        "--agent",
+        help="adjudicator agent command (default: agents.critic, else the planner)",
+    )
+    p.add_argument("--model", help="model for the adjudicator")
+    p.add_argument(
+        "--critic-agent",
+        help=(
+            "agent for the critics that re-read each patched plan "
+            "(default: the adjudicator's). Separate because they are separate "
+            "jobs: one proposes the change, the others judge it"
+        ),
+    )
+    p.add_argument("--critic-model", help="model for the re-reading critics")
+    p.add_argument(
+        "--timeout", type=int, help="seconds before the adjudicator is killed"
+    )
+    p.add_argument("--cwd", help="working directory for the agent (default: --root)")
+    p.add_argument(
+        "--max-rounds",
+        type=int,
+        help=(
+            "how many patches may land before the plan stops for a human "
+            f"(default: {repair.DEFAULT_MAX_REPAIR_ROUNDS})"
+        ),
+    )
+    p.add_argument(
+        "--critics",
+        nargs="*",
+        metavar="NAME",
+        help=(
+            "which critics re-read the patched plan (default: all). "
+            + ", ".join(critic.name for critic in critics.CRITICS)
+        ),
+    )
+    p.add_argument(
+        "--no-critics",
+        action="store_true",
+        default=None,
+        help=(
+            "re-check deterministically between rounds but do not re-run the "
+            "critics; cheaper, and blind to anything only a critic can see"
+        ),
+    )
+    p.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        default=None,
+        help="do not mirror the adjudicator's output to the terminal",
+    )
+    p.set_defaults(func=commands.cmd_adjudicate)
 
     p = sub.add_parser(
         "critique",
@@ -243,9 +443,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--parallel-critics",
+        action="store_true",
+        default=None,
+        help=(
+            "run all the critics at once rather than one after another: five agent "
+            "runs' wall-clock for one. Only one of them runs the test suite, and "
+            "the rest are told to leave it alone"
+        ),
+    )
+    p.add_argument(
         "--quiet",
         "-q",
         action="store_true",
+        default=None,
         help="do not mirror the critics' output to the terminal",
     )
     p.set_defaults(func=commands.cmd_critique)
@@ -272,6 +483,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--uncovered",
         action="store_true",
+        default=None,
         help="only requirements nothing stands behind",
     )
     p.add_argument("--requirement", help="one requirement id")
@@ -286,14 +498,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--watch",
         "-w",
         action="store_true",
+        default=None,
         help="redraw until interrupted, or until no run is active",
     )
-    p.add_argument("--interval", type=float, default=2.0, help="--watch seconds")
     p.add_argument(
-        "--until-idle", action="store_true", help="with --watch, exit when idle"
+        "--interval", type=float, help="--watch seconds (default: status.interval)"
     )
     p.add_argument(
-        "--no-clear", action="store_true", help="with --watch, do not clear the screen"
+        "--until-idle",
+        action="store_true",
+        default=None,
+        help="with --watch, exit when idle",
+    )
+    p.add_argument(
+        "--no-clear",
+        action="store_true",
+        default=None,
+        help="with --watch, do not clear the screen (status.clear)",
+    )
+    p.add_argument(
+        "--clear",
+        dest="no_clear",
+        action="store_false",
+        default=None,
+        help="with --watch, clear the screen even if status.clear is false",
     )
     p.set_defaults(func=commands.cmd_status)
 
@@ -359,10 +587,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--verbose",
         "-v",
         action="store_true",
+        default=None,
         help="for a milestone, expand every member task in full",
     )
     p.add_argument(
-        "--prompt", action="store_true", help="for a run, print the prompt it was given"
+        "--prompt",
+        action="store_true",
+        default=None,
+        help="for a run, print the prompt it was given",
     )
     p.set_defaults(func=commands.cmd_show)
 
@@ -381,15 +613,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--levels",
         action="store_true",
+        default=None,
         help="group by dependency depth: what could run at the same time",
     )
     p.add_argument(
         "--verbose",
         "-v",
         action="store_true",
+        default=None,
         help="add status and acceptance counts to each node",
     )
-    p.add_argument("--dot", action="store_true", help="emit graphviz dot")
+    p.add_argument(
+        "--dot", action="store_true", default=None, help="emit graphviz dot"
+    )
     p.set_defaults(func=commands.cmd_graph)
 
     p = sub.add_parser(
@@ -410,28 +646,52 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--port",
         type=int,
-        default=DEFAULT_PORT,
-        help=f"port to listen on (default {DEFAULT_PORT})",
+        help=f"port to listen on (default {DEFAULT_PORT}, or serve.port)",
     )
     p.add_argument(
         "--host",
-        default="127.0.0.1",
-        help="interface to bind (default 127.0.0.1, this machine only)",
+        help=(
+            f"interface to bind (default {DEFAULT_HOST}, or serve.host; this "
+            "machine only)"
+        ),
     )
     p.add_argument(
         "--no-open",
         action="store_true",
-        help="print the url instead of opening a browser",
+        default=None,
+        help="print the url instead of opening a browser (serve.open)",
+    )
+    # The positive of the flag above, so `serve.open: false` in a config is still
+    # overridable for one run. Without it the config could only be argued with in
+    # one direction, and "a flag always wins" would be true of every setting but
+    # the two spelled negatively.
+    p.add_argument(
+        "--open",
+        dest="no_open",
+        action="store_false",
+        default=None,
+        help="open a browser even if serve.open is false",
     )
     p.set_defaults(func=commands.cmd_serve)
 
     p = sub.add_parser("logs", help="print or follow a run's output")
     p.add_argument("id", help="run id, or a task id for its latest run")
     p.add_argument(
-        "--follow", "-f", action="store_true", help="stream until the run ends"
+        "--follow",
+        "-f",
+        action="store_true",
+        default=None,
+        help="stream until the run ends",
     )
-    p.add_argument("--stderr", action="store_true", help="show stderr instead of stdout")
-    p.add_argument("--tail", type=int, help="only the last N lines")
+    p.add_argument(
+        "--stderr",
+        action="store_true",
+        default=None,
+        help="show stderr instead of stdout",
+    )
+    p.add_argument(
+        "--tail", type=int, help="only the last N lines (default: logs.tail)"
+    )
     p.set_defaults(func=commands.cmd_logs)
 
     # -------------------------------------------------------------- mutation
@@ -497,9 +757,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--force", action="store_true", help="review a task that is not awaiting review"
     )
-    p.add_argument("--quiet", "-q", action="store_true", help="do not mirror output")
     p.add_argument(
-        "--dry-run", action="store_true", help="print the review prompt and stop"
+        "--quiet", "-q", action="store_true", default=None, help="do not mirror output"
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=None,
+        help="print the review prompt and stop",
     )
     p.add_argument(
         "--max-rework",
@@ -578,7 +843,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-tasks",
         type=int,
-        default=None,
         metavar="N",
         help="stop after starting N tasks (reviews of them still finish)",
     )
@@ -590,6 +854,17 @@ def build_parser() -> argparse.ArgumentParser:
             f"times a rejected task is re-dispatched with the review attached "
             f"before it is left failed (default: {DEFAULT_MAX_REWORK}, 0 to fail "
             "on the first rejection)"
+        ),
+    )
+    p.add_argument(
+        "--max-infra-retries",
+        type=int,
+        metavar="N",
+        help=(
+            "times a task is retried after an infrastructure failure — a provider "
+            "timeout, a failed spawn, a lock writ could not take (default: "
+            f"{DEFAULT_MAX_INFRA_RETRIES}, 0 to disable). Separate from "
+            "--max-rework: nothing here is a judgement of the work"
         ),
     )
     p.add_argument(
@@ -629,10 +904,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="start even if another run session looks active",
     )
     p.add_argument(
-        "--quiet", "-q", action="store_true", help="only report finished work"
+        "--quiet",
+        "-q",
+        action="store_true",
+        default=None,
+        help="only report finished work",
+    )
+    # The negative is the one worth spelling, because streaming is the default: a
+    # run that prints nothing for ten minutes is indistinguishable from a hung one.
+    p.add_argument(
+        "--stream",
+        dest="no_stream",
+        action="store_false",
+        default=None,
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
-        "--dry-run", action="store_true", help="print the intended walk and stop"
+        "--no-stream",
+        dest="no_stream",
+        action="store_true",
+        default=None,
+        help=(
+            "do not mirror the agents' own output; report transitions only. Each "
+            "line is labelled with its task and role, and the full transcript is "
+            "on disk either way (writ logs <task>)"
+        ),
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=None,
+        help="print the intended walk and stop",
     )
     p.set_defaults(func=commands.cmd_run)
 
@@ -647,17 +949,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=int, default=None, help="seconds before kill")
     p.add_argument("--cwd", help="working directory for the agent (default: --root)")
     p.add_argument(
-        "--detach", action="store_true", help="run in the background under a supervisor"
+        "--detach",
+        action="store_true",
+        default=None,
+        help="run in the background under a supervisor",
     )
     p.add_argument("--force", action="store_true", help="ignore dependency gate")
     p.add_argument(
         "--quiet",
         "-q",
         action="store_true",
+        default=None,
         help="do not mirror the agent's output to this terminal",
     )
     p.add_argument(
-        "--dry-run", action="store_true", help="print the prompt and exit"
+        "--dry-run", action="store_true", default=None, help="print the prompt and exit"
     )
     p.set_defaults(func=commands.cmd_dispatch)
 

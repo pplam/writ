@@ -5,7 +5,14 @@ with the next attempt. A rejected *plan* had no such path: if a milestone's work
 did not compose, the gate failed and the run stopped, because nothing could add
 the work the plan had missed.
 
-This is that path, and its shape is set by one rule from the review:
+There are two occasions for it, and they share everything but their trigger. A
+**gate** asks for repair when a milestone's work did not compose. A **plan** asks
+before anything has run, when the deterministic checks and the critics have found
+something and there is no agent whose job is to fix it. Both produce a request,
+both are adjudicated by a planner that proposes a patch, and both are bounded so a
+finding that survives repair reaches a human instead of another round.
+
+Its shape is set by one rule from the review:
 
 > a reviewer should report findings and request repair — not directly rewrite the
 > live graph.
@@ -35,7 +42,7 @@ from .state import WritError, utcnow
 #: a repair request's life
 REQUEST_STATUSES = ("open", "planning", "proposed", "applied", "failed", "abandoned")
 
-#: how many times one gate may ask for repair before it needs a human.
+#: how many times one gate, or one plan, may ask for repair before it needs a human.
 #:
 #: Separate from the task rework budget on purpose. A task being reworked is one
 #: agent failing to meet a fixed bar; a gate asking for repair again means the
@@ -100,6 +107,51 @@ PATCH_SCHEMA = """\
   ]
 }"""
 
+#: what a pre-execution adjudicator may propose, on top of `PATCH_SCHEMA`.
+#:
+#: `revise_tasks` exists only here, and the reason is the whole difference between
+#: the two occasions. A gate repair happens mid-run: tasks are completed or in
+#: flight, their contracts have been reviewed against, and rewriting one would
+#: change a bar somebody already met. Before execution nothing has run, so a task
+#: whose criteria are too vague can simply be *fixed* — which is what most critic
+#: findings actually call for. Adding a task to compensate for a weak criterion on
+#: another task would be a worse plan, not a repaired one.
+REVISE_SCHEMA = """\
+{
+  "revise_tasks": [
+    {
+      "id": "M01-002",
+      "resolves_findings": ["F-0007"],
+      "title": "optional: a clearer title",
+      "notes": "optional: why this task exists",
+      "acceptances": [
+        "every criterion the task should be held to, including the ones it already had",
+        "`pytest -q tests/test_parser.py` passes"
+      ],
+      "allowed": ["writ/parser.py", "tests/test_parser.py"],
+      "forbidden": [],
+      "requirement_ids": ["REQ-001"],
+      "depends_on": ["M01-001"]
+    }
+  ]
+}"""
+
+PLAN_PATCH_RULES = """\
+This plan has not run yet, so you may also revise the tasks that are in it:
+
+8. `revise_tasks` replaces the fields you name on an existing task. Every field is
+   optional except `id`. Omit a field to leave it alone.
+9. `acceptances`, `allowed`, `forbidden`, `requirement_ids` and `depends_on` are
+   replacements, not additions: list the whole set you want the task to end with,
+   including what it already has. Writ refuses a revision that drops a requirement
+   the task covered or that leaves it with fewer criteria than it had, because that
+   lowers the bar instead of fixing it.
+10. Prefer revising the task a finding is about over adding a new one. A vague
+    criterion is fixed by writing a better criterion on that task, not by adding a
+    task to check up on it.
+11. You may not revise a task that is running, reviewing, completed or failed. If
+    one needs to change, raise a question."""
+
 PATCH_RULES = """\
 Rules for the patch:
 1. Repair the findings you were given. Do not re-plan the project, do not tidy
@@ -138,12 +190,13 @@ class Patch:
     analysis: str = ""
     add_tasks: list[dict[str, Any]] = field(default_factory=list)
     add_dependencies: list[dict[str, Any]] = field(default_factory=list)
+    revise_tasks: list[dict[str, Any]] = field(default_factory=list)
     dispositions: list[dict[str, Any]] = field(default_factory=list)
     questions: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def empty(self) -> bool:
-        return not self.add_tasks and not self.add_dependencies
+        return not self.add_tasks and not self.add_dependencies and not self.revise_tasks
 
 
 def requests(data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -163,9 +216,48 @@ def open_requests(data: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+#: the scope of a request that is not about any one gate.
+#:
+#: A gate-scoped request names the gate in `gate`; this one names nothing, because
+#: what is wrong is the plan. Kept as a sentinel rather than an absent key so that
+#: every reader can ask the same question of every request.
+PLAN_SCOPE = "plan"
+
+
+def scope_of(request: dict[str, Any]) -> str:
+    """What this request is repairing: a gate id, or the plan itself."""
+    return str(request.get("gate") or PLAN_SCOPE)
+
+
+def is_plan_request(request: dict[str, Any]) -> bool:
+    return not request.get("gate")
+
+
+def gate_requests(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Requests a gate opened. The scheduler only ever wants these.
+
+    `open_requests` returns plan-scoped ones too, and those have no gate to
+    dispatch against — a plan repair is driven by `writ adjudicate` before any run
+    exists, not by the orchestrator.
+    """
+    return [request for request in requests(data) if not is_plan_request(request)]
+
+
 def request_for_gate(data: dict[str, Any], gate_id: str) -> dict[str, Any] | None:
     for request in reversed(requests(data)):
         if request.get("gate") == gate_id and request.get("status") in (
+            "open",
+            "planning",
+            "proposed",
+        ):
+            return request
+    return None
+
+
+def plan_request(data: dict[str, Any]) -> dict[str, Any] | None:
+    """The open plan-scoped request, if the plan is mid-adjudication."""
+    for request in reversed(requests(data)):
+        if is_plan_request(request) and request.get("status") in (
             "open",
             "planning",
             "proposed",
@@ -184,17 +276,22 @@ def get_request(data: dict[str, Any], request_id: str) -> dict[str, Any]:
 def open_request(
     data: dict[str, Any],
     *,
-    gate_id: str,
+    gate_id: str | None = None,
     finding_ids: Iterable[str],
     summary: str,
     actor: str,
 ) -> dict[str, Any]:
-    """Record that a gate has asked for the plan to change."""
+    """Record that a gate — or, with no gate, the plan — has asked to change.
+
+    `round` counts applied requests in the same scope, which is what bounds the
+    loop: a plan on its third adjudication has had two patches land and is still
+    being objected to.
+    """
     counters = data.setdefault("counters", {})
     counters["repair"] = int(counters.get("repair", 0)) + 1
     request = {
         "id": f"RR-{counters['repair']:04d}",
-        "gate": gate_id,
+        "gate": gate_id or "",
         "findings": list(finding_ids),
         "summary": summary,
         "status": "open",
@@ -207,7 +304,8 @@ def open_request(
     prior = [
         item
         for item in requests(data)
-        if item.get("gate") == gate_id and item.get("status") == "applied"
+        if (item.get("gate") or "") == (gate_id or "")
+        and item.get("status") == "applied"
     ]
     request["round"] = len(prior) + 1
     requests(data).append(request)
@@ -265,18 +363,89 @@ def exhausted(
 
 def repeat_findings(data: dict[str, Any], gate_id: str) -> list[str]:
     """Findings this gate has raised again after a repair claimed to close them."""
-    counts: dict[str, int] = {}
+    return _repeat_findings(data, lambda scope: scope == f"gate:{gate_id}")
+
+
+def plan_rounds(data: dict[str, Any]) -> int:
+    """How many plan-scoped repairs have landed on this plan."""
+    return sum(
+        1
+        for request in requests(data)
+        if is_plan_request(request) and request.get("status") == "applied"
+    )
+
+
+def plan_exhausted(
+    data: dict[str, Any], *, max_rounds: int | None = None
+) -> str:
+    """Why the plan should stop being adjudicated, or "" while it may continue.
+
+    The pre-execution twin of `exhausted`, and bounded for the same two reasons. A
+    plan that has been patched twice and still draws blocking findings is not one
+    round away from being right; and a finding that survives its own repair will
+    survive the next one, because what is wrong is the question rather than the
+    answer.
+
+    Deliberately not a finding. Writ cannot prove the plan is wrong — that is why
+    it asked agents — so this stops the loop and hands over what it has, rather
+    than adding an objection of its own.
+    """
+    budget = DEFAULT_MAX_REPAIR_ROUNDS if max_rounds is None else max_rounds
+    rounds = plan_rounds(data)
+    if rounds >= budget:
+        return (
+            f"the plan has been repaired {rounds} time(s), its budget of {budget}. "
+            "What is still open needs a decision rather than another patch "
+            "(writ check, then writ approve --force --reason ...)."
+        )
+    repeated = plan_repeat_findings(data)
+    if repeated:
+        listed = ", ".join(repeated)
+        return (
+            f"{listed} survived {REPEAT_FINDING_LIMIT} repair(s). The repairs are "
+            "not addressing the finding, so the next one will not either."
+        )
+    return ""
+
+
+def plan_repeat_findings(data: dict[str, Any]) -> list[str]:
+    """Pre-execution findings that came back after a repair claimed to close them.
+
+    Scoped to everything that is not a gate: writ's own checks (`plan`) and each
+    critic (`critic:<name>`). A finding reopened by a re-check after a patch landed
+    is the signal — the patch said it closed it and the check disagreed.
+    """
+    return _repeat_findings(
+        data, lambda scope: scope == "plan" or scope.startswith("critic:")
+    )
+
+
+def _repeat_findings(data: dict[str, Any], in_scope) -> list[str]:
+    """Blocking findings that survived a repair, by id.
+
+    Only `error` severity counts. An advisory is never what a patch was asked to
+    close — the loop repairs what blocks, and the critics re-report every note they
+    still believe on each re-read — so counting advisories here escalated on the
+    ordinary case: one repair lands, the critics re-read the patched plan, and
+    seventy notes they had already made cross the limit together. The plan was then
+    declared beyond repair over findings nothing had ever tried to fix, while the
+    blocking findings the re-check had just raised went unanswered.
+
+    Two ways in, because they are different evidence. `reopened_at` is a finding a
+    re-check raised again after a patch claimed to close it — one is enough, and it
+    is the signal this bound exists for. A high `seen_count` is the same story told
+    by a critic that never stopped reporting it.
+    """
+    repeated = []
     for payload in plans.finding_records(data):
-        if payload.get("scope") != f"gate:{gate_id}":
+        if not in_scope(str(payload.get("scope", ""))):
+            continue
+        if str(payload.get("severity", "")) != "error":
             continue
         seen = int(payload.get("seen_count", 1))
         if payload.get("reopened_at") or seen > REPEAT_FINDING_LIMIT:
-            counts[payload["id"]] = seen
-    return sorted(
-        finding_id
-        for finding_id, seen in counts.items()
-        if seen > REPEAT_FINDING_LIMIT
-    )
+            repeated.append(str(payload["id"]))
+    return sorted(repeated)
 
 
 # --------------------------------------------------------------------------
@@ -329,6 +498,7 @@ def load_patch(text: str) -> Patch:
         add_dependencies=_list_of_objects(
             payload.get("add_dependencies"), "add_dependencies"
         ),
+        revise_tasks=_list_of_objects(payload.get("revise_tasks"), "revise_tasks"),
         dispositions=_list_of_objects(payload.get("dispositions"), "dispositions"),
         questions=_list_of_objects(payload.get("questions"), "questions"),
     )
@@ -392,8 +562,236 @@ def validate(
         )
     found.extend(_validate_new_tasks(data, patch, request))
     found.extend(_validate_edges(data, patch, request))
+    found.extend(_validate_revisions(data, patch, request))
     found.extend(_validate_dispositions(data, patch, request))
     return plancheck.sort_findings(found)
+
+
+def _validate_revisions(
+    data: dict[str, Any], patch: Patch, request: dict[str, Any]
+) -> list[Finding]:
+    """A revision may raise a task's bar or sharpen it. It may not lower it.
+
+    Writ cannot judge whether a rewritten criterion is *better* — that is what the
+    acceptance critic is for, and it reads the plan again after this lands. What it
+    can prove is that the revision did not quietly drop an obligation: a
+    requirement the task covered, or a criterion it no longer has. Both are the
+    failure the review warned about, where a repair closes a finding by deleting
+    what could not be satisfied.
+    """
+    found: list[Finding] = []
+    existing = data.get("tasks", {})
+    known_requirements = set(data.get("requirements", {}))
+    # The ids this same patch is adding. A revision may depend on one of them: the
+    # commonest plan repair is "the work this task needs does not exist yet", whose
+    # answer is one new task plus an edge to it from the task that needs it. Judging
+    # the revision against the *committed* graph alone refuses that patch for naming
+    # a task the patch itself is introducing, and the adjudicator's only way out is
+    # to drop the edge — which is the finding, unrepaired.
+    proposed_ids = {
+        str(entry.get("id", "")).strip()
+        for entry in patch.add_tasks
+        if str(entry.get("id", "")).strip()
+    }
+    for index, entry in enumerate(patch.revise_tasks):
+        where = f"{request['id']}.revise_tasks[{index}]"
+        ref = str(entry.get("id", "")).strip()
+        if not ref:
+            found.append(
+                Finding(
+                    severity="error",
+                    category="patch-shape",
+                    message="a revision names no task",
+                    where=where,
+                    suggested_action="state the `id` of the task to revise",
+                    source="writ",
+                )
+            )
+            continue
+        task = existing.get(ref)
+        if task is None:
+            found.append(
+                Finding(
+                    severity="error",
+                    category="unknown-task",
+                    message=f"revises {ref}, which is not a task in this plan",
+                    where=where,
+                    suggested_action="name a task that exists, or add a new one",
+                    source="writ",
+                )
+            )
+            continue
+        if not is_plan_request(request):
+            found.append(
+                Finding(
+                    severity="error",
+                    category="revision-after-start",
+                    message=(
+                        f"revises {ref}, but this is a gate repair: the plan is "
+                        "already executing and a task's contract does not change "
+                        "underneath it"
+                    ),
+                    where=where,
+                    suggested_action="add a task that fixes the problem instead",
+                    source="writ",
+                )
+            )
+            continue
+        status = task.get("status")
+        if status != "planned":
+            found.append(
+                Finding(
+                    severity="error",
+                    category="revision-after-start",
+                    message=(
+                        f"revises {ref}, which is {status}; only a task that has "
+                        "not started can be rewritten"
+                    ),
+                    where=where,
+                    suggested_action=(
+                        "add a task that fixes the problem, or raise a question"
+                    ),
+                    source="writ",
+                )
+            )
+            continue
+        if task.get("kind") == "gate":
+            found.append(
+                Finding(
+                    severity="error",
+                    category="revision-of-gate",
+                    message=(
+                        f"revises {ref}, which is a gate; a gate's criteria are the "
+                        "plan's own bar and are not an adjudicator's to rewrite"
+                    ),
+                    where=where,
+                    suggested_action="revise the tasks the gate judges instead",
+                    source="writ",
+                )
+            )
+            continue
+        found.extend(
+            _validate_revision_fields(
+                data,
+                entry,
+                task,
+                where,
+                known_requirements,
+                proposed_ids=proposed_ids,
+            )
+        )
+    return found
+
+
+def _validate_revision_fields(
+    data: dict[str, Any],
+    entry: dict[str, Any],
+    task: dict[str, Any],
+    where: str,
+    known_requirements: set[str],
+    *,
+    proposed_ids: frozenset[str] | set[str] = frozenset(),
+) -> list[Finding]:
+    found: list[Finding] = []
+    ref = task["id"]
+    if "acceptances" in entry:
+        proposed = entry.get("acceptances")
+        if not isinstance(proposed, list) or not proposed:
+            found.append(
+                Finding(
+                    severity="error",
+                    category="weakened-acceptance",
+                    message=f"revision of {ref} leaves it with no acceptance criteria",
+                    where=where,
+                    suggested_action="state the whole set the task should be held to",
+                    source="writ",
+                )
+            )
+        elif len(proposed) < len(task.get("acceptances") or []):
+            found.append(
+                Finding(
+                    severity="error",
+                    category="weakened-acceptance",
+                    message=(
+                        f"revision of {ref} states {len(proposed)} criteria where it "
+                        f"had {len(task.get('acceptances') or [])}; `acceptances` "
+                        "replaces the set, so this drops a bar"
+                    ),
+                    where=where,
+                    suggested_action=(
+                        "include every criterion the task should keep, or raise a "
+                        "question if one is genuinely wrong"
+                    ),
+                    source="writ",
+                )
+            )
+    if "requirement_ids" in entry:
+        proposed = {str(req) for req in (entry.get("requirement_ids") or [])}
+        held = {str(req) for req in (task.get("requirement_ids") or [])}
+        dropped = sorted(held - proposed)
+        if dropped:
+            found.append(
+                Finding(
+                    severity="error",
+                    category="dropped-requirement",
+                    message=(
+                        f"revision of {ref} stops covering {', '.join(dropped)}, "
+                        "which nothing else in the patch takes on"
+                    ),
+                    where=where,
+                    suggested_action=(
+                        "keep the requirement on this task, or move it to a task "
+                        "this patch adds"
+                    ),
+                    source="writ",
+                )
+            )
+        for req_id in sorted(proposed - held):
+            if req_id not in known_requirements:
+                found.append(
+                    Finding(
+                        severity="error",
+                        category="unknown-requirement",
+                        message=(
+                            f"revision of {ref} claims requirement {req_id}, which "
+                            "is not in the inventory"
+                        ),
+                        where=where,
+                        suggested_action=(
+                            "reference a real requirement; a repair may not invent "
+                            "obligations"
+                        ),
+                        source="writ",
+                    )
+                )
+    if "depends_on" in entry:
+        tasks = data.get("tasks", {})
+        for dep in entry.get("depends_on") or []:
+            if str(dep) == ref:
+                found.append(
+                    Finding(
+                        severity="error",
+                        category="self-dependency",
+                        message=f"revision of {ref} makes it depend on itself",
+                        where=where,
+                        suggested_action="depend on the work it actually needs",
+                        source="writ",
+                    )
+                )
+            elif str(dep) not in tasks and str(dep) not in proposed_ids:
+                found.append(
+                    Finding(
+                        severity="error",
+                        category="unknown-dependency",
+                        message=f"revision of {ref} depends on unknown {dep}",
+                        where=where,
+                        suggested_action=(
+                            "depend on a task that exists, or on one this patch adds"
+                        ),
+                        source="writ",
+                    )
+                )
+    return found
 
 
 def _validate_new_tasks(
@@ -403,6 +801,7 @@ def _validate_new_tasks(
     existing = data.get("tasks", {})
     proposed_ids = {str(entry.get("id", "")) for entry in patch.add_tasks}
     known_requirements = set(data.get("requirements", {}))
+    seen_refs: set[str] = set()
     for index, entry in enumerate(patch.add_tasks):
         where = f"{request['id']}.add_tasks[{index}]"
         ref = str(entry.get("id", "")).strip()
@@ -418,6 +817,26 @@ def _validate_new_tasks(
                     source="writ",
                 )
             )
+        if ref and ref in seen_refs:
+            # Two entries under one id. `translate` is keyed on the proposed id, so
+            # the second would overwrite the first and every edge naming it would
+            # point at one task while the other became unreachable — a patch that
+            # applies cleanly and quietly drops an ordering it was written to add.
+            found.append(
+                Finding(
+                    severity="error",
+                    category="task-collision",
+                    message=(
+                        f"proposes two tasks under the id {ref}; each needs its own, "
+                        "because the edges in this patch name them"
+                    ),
+                    where=where,
+                    suggested_action="give the second task a distinct id",
+                    source="writ",
+                )
+            )
+        if ref:
+            seen_refs.add(ref)
         if ref and ref in existing:
             found.append(
                 Finding(
@@ -581,6 +1000,13 @@ def _validate_dispositions(
     open_questions = {
         str(question.get("finding_id", "")) for question in patch.questions
     }
+    if patch.empty and patch.questions:
+        # "I cannot repair any of this without a ruling" is an answer to the whole
+        # request, so its questions need not name each finding one by one. Refusing
+        # this would leave the planner nowhere to go: it has proposed nothing, which
+        # is exactly what it is supposed to do when the blocker is a decision, and a
+        # refusal would send it back to invent work it just said it could not.
+        return found
     for finding_id in request.get("findings", []):
         try:
             record = plans.get_finding(data, finding_id)
@@ -641,9 +1067,15 @@ def _validate_dispositions(
 
 
 def _closes(patch: Patch, finding_id: str) -> bool:
+    """Whether some proposed change claims to close this finding.
+
+    A revision counts. Before execution most findings are closed by fixing the task
+    the finding is about, so requiring a *new* task to claim every accepted finding
+    would push the adjudicator into adding tasks it does not need.
+    """
     return any(
         finding_id in (entry.get("resolves_findings") or [])
-        for entry in patch.add_tasks
+        for entry in (*patch.add_tasks, *patch.revise_tasks)
     )
 
 
@@ -668,15 +1100,28 @@ def apply_patch(
 
     The caller holds the state transaction, so a raise here rolls the whole patch
     back rather than leaving half a repair in the store.
+
+    A plan-scoped request has no gate, so none of the gate half applies: nothing is
+    held, nothing needs re-arming, and the new tasks are numbered into the milestone
+    the patch names. What it can do instead is revise the tasks already there, which
+    is safe precisely because none of them has started.
     """
     from . import gates
 
-    gate = gates.require_gate(data, request["gate"])
-    milestone_id = gates.milestone_of(gate)
+    gate = None if is_plan_request(request) else gates.require_gate(data, request["gate"])
+    milestone_id = gates.milestone_of(gate) if gate is not None else None
     added: list[str] = []
     translate: dict[str, str] = {}
     for entry in patch.add_tasks:
-        task_id = _next_repair_id(data, milestone_id)
+        # A gate repair numbers into the gate's own milestone; a plan repair has no
+        # gate, so the patch says where the task belongs and an unplaced one falls
+        # back to `R-00n`.
+        into = milestone_id or (str(entry.get("milestone", "")).strip() or None)
+        task_id = _next_repair_id(
+            data,
+            into if into in data.get("milestones", {}) else None,
+            minted=added,
+        )
         ref = str(entry.get("id", "")).strip()
         if ref:
             translate[ref] = task_id
@@ -697,7 +1142,7 @@ def apply_patch(
             ],
             allowed=[str(path) for path in (entry.get("allowed") or [])],
             forbidden=[str(path) for path in (entry.get("forbidden") or [])],
-            design_section=gate.get("design_section"),
+            design_section=gate.get("design_section") if gate is not None else None,
             requirement_ids=[
                 str(req) for req in (entry.get("requirement_ids") or [])
             ],
@@ -706,7 +1151,8 @@ def apply_patch(
         task = data["tasks"][task_id]
         task["repair"] = {
             "request": request["id"],
-            "gate": gate["id"],
+            "gate": gate["id"] if gate is not None else "",
+            "scope": scope_of(request),
             "resolves": [
                 str(item) for item in (entry.get("resolves_findings") or [])
             ],
@@ -721,11 +1167,13 @@ def apply_patch(
         if target not in task["depends_on"]:
             task["depends_on"].append(target)
             task["updated_at"] = utcnow()
-    # The gate waits for its repair. Without this the gate is ready the moment it
-    # is un-held and would re-review the identical tree.
-    for task_id in added:
-        if task_id not in gate["depends_on"]:
-            gate["depends_on"].append(task_id)
+    revised = _apply_revisions(data, patch, request, translate=translate)
+    if gate is not None:
+        # The gate waits for its repair. Without this the gate is ready the moment
+        # it is un-held and would re-review the identical tree.
+        for task_id in added:
+            if task_id not in gate["depends_on"]:
+                gate["depends_on"].append(task_id)
     for entry in patch.dispositions:
         finding_id = str(entry.get("finding_id", ""))
         resolution = str(entry.get("resolution", "open")).lower()
@@ -742,38 +1190,136 @@ def apply_patch(
             )
         except WritError:
             continue
-    gate["status"] = "planned"
-    gate["updated_at"] = utcnow()
-    gate.pop("held", None)
+    if gate is not None:
+        gate["status"] = "planned"
+        gate["updated_at"] = utcnow()
+        gate.pop("held", None)
     request["status"] = "applied"
     request["applied_at"] = utcnow()
     request["applied_tasks"] = added
+    request["revised_tasks"] = revised
     request["analysis"] = patch.analysis
     request["questions"] = list(patch.questions)
     check_dag(data)
     refresh_milestones(data)
     plans.bump(data)
-    return {"tasks": added, "gate": gate["id"], "revision": plans.revision(data)}
+    return {
+        "tasks": added,
+        "revised": revised,
+        "gate": gate["id"] if gate is not None else "",
+        "scope": scope_of(request),
+        "revision": plans.revision(data),
+    }
 
 
-def _next_repair_id(data: dict[str, Any], milestone_id: str | None) -> str:
+def _apply_revisions(
+    data: dict[str, Any],
+    patch: Patch,
+    request: dict[str, Any],
+    *,
+    translate: dict[str, str] | None = None,
+) -> list[str]:
+    """Replace the named fields on each revised task.
+
+    Only the fields the patch states. A revision that mentions `acceptances` and
+    nothing else leaves the fence, the requirements and the edges exactly as they
+    were — which is what makes a narrow fix narrow, and keeps the diff a reader has
+    to check small.
+
+    `translate` maps the ids a patch used for the tasks it adds onto the ids writ
+    minted for them. A revision may depend on a task the same patch adds, and the
+    patch calls it by the name it proposed; without the mapping that edge names
+    nothing and is dropped, so the patch would apply having silently left out the
+    ordering it was written to add.
+    """
+    revised: list[str] = []
+    for entry in patch.revise_tasks:
+        ref = str(entry.get("id", "")).strip()
+        task = data.get("tasks", {}).get(ref)
+        if task is None:
+            continue
+        if "title" in entry and str(entry.get("title", "")).strip():
+            task["title"] = str(entry["title"]).strip()
+        if "notes" in entry:
+            task["notes"] = str(entry.get("notes", "")).strip()
+        if "acceptances" in entry:
+            # A criterion is a record, not a string: it carries the status a
+            # reviewer will set. A revision states the text, so the status of a
+            # criterion whose wording is unchanged is carried over and a new one
+            # starts `pending` — otherwise re-stating a task's existing criteria
+            # would silently reset whatever had been signed off.
+            held = {
+                str(item.get("text", "")): item
+                for item in (task.get("acceptances") or [])
+                if isinstance(item, dict)
+            }
+            revised_criteria = []
+            for item in entry.get("acceptances") or []:
+                text = str(item.get("text", item)) if isinstance(item, dict) else str(item)
+                existing = held.get(text)
+                revised_criteria.append(
+                    dict(existing) if existing else {"text": text, "status": "pending"}
+                )
+            task["acceptances"] = revised_criteria
+        for key in ("allowed", "forbidden"):
+            if key in entry:
+                task[key] = [str(path) for path in (entry.get(key) or [])]
+        if "requirement_ids" in entry:
+            task["requirement_ids"] = [
+                str(req) for req in (entry.get("requirement_ids") or [])
+            ]
+        if "depends_on" in entry:
+            mapped = translate or {}
+            wanted = [
+                mapped.get(str(dep), str(dep))
+                for dep in (entry.get("depends_on") or [])
+            ]
+            task["depends_on"] = [
+                dep for dep in wanted if dep in data["tasks"] and dep != ref
+            ]
+        history = task.setdefault("revisions", [])
+        history.append(
+            {
+                "request": request["id"],
+                "at": utcnow(),
+                "resolves": [
+                    str(item) for item in (entry.get("resolves_findings") or [])
+                ],
+                "fields": sorted(
+                    key
+                    for key in entry
+                    if key not in ("id", "resolves_findings")
+                ),
+            }
+        )
+        task["updated_at"] = utcnow()
+        revised.append(ref)
+    return revised
+
+
+def _next_repair_id(
+    data: dict[str, Any],
+    milestone_id: str | None,
+    minted: Iterable[str] = (),
+) -> str:
     """The next free task id, numbered into its milestone like any other task.
 
     A repair is ordinary work and is numbered as such. Nothing downstream should
     have to know a task arrived by patch — that is what the `repair` record on the
     task is for.
+
+    `minted` is the ids this same patch has already claimed but not yet inserted.
+    Without it, two tasks a patch adds to one milestone both read the same
+    `data["tasks"]` and mint the same id: the first insert succeeds, the second
+    raises `task M06-006 already exists`, and the patch rolls back naming an id
+    that is nowhere in the plan. Which is a confusing way to say "twice", so the
+    ids a patch has handed out count as taken.
     """
-    if milestone_id:
-        prefix = f"{milestone_id}-"
-        taken = [
-            int(task_id[len(prefix) :])
-            for task_id in data["tasks"]
-            if task_id.startswith(prefix) and task_id[len(prefix) :].isdigit()
-        ]
-        return f"{prefix}{(max(taken) + 1) if taken else 1:03d}"
+    claimed = set(data["tasks"]) | {str(task_id) for task_id in minted}
+    prefix = f"{milestone_id}-" if milestone_id else "R-"
     taken = [
-        int(task_id[len("R-") :])
-        for task_id in data["tasks"]
-        if task_id.startswith("R-") and task_id[len("R-") :].isdigit()
+        int(task_id[len(prefix) :])
+        for task_id in claimed
+        if task_id.startswith(prefix) and task_id[len(prefix) :].isdigit()
     ]
-    return f"R-{(max(taken) + 1) if taken else 1:03d}"
+    return f"{prefix}{(max(taken) + 1) if taken else 1:03d}"

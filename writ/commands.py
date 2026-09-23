@@ -9,15 +9,18 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from . import (
+    adjudicate,
     agents,
+    analysis,
     config,
     critics,
     decisions,
     gates,
     orchestrator,
+    phases,
     plancheck,
     planner,
     planning,
@@ -58,17 +61,70 @@ from .state import WritError
 def cmd_init(args) -> None:
     location = state.initialize(args.root, force=args.force)
     print(f"initialized Writ project at {location}")
+    # Written here rather than in `state.initialize` because it is not state: it
+    # is a file the project owns, and the store can be reset without it.
+    path, created = config.ensure(args.root)
+    if created:
+        print(f"wrote {path.name} — writ's defaults, with a note explaining them")
+    else:
+        print(f"kept your existing {path.name}")
     print("next: writ plan <design.md>")
 
 
 def cmd_plan(args) -> int:
+    """Turn a design document into a task DAG, and record the attempt as it runs.
+
+    A wrapper around `_plan`, which is the command. Its whole job is the phase
+    record: `writ/phases.py` is written to as planning happens rather than after,
+    so `writ serve` has something to show during the one stretch of writ that used
+    to write nothing to state at all.
+
+    The `finally` is the point. `_plan` has half a dozen ways out — a deliberate
+    stop at `--stage requirements`, a stage that failed, a synthesis with no plan,
+    a `^C` in the middle of a critic — and every one of them has to close the
+    record. A phase left `running` by a process that exited would have the
+    dashboard reporting a plan in flight long after the terminal came back, which
+    is worse than showing nothing: nothing does not claim to know.
+    """
+    held: dict[str, Any] = {}
+    code = 1
+    try:
+        code = _plan(args, held)
+    except BaseException as exc:
+        # Includes `KeyboardInterrupt`: a `^C` is the most likely way a planning
+        # run ends early, and it is exactly when a reader wants the record to say
+        # where it stopped. The exception carries on to the CLI's own handler.
+        phases.finish(
+            Path(args.root),
+            held.get("id"),
+            status="failed",
+            note=_first_line(str(exc)) or type(exc).__name__,
+        )
+        held["closed"] = True
+        raise
+    finally:
+        if not held.get("closed"):
+            phases.finish(
+                Path(args.root),
+                held.get("id"),
+                status=held.get("status") or ("done" if code == 0 else "failed"),
+                note=held.get("note", ""),
+            )
+    return code
+
+
+def _plan(args, held: dict[str, Any]) -> int:
     """Turn a design document into a task DAG.
 
-    By default a coding agent does the planning: it reads the document and the
-    repository and returns a plan as JSON, which Writ validates before any of it
-    reaches project state. `--extract` uses the deterministic heading parser
-    instead, and `--from-plan` re-imports a plan artifact without paying for
-    another agent run.
+    By default this is a staged pipeline (`writ/analysis.py`): three analyses
+    write artifacts — what the document requires, what the repository already is,
+    how each requirement could be demonstrated — and a synthesis agent decomposes
+    the work from all three. Writ then checks that the synthesizer honoured them
+    (`analysis.reconcile`) as well as that the plan is structurally sound.
+
+    `--no-stages` is the older single-shot planner, which makes every one of those
+    judgements in one response. `--extract` uses the deterministic heading parser,
+    and `--from-plan` re-imports a plan artifact without paying for an agent run.
     """
     root = Path(args.root)
     doc = Path(args.design).expanduser()
@@ -76,6 +132,16 @@ def cmd_plan(args) -> int:
         raise WritError(f"design document not found: {doc}")
 
     plan_path: Path | None = None
+    #: the phase record's id, or None when there is nothing to record against.
+    #: `--extract` and `--from-plan` run no agents before the commit, so there is
+    #: no pre-execution phase to watch; every `phases.*` call is a no-op on None.
+    phase: str | None = None
+    #: set only on the staged path, and only once synthesis has produced a plan
+    extra_findings: list[plancheck.Finding] = []
+    pipeline_artifacts: analysis.Artifacts | None = None
+    pipeline_results: list[analysis.Result] = []
+    pipeline_id: str | None = None
+    pipeline_directory: Path | None = None
     if args.from_plan:
         plan_path = Path(args.from_plan).expanduser()
         document = planning.read_document(plan_path)
@@ -98,6 +164,7 @@ def cmd_plan(args) -> int:
                 "or --force to replace the plan"
             )
         context = planning.plan_context(data)
+        staged = bool(getattr(args, "stages", True))
         if args.dry_run:
             print(
                 planning.build_prompt(
@@ -106,12 +173,88 @@ def cmd_plan(args) -> int:
                     plan_path=state.plan_dir(root, "<plan-id>") / "plan.json",
                     instructions=args.instructions,
                     context=context,
+                    artifacts=(
+                        analysis.read_all(
+                            state.plan_dir(root, getattr(args, "plan_id", None))
+                        )
+                        if staged and getattr(args, "plan_id", None)
+                        else None
+                    ),
                 )
             )
             return 0
+
+        plan_id = getattr(args, "plan_id", None) or planning.new_plan_id(doc)
+        directory = state.plan_dir(root, plan_id)
+        chosen_stages = (
+            (analysis.upto(args.stage) if getattr(args, "stage", None) else list(analysis.STAGES))
+            if staged
+            else []
+        )
+        # Declared before anything runs, from the flags alone. This is what makes a
+        # step visible as *pending*: the page shows the shape of the attempt — which
+        # analyses, which critics, whether repair is armed — rather than boxes
+        # appearing one at a time from nowhere. Only the steps that genuinely cannot
+        # be foreseen are appended later: a repair round exists because the critics
+        # objected, and a re-review is the critics reading a plan a patch changed.
+        try:
+            declared_critics = _chosen_critics(args) if _critics_requested(args) else []
+        except WritError:
+            # An unknown critic name is `_run_critics`'s error to raise, where it is
+            # about to spend agent runs. Declaring must not be the thing that fails.
+            declared_critics = []
+        held["id"] = phases.begin(
+            root,
+            doc=str(doc),
+            plan_id=plan_id,
+            label=f"{doc.name} ({'staged' if staged else 'single-shot'})",
+            steps=phases.declare(
+                stages=chosen_stages,
+                parallel_stages=bool(getattr(args, "parallel_stages", False)),
+                critics=declared_critics,
+                parallel_critics=bool(getattr(args, "parallel_critics", False)),
+                repair=bool(getattr(args, "repair", False)),
+                auto_approve=bool(getattr(args, "auto_approve", False)),
+            ),
+        )
+        phase = held["id"]
+        artifacts = None
+        if staged:
+            artifacts, pipeline_results, stopped = _run_stages(
+                args,
+                root=root,
+                doc=doc,
+                plan_id=plan_id,
+                context=context,
+                stages=chosen_stages,
+                phase=phase,
+            )
+            if stopped is not None:
+                # Either a stage failed or `--stage` asked for the analyses alone.
+                # `stopped == 0` is the second, which is writ doing as it was told
+                # and is not a failed attempt.
+                held["status"] = "stopped" if stopped == 0 else "failed"
+                held["note"] = (
+                    f"stopped after {args.stage}"
+                    if stopped == 0
+                    else "an analysis stage produced no usable artifact"
+                )
+                return stopped
+            pipeline_id = plan_id
+            pipeline_directory = directory
+
+        print()
         print(f"planning {doc.name} with {args.agent}...")
 
         def announce(resolved: agents.ResolvedAgent, directory: Path) -> None:
+            phases.start_step(
+                root,
+                phase,
+                "synthesis",
+                resolved=resolved,
+                directory=directory,
+                artifact=directory / "plan.json",
+            )
             print(f"  running: {resolved.display}")
             if resolved.warning:
                 print(f"  warning: {resolved.warning}", file=sys.stderr)
@@ -120,7 +263,8 @@ def cmd_plan(args) -> int:
                 print("  " + "─" * 60)
             sys.stdout.flush()
 
-        document, plan_path, code = planning.generate(
+        try:
+            document, plan_path, code = planning.generate(
             root=root,
             doc=doc,
             agent=args.agent,
@@ -132,11 +276,36 @@ def cmd_plan(args) -> int:
             context=context,
             stream=not args.quiet,
             on_start=announce,
+                artifacts=artifacts,
+                plan_id=plan_id,
+            )
+        except WritError as exc:
+            # A synthesis that wrote no plan raises, and the record has to say so
+            # before the exception leaves: the step is otherwise left `running` by
+            # a process that is exiting, and the reason is the useful part.
+            phases.finish_step(
+                root, phase, "synthesis", status="failed", error=_first_line(str(exc))
+            )
+            raise
+        phases.finish_step(
+            root, phase, "synthesis", status="ok", exit_code=code, artifact=plan_path
         )
         if not args.quiet:
             print("  " + "─" * 60)
-        print(f"planning agent exited {code}; plan: {plan_path}")
-        source = f"{doc.name} (agent)"
+        label = "synthesis agent" if artifacts is not None else "planning agent"
+        print(f"{label} exited {code}; plan: {plan_path}")
+        source = f"{doc.name} (staged)" if artifacts is not None else f"{doc.name} (agent)"
+        if artifacts is not None:
+            pipeline_artifacts = artifacts
+            extra_findings = analysis.reconcile(document, artifacts)
+            # Whether each obligation traces to a heading that exists. Checked
+            # against the inventory the requirements stage wrote rather than the
+            # plan's copy of it, so a synthesizer that tidied a source cannot
+            # launder a citation the stage got wrong.
+            extra_findings += planning.untraceable_requirements(
+                artifacts.requirements.requirements if artifacts.requirements else [],
+                doc,
+            )
 
     milestones = document.milestones
     summary = planner.summarize(milestones)
@@ -154,13 +323,36 @@ def cmd_plan(args) -> int:
         )
         return 0
 
-    created, findings = _commit_plan(
-        args,
-        root=root,
-        doc=doc,
-        document=document,
-        plan_path=plan_path,
-        source=source,
+    phases.start_step(root, phase, "commit", artifact=plan_path or "")
+    try:
+        created, findings = _commit_plan(
+            args,
+            root=root,
+            doc=doc,
+            document=document,
+            plan_path=plan_path,
+            source=source,
+            extra_findings=extra_findings,
+            pipeline_artifacts=pipeline_artifacts,
+            pipeline_results=pipeline_results,
+            pipeline_id=pipeline_id,
+            pipeline_directory=pipeline_directory,
+        )
+    except WritError as exc:
+        # The overwrite gate and every structural refusal come out here. Recorded
+        # before the exception leaves, because a commit that refused is the most
+        # informative thing on the record: the agents ran, their artifacts are on
+        # disk, and what stopped is the one step that did not.
+        phases.finish_step(
+            root, phase, "commit", status="failed", error=_first_line(str(exc))
+        )
+        raise
+    phases.finish_step(
+        root,
+        phase,
+        "commit",
+        status="ok",
+        note=f"{summary['milestones']} milestone(s), {created} task(s)",
     )
     print(
         f"created {summary['milestones']} milestones and {created} tasks "
@@ -174,7 +366,7 @@ def cmd_plan(args) -> int:
     for section in missing:
         print(f"note: no section titled {section!r} in {doc.name}", file=sys.stderr)
     _print_findings(findings)
-    if getattr(args, "critics", None) is not None:
+    if _critics_requested(args):
         # `--critics` absent is None and runs nothing; `--critics` with no names is
         # `[]` and means all of them. The distinction matters because the flag is
         # opt-in — it spends an agent run per critic — so the empty list is a
@@ -185,19 +377,268 @@ def cmd_plan(args) -> int:
             doc=doc,
             chosen=_chosen_critics(args),
             plan_path=plan_path,
+            phase=phase,
+        )
+    # Repair before approval, because repair is what makes an unattended plan
+    # approvable: the critics' blocking findings are exactly what `--auto-approve`
+    # refuses to override, and answering them is the adjudicator's job. Opt-in for
+    # the same reason as the critics — it spends agent runs — and bounded by
+    # `adjudicate.max_rounds`, so a finding that survives its own repair reaches a
+    # human instead of looping.
+    if getattr(args, "repair", False):
+        _repair_plan(args, root=root, doc=doc, phase=phase)
+    if getattr(args, "auto_approve", False):
+        phases.start_step(root, phase, "approval")
+        approved = _auto_approve(root)
+        phases.finish_step(
+            root,
+            phase,
+            "approval",
+            status="ok" if approved else "skipped",
+            note=(
+                "approved: nothing blocking stood against the plan"
+                if approved
+                else "not approved: a blocking finding stands, which only "
+                "`writ approve --force --reason` may overrule"
+            ),
         )
     data = state.load(root)
+    counts = plancheck.tally(plans.findings(data, open_only=True))
     if plans.runnable(data):
-        print("plan approved: no blocking findings")
+        record = plans.plan_status(data)
+        print(f"plan approved by {record['approved_by']}: {record['approval_note']}")
+        if counts["warning"]:
+            print(f"  {counts['warning']} advisory finding(s) stand on the record")
         print("next: writ run")
-    else:
-        counts = plancheck.tally(plans.findings(data, open_only=True))
+    elif counts["error"]:
         print(
             f"plan held at {plans.plan_status(data)['status']}: "
             f"{counts['error']} blocking, {counts['warning']} advisory"
         )
         print("next: writ check   (then writ approve, or re-plan)")
+    else:
+        # Nothing objects, and that is deliberately not the same as approved.
+        print(
+            f"plan at {plans.plan_status(data)['status']}: nothing blocking, "
+            f"{counts['warning']} advisory"
+        )
+        print("next: writ check, writ coverage   (then writ approve)")
     return 0
+
+
+def _run_stages(
+    args,
+    *,
+    root: Path,
+    doc: Path,
+    plan_id: str,
+    context: dict[str, Any],
+    stages: list[analysis.Stage] | None = None,
+    phase: str | None = None,
+) -> tuple[analysis.Artifacts | None, list[analysis.Result], int | None]:
+    """Run the analysis stages, and say whether planning should continue.
+
+    Returns `(artifacts, results, stop)`. `stop` is an exit code when the caller
+    must not go on to synthesis: either a stage failed, or `--stage` asked for
+    the analyses alone. Otherwise it is None and `artifacts` is complete.
+
+    A failed stage stops the pipeline rather than letting synthesis proceed on a
+    partial set. Synthesising without the requirement inventory would produce
+    exactly the plan the staging exists to prevent — one whose coverage claims
+    nothing established — and it would cost an agent run to find that out.
+    """
+    if stages is None:
+        stages = analysis.upto(args.stage) if getattr(args, "stage", None) else list(
+            analysis.STAGES
+        )
+    agent = getattr(args, "stage_agent", None) or args.agent
+    model = getattr(args, "stage_model", None) or args.model
+    timeout = getattr(args, "stage_timeout", None) or args.timeout
+    # Resolve before the pipeline creates anything. An unknown --model is a
+    # WritError from `agents.resolve`, and raising it after the plan directory
+    # exists leaves a project littered with empty pipelines that never ran.
+    agents.resolve(agent, list(getattr(args, "agent_args", []) or []), model)
+    directory = state.plan_dir(root, plan_id)
+    parallel = bool(getattr(args, "parallel_stages", False))
+    grouped = analysis.waves(stages) if parallel else [[stage] for stage in stages]
+    print(f"analysing {doc.name} in {len(stages)} stage(s) with {agent}...")
+    print(f"  artifacts: {directory}")
+    if parallel and any(len(wave) > 1 for wave in grouped):
+        print(
+            "  at once: "
+            + "; then ".join(", ".join(s.name for s in wave) for wave in grouped)
+        )
+        if any(
+            len(wave) > 1 and any(s.name == "inventory" for s in wave)
+            for wave in grouped
+        ):
+            # Said plainly, because it is a real loss and it is invisible
+            # afterwards: the artifact is well-formed and simply has one field
+            # empty, so nothing downstream reports the absence as a problem.
+            print(
+                "  the inventory runs without the requirement ids, so it will "
+                "claim no existing coverage"
+            )
+
+    # A blank line before each stage and after each result. Four agents' worth of
+    # streamed output runs into one wall otherwise, and the lines that say which
+    # stage started and what it wrote are the ones a reader is scanning for.
+    def record(
+        stage: analysis.Stage, resolved: agents.ResolvedAgent, where: Path
+    ) -> None:
+        """Mark the stage running. Separate from `announce` because of the lock.
+
+        `announce` prints, so `analysis.run_stage` holds it behind the mirror lock
+        that keeps two concurrent stages from interleaving a line. This writes
+        state, which takes a lock of its own, so it is called outside that one.
+        """
+        phases.start_step(
+            root,
+            phase,
+            f"stage:{stage.name}",
+            resolved=resolved,
+            directory=where,
+            artifact=directory / stage.artifact,
+        )
+
+    def announce(stage: analysis.Stage, resolved: agents.ResolvedAgent) -> None:
+        print()
+        print(f"  {stage.name}: {stage.summary}")
+        # The command, not just the agent name: each stage may resolve its own
+        # model and event flags, and the first thing anyone does with a stage
+        # that failed or hung is run its invocation by hand.
+        print(f"    running: {resolved.display}")
+        if resolved.warning:
+            print(f"    warning: {resolved.warning}", file=sys.stderr)
+        if not args.quiet:
+            print("  " + "─" * 60)
+        sys.stdout.flush()
+
+    def finished(result: analysis.Result) -> None:
+        # A reused stage reaches here having never started: `run_stage` returns
+        # before the launch hook when the artifact is already on disk, which is the
+        # common case on `writ plan --plan-id <existing>`. `finish_step` tolerates
+        # it rather than stamping a `started_at` for a run that did not happen.
+        phases.finish_step(
+            root,
+            phase,
+            f"stage:{result.stage}",
+            status="reused" if result.reused else ("ok" if result.ok else "failed"),
+            exit_code=result.exit_code,
+            error=_first_line(result.error or ""),
+            artifact=result.path,
+            directory=directory / result.stage,
+        )
+        if not args.quiet and not result.reused:
+            print("  " + "─" * 60)
+        if result.reused:
+            print(f"  {result.stage}: reusing {result.path.name}")
+        elif result.ok:
+            print(f"  {result.stage}: wrote {result.path.name}")
+        else:
+            print(f"  {result.stage}: failed — {result.error}", file=sys.stderr)
+        sys.stdout.flush()
+
+    artifacts, results = analysis.run_pipeline(
+        root=root,
+        doc=doc,
+        directory=directory,
+        chosen=stages,
+        agent=agent,
+        agent_args=list(getattr(args, "agent_args", []) or []),
+        model=model,
+        timeout=timeout,
+        cwd=args.cwd,
+        instructions=args.instructions,
+        context=context,
+        refresh=bool(getattr(args, "refresh", False)),
+        stream=not args.quiet,
+        parallel=parallel,
+        on_start=announce,
+        on_finish=finished,
+        on_launch=record,
+    )
+    failed = [result for result in results if not result.ok]
+    if failed:
+        names = ", ".join(result.stage for result in failed)
+        print(
+            f"planning stopped: the {names} stage produced no usable artifact.\n"
+            f"  fix or re-run with: writ plan {doc} --plan-id {plan_id}\n"
+            "  (completed stages are reused; add --refresh to redo them)",
+            file=sys.stderr,
+        )
+        return artifacts, results, 1
+
+    _print_stage_summary(artifacts)
+
+    if getattr(args, "stage", None):
+        print(
+            f"\nstages complete: {args.stage}. Nothing has been committed.\n"
+            f"  continue with: writ plan {doc} --plan-id {plan_id}"
+        )
+        return artifacts, results, 0
+    return artifacts, results, None
+
+
+def _print_stage_summary(artifacts: analysis.Artifacts) -> None:
+    """What the analyses found, before any of it becomes tasks.
+
+    Printed because these artifacts are the plan's premises, and a premise nobody
+    read is the failure mode staging is supposed to fix. The baseline in
+    particular: a run that starts with a failing suite will attribute that failure
+    to the first task that trips over it unless somebody saw this line.
+    """
+    print()
+    requirements = artifacts.requirements
+    if requirements is not None:
+        musts = sum(1 for req in requirements.requirements if req.priority == "must")
+        print(
+            f"  requirements: {len(requirements.requirements)} obligations "
+            f"({musts} must)"
+        )
+        unresolved = requirements.open_questions
+        if unresolved:
+            print(
+                f"  warning: {len(unresolved)} ambiguity(ies) with no assumed "
+                "reading — the plan will have to guess",
+                file=sys.stderr,
+            )
+    inventory = artifacts.inventory
+    if inventory is not None:
+        status = inventory.baseline_status
+        commands = ", ".join(inventory.baseline_commands) or "none named"
+        print(f"  baseline: {commands} → {status}")
+        if status == "fail":
+            print(
+                "  warning: this project's verification already fails. Failures "
+                "during execution will be ambiguous unless these are fixed first: "
+                + (", ".join(inventory.known_failures) or "unnamed"),
+                file=sys.stderr,
+            )
+        elif status == "unknown":
+            print(
+                "  warning: the baseline was never established, so a later failure "
+                "cannot be told from a pre-existing one",
+                file=sys.stderr,
+            )
+        already = inventory.satisfied()
+        if already:
+            print(f"  already satisfied by this repository: {', '.join(already)}")
+    verification = artifacts.verification
+    if verification is not None:
+        undemonstrable = [
+            str(entry.get("requirement_id", ""))
+            for entry in verification.undemonstrable
+        ]
+        print(f"  verification: {len(verification.covered)} requirements demonstrable")
+        if undemonstrable:
+            print(
+                f"  warning: no way found to demonstrate {', '.join(undemonstrable)} "
+                "— any task claiming them will be judged on prose",
+                file=sys.stderr,
+            )
+        for entry in verification.missing_infrastructure:
+            print(f"  missing infrastructure: {entry.get('need')}")
 
 
 def _print_plan(
@@ -246,6 +687,11 @@ def _commit_plan(
     document: planning.PlanDocument,
     plan_path: Path | None,
     source: str,
+    extra_findings: Iterable[plancheck.Finding] = (),
+    pipeline_artifacts: analysis.Artifacts | None = None,
+    pipeline_results: Iterable[analysis.Result] = (),
+    pipeline_id: str | None = None,
+    pipeline_directory: Path | None = None,
 ) -> tuple[int, list[plancheck.Finding]]:
     """Write the plan to state, then check it and set the plan's status.
 
@@ -279,6 +725,15 @@ def _commit_plan(
             existing = sorted(data["tasks"])
             previous = existing[-1] if existing else None
         created = 0
+        # Two passes: every task is inserted without its edges, then the edges are
+        # attached once all of them exist. `add_task` requires a dependency to be
+        # present already, which makes insertion order decide whether a plan
+        # commits — a task in M08 that legitimately depends on one in M10 is a
+        # backward edge, not a cycle, and rejecting it stranded a whole plan on an
+        # ordering writ imposed rather than one the plan got wrong. Attaching
+        # afterwards leaves the actual validation to `check_dag`, which sees the
+        # finished graph and still refuses cycles and edges to nothing.
+        deferred: list[tuple[str, list[str]]] = []
         for milestone_id, milestone, tasks in built:
             add_milestone(
                 data,
@@ -295,7 +750,6 @@ def _commit_plan(
                     task_id=task_id,
                     title=task.title,
                     milestone=milestone_id,
-                    depends_on=depends,
                     acceptances=task.acceptances,
                     allowed=task.allowed,
                     forbidden=task.forbidden,
@@ -304,10 +758,14 @@ def _commit_plan(
                     requirement_ids=task.requirement_ids,
                     notes=task.notes,
                 )
+                if depends:
+                    deferred.append((task_id, depends))
                 if task.notes:
                     add_evidence(data["tasks"][task_id], f"plan: {task.notes}")
                 created += 1
                 previous = task_id
+        for task_id, depends in deferred:
+            data["tasks"][task_id]["depends_on"] = depends
         check_dag(data)
         refresh_milestones(data)
         if args.gates:
@@ -322,10 +780,67 @@ def _commit_plan(
                 "created_at": state.utcnow(),
             }
         )
+        if pipeline_artifacts is not None and pipeline_id and pipeline_directory:
+            analysis.record(
+                data,
+                plan_id=pipeline_id,
+                directory=pipeline_directory,
+                results=pipeline_results,
+                artifacts=pipeline_artifacts,
+            )
         plans.bump(data)
         plans.set_status(data, "draft")
-        findings = plans.run_check(data, root=root.resolve())
+        # The reconcile findings go in beside writ's structural ones rather than
+        # into a channel of their own: a dropped requirement holds the plan the
+        # same way a cycle does, and `writ approve` should not need to know which
+        # kind it is overruling.
+        findings = plans.run_check(
+            data, root=root.resolve(), extra=extra_findings
+        )
     return created, findings
+
+
+def _auto_approve(root: Path) -> bool:
+    """Approve the plan without a human, when nothing blocking stands against it.
+
+    Returns whether it did. The caller records the answer: a plan that reached
+    approval and was declined is the most common end of an unattended run, and the
+    reader looking for why should find the approval step saying so rather than
+    find nothing where an approval would have been.
+
+    Deliberately narrow. `--auto-approve` is for automation that has to get from a
+    document to a running graph with nobody watching, and the one thing it must not
+    become is a way to start executing a plan writ objected to. So a blocking
+    finding is not overridden here — `writ approve --force --reason ...` is the only
+    path that does that, because accepting an objection is a judgement and the
+    record has to say whose.
+
+    Runs last, after the critics and any repair, rather than inside the commit that
+    writes the tasks. It used to run there, which meant it judged writ's structural
+    findings alone and approved the plan minutes before the critics had read it: the
+    approval was recorded, five blocking findings arrived, and `run_check` demoted
+    the plan back to `needs-approval` — leaving a record that said a plan nothing
+    blocking stood against had been approved, next to the five findings blocking it.
+    Worse while it lasted: between the commit and the last critic the plan really
+    was `approved`, so a `writ run` in another terminal would start executing a plan
+    no critic had finished reading.
+    """
+    with state.transaction(root) as data:
+        blocking = [
+            finding
+            for finding in plans.findings(data, open_only=True)
+            if finding.severity == "error"
+        ]
+        if blocking:
+            return False
+        if plans.plan_status(data)["status"] not in ("draft", "needs-approval"):
+            return False
+        plans.approve(
+            data,
+            actor="writ --auto-approve",
+            reason="no blocking findings stood against the plan",
+        )
+        return True
 
 
 def _resolve_depends(
@@ -446,7 +961,7 @@ def cmd_check(args) -> int:
     if blocking:
         print()
         print(
-            "fix the plan and re-plan, answer them one at a time with "
+            "repair them with `writ adjudicate`, answer them one at a time with "
             "`writ set F-NNNN accepted|declined --reason ...`, or accept them all "
             "with `writ approve --force --reason ...`"
         )
@@ -503,13 +1018,457 @@ def cmd_critique(args) -> int:
     return 1 if blocking or any(not report.ok for report in reports) else 0
 
 
+def _phase_for_adjudication(data: dict[str, Any]) -> str | None:
+    """The planning phase whose plan this is, or None if there is no record.
+
+    Matched on `plan_id` rather than just taking the newest: adjudication is about
+    one committed plan, and attaching its rounds to some other plan's attempt would
+    draw them into a graph they were no part of. None is a working answer — every
+    `phases.*` call is a no-op for it — which is what a project planned by an older
+    writ, or one whose plan came from `--from-plan`, gets.
+    """
+    record = phases.current(data)
+    if not record:
+        return None
+    # A positive match, not the absence of a mismatch. `pipeline.plan_id` is what
+    # names the planning run on disk and is the id `phases.begin` was given; a plan
+    # committed with `--from-plan` has no pipeline and so nothing to match on. That
+    # case has to be None: falling through on a missing id attached the rounds to
+    # whatever attempt happened to be newest, which is how a repair ends up drawn
+    # into a graph belonging to a different plan.
+    pipeline = plans.plan_status(data).get("pipeline") or {}
+    plan_id = str(pipeline.get("plan_id") or "")
+    if not plan_id or str(record.get("plan_id") or "") != plan_id:
+        return None
+    return str(record.get("id") or "") or None
+
+
+def _last_phase_step(root: Path, phase: str | None) -> str:
+    """The id of the step in the last column, which a new round follows.
+
+    A resumed loop appends after whatever the previous attempt ended with — the
+    approval it skipped, or the last re-review — so the new round is drawn where it
+    happened rather than back among the steps it came after.
+    """
+    if not phase:
+        return ""
+    data = state.load(root)
+    record = phases.current(data) or {}
+    steps = record.get("steps") or []
+    if not steps:
+        return ""
+    return str(max(steps, key=lambda entry: int(entry.get("wave", 0))).get("id") or "")
+
+
+def cmd_adjudicate(args) -> int:
+    """Repair the plan against its own findings, bounded, before it executes.
+
+    The loop writ was missing. `writ check` and `writ critique` produce findings;
+    this is what answers them. An adjudicator proposes a patch, writ validates it
+    against the invariants no agent is trusted with — a bar may not be lowered, a
+    requirement may not be dropped — applies it if it holds, then re-checks and
+    re-runs the critics so a finding closes on evidence rather than on the patch's
+    word.
+
+    Bounded on purpose, and separate from `writ approve --force`. Force is a human
+    accepting an objection on the record; this is an attempt to remove it. A plan
+    that is still objected to after its budget stops for a person rather than
+    looping.
+    """
+    root = Path(args.root)
+    data = state.load(root)
+    if not data["tasks"]:
+        raise WritError("there is no plan to repair (run `writ plan` first)")
+    if plans.plan_status(data)["status"] == "executing":
+        raise WritError(
+            "this plan is executing; a running plan is repaired by its gates, not "
+            "by adjudication (writ status)"
+        )
+    open_blocking = [
+        finding
+        for finding in plans.findings(data, open_only=True)
+        if finding.severity == "error"
+    ]
+    if not open_blocking:
+        stale = critics.unreviewed(data)
+        if not args.json:
+            print("nothing blocking stands against this plan")
+            _print_stale(stale)
+        elif args.json:
+            render.emit_json(
+                {"rounds": [], "stopped": "clean", "plan": dict(plans.plan_status(data))}
+            )
+        return 0
+    doc = Path(args.doc) if getattr(args, "doc", None) else None
+    directory = state.store_dir(root) / "adjudication" / f"r{plans.revision(data)}"
+    # Attach to the planning phase this plan was built by, so a round run from
+    # `writ adjudicate` reaches the dashboard the same way one run by
+    # `writ plan --repair` does.
+    #
+    # `writ adjudicate` is how a repair is resumed: the loop stops for a human, the
+    # human answers, and this is the command that carries on. Recording nothing
+    # meant the page kept showing the planning run that stopped — the same critics,
+    # the same one repair box — while rounds two and three were on disk and in
+    # `state.json`. The loop had run, and the only view of it said it had not.
+    phase = _phase_for_adjudication(data)
+    step_of: dict[int, str] = {}
+
+    # The revision as the loop starts, which is what `directory` is named for. Used
+    # in the step ids too so a step and the round directory it points at carry the
+    # same number; re-reading the revision per round would have named round 2 after
+    # the revision round 1 created, while its transcript sat under the old one.
+    opened_at_revision = plans.revision(data)
+
+    def step_for(number: int) -> str:
+        """The step id for this round, declared the first time the round opens."""
+        if number not in step_of:
+            step_of[number] = f"repair:r{opened_at_revision}-{number}"
+            phases.add(
+                root,
+                phase,
+                [
+                    phases.make_step(
+                        id=step_of[number],
+                        kind="repair",
+                        name=f"repair round {number}",
+                        summary="answer the plan's blocking findings",
+                    )
+                ],
+                after=_last_phase_step(root, phase),
+            )
+        return step_of[number]
+
+    def announce(number: int, resolved) -> None:
+        phases.start_step(
+            root,
+            phase,
+            step_for(number),
+            resolved=resolved,
+            directory=directory / f"round-{number}",
+        )
+        if args.json:
+            return
+        print(f"adjudication round {number}: {len(open_blocking)} blocking")
+        print(f"  running: {resolved.display}")
+        sys.stdout.flush()
+
+    def record(round_) -> None:
+        """Close this round's step with how it ended. The record goes first."""
+        step = step_of.get(round_.number)
+        if step is None:
+            return
+        if round_.error:
+            phases.finish_step(
+                root, phase, step, status="failed", error=_first_line(round_.error)
+            )
+            return
+        if round_.refused:
+            note = f"writ refused the patch ({len(round_.refused)} reason(s))"
+        elif round_.questions:
+            note = f"raised {len(round_.questions)} question(s) for a human"
+        else:
+            note = (
+                f"applied at plan revision {round_.applied.get('revision')}; "
+                f"blocking now {round_.blocking_after}"
+            )
+        phases.finish_step(root, phase, step, status="ok", note=note)
+
+    def report(round_) -> None:
+        record(round_)
+        if args.json:
+            return
+        if round_.error:
+            print(f"  round {round_.number} failed: {round_.error}", file=sys.stderr)
+            return
+        if round_.refused:
+            print(f"  writ refused the patch ({len(round_.refused)} reason(s)):")
+            for finding in round_.refused[:6]:
+                print(f"    {finding.line()}")
+            return
+        if round_.questions:
+            print(f"  raised {len(round_.questions)} question(s) for a human")
+            return
+        applied = round_.applied
+        added = ", ".join(applied.get("tasks") or []) or "none"
+        revised = ", ".join(applied.get("revised") or []) or "none"
+        print(
+            f"  applied: added {added}; revised {revised} "
+            f"(plan revision {applied.get('revision')})"
+        )
+        print(f"  blocking now: {round_.blocking_after}")
+
+    def recheck() -> list[str]:
+        """Re-run the critics against the patched plan."""
+        if args.no_critics:
+            return []
+        chosen = _chosen_critics(args)
+        if not args.json:
+            print("  re-reviewing the patched plan")
+        _run_critics(
+            args, root=root, doc=doc, chosen=chosen, plan_path=None, phase=phase
+        )
+        return []
+
+    # The phase closed when planning ended; these rounds reopen it. In a `finally`,
+    # because every way out of here — a clean plan, a spent budget, an adjudicator
+    # that would not start — has to leave the record settled rather than showing an
+    # attempt still in flight after the process is gone.
+    phases.resume(root, phase)
+    try:
+        result = adjudicate.loop(
+            root=root,
+            doc=doc,
+            directory=directory,
+            agent=getattr(args, "adjudicator_agent", None) or args.agent,
+            model=getattr(args, "adjudicator_model", None) or args.model,
+            timeout=args.timeout,
+            cwd=args.cwd,
+            max_rounds=args.max_rounds,
+            recheck=recheck,
+            stream=not args.quiet,
+            on_round=report,
+            on_start=announce,
+        )
+    finally:
+        phases.finish(root, phase, status="done")
+    data = state.load(root)
+    if args.json:
+        render.emit_json(
+            {
+                "rounds": [
+                    {
+                        "number": round_.number,
+                        "request": round_.request_id,
+                        "revision": round_.revision,
+                        "error": round_.error,
+                        "refused": [f.to_dict() for f in round_.refused],
+                        "applied": round_.applied,
+                        "questions": round_.questions,
+                        "blocking_after": round_.blocking_after,
+                    }
+                    for round_ in result.rounds
+                ],
+                "stopped": result.stopped,
+                "resolved": result.resolved,
+                "remaining": result.remaining,
+                "plan": dict(plans.plan_status(data)),
+            }
+        )
+        return 0 if result.clean else 1
+    print()
+    print(
+        f"{len(result.rounds)} round(s): {result.resolved} finding(s) resolved, "
+        f"{result.remaining} still blocking"
+    )
+    if result.stopped and result.stopped != "clean":
+        print(f"stopped: {result.stopped}")
+    if result.clean:
+        print("next: writ approve")
+    else:
+        print("next: writ check   (then writ approve --force --reason ..., or re-plan)")
+    return 0 if result.clean else 1
+
+
+def _repair_plan(args, *, root: Path, doc: Path | None, phase: str | None = None) -> None:
+    """Run the bounded repair loop over the plan `writ plan` just committed.
+
+    The same loop `writ adjudicate` drives, reached from planning so that one
+    command can get from a document to a runnable graph unattended. Findings are
+    the whole reason it exists: the deterministic checks and the critics both
+    report, and until this runs there is nobody whose job is to answer them.
+
+    Failures here do not fail planning. The plan is committed and its objections
+    are on the record either way, and an adjudicator that could not be started is
+    a reason to read `writ check` rather than to lose the plan that was just paid
+    for. It is reported and planning carries on to say where the plan stands.
+    """
+    data = state.load(root)
+    blocking = [
+        finding
+        for finding in plans.findings(data, open_only=True)
+        if finding.severity == "error"
+    ]
+    if not blocking:
+        # The declared repair step, which was armed and not needed. Said rather
+        # than left blank: "nothing was blocking" is the good outcome, and a step
+        # that simply vanished would read as one that never ran for unknown
+        # reasons.
+        phases.finish_step(
+            root,
+            phase,
+            "repair",
+            status="skipped",
+            note="nothing blocking stood against the plan",
+        )
+        return
+    print()
+    print(f"repairing the plan: {len(blocking)} blocking finding(s)")
+    directory = state.store_dir(root) / "adjudication" / f"r{plans.revision(data)}"
+    # The declared `repair` step becomes round 1, and every round after it is
+    # appended as it opens. How many there are is not knowable here: it depends on
+    # what each patch actually fixed, which is what `adjudicate.loop` is bounded
+    # over. So the record grows as the loop does, which is the honest shape.
+    step_of = {1: "repair"}
+
+    def announce(number: int, resolved) -> None:
+        if number not in step_of:
+            step_of[number] = f"repair:round-{number}"
+            phases.add(
+                root,
+                phase,
+                [
+                    phases.make_step(
+                        id=step_of[number],
+                        kind="repair",
+                        name=f"repair round {number}",
+                        summary="answer what the previous round left blocking",
+                    )
+                ],
+                after=step_of[number - 1],
+            )
+        phases.start_step(
+            root,
+            phase,
+            step_of[number],
+            resolved=resolved,
+            directory=directory / f"round-{number}",
+        )
+        print(f"  round {number}: {resolved.display}")
+        sys.stdout.flush()
+
+    def record(round_) -> None:
+        """How the round ended, in the words the terminal uses for it."""
+        step = step_of.get(round_.number, "repair")
+        if round_.error:
+            phases.finish_step(
+                root, phase, step, status="failed", error=_first_line(round_.error)
+            )
+            return
+        if round_.refused:
+            note = f"writ refused the patch ({len(round_.refused)} reason(s))"
+        elif round_.questions:
+            note = f"raised {len(round_.questions)} question(s) for a human"
+        else:
+            note = (
+                f"applied at plan revision {round_.applied.get('revision')}; "
+                f"blocking now {round_.blocking_after}"
+            )
+        phases.finish_step(root, phase, step, status="ok", note=note)
+
+    def report(round_) -> None:
+        # One `on_round` hook, two audiences. The record goes first so the step is
+        # closed before anything can go wrong in the printing.
+        record(round_)
+        if round_.error:
+            print(f"  round {round_.number} failed: {round_.error}", file=sys.stderr)
+            return
+        if round_.refused:
+            print(f"  writ refused the patch ({len(round_.refused)} reason(s)):")
+            for finding in round_.refused[:6]:
+                print(f"    {finding.line()}")
+            return
+        if round_.questions:
+            print(f"  raised {len(round_.questions)} question(s) for a human")
+            return
+        applied = round_.applied
+        added = ", ".join(applied.get("tasks") or []) or "none"
+        print(
+            f"  applied: added {added} (plan revision {applied.get('revision')}); "
+            f"blocking now {round_.blocking_after}"
+        )
+
+    def recheck() -> list[str]:
+        """Re-run the critics against the patched plan, if they ran at all.
+
+        Tied to whether the critics read the plan in the first place. Re-running
+        them over a patch when nobody asked for them spends agent runs the operator
+        declined; skipping them when they did run would close a critic's finding on
+        the adjudicator's word, which is the one thing the loop must not do.
+        """
+        if not _critics_requested(args):
+            return []
+        print("  re-reviewing the patched plan")
+        _run_critics(
+            args,
+            root=root,
+            doc=doc,
+            chosen=_chosen_critics(args),
+            plan_path=None,
+            phase=phase,
+        )
+        return []
+
+    try:
+        result = adjudicate.loop(
+            root=root,
+            doc=doc,
+            directory=directory,
+            agent=getattr(args, "adjudicator_agent", None)
+            or getattr(args, "critic_agent", None)
+            or args.agent,
+            model=getattr(args, "adjudicator_model", None)
+            or getattr(args, "critic_model", None)
+            or args.model,
+            timeout=args.timeout,
+            cwd=args.cwd,
+            max_rounds=getattr(args, "max_rounds", None),
+            recheck=recheck,
+            stream=not args.quiet,
+            on_round=report,
+            on_start=announce,
+        )
+    except WritError as exc:
+        print(f"repair did not run: {exc}", file=sys.stderr)
+        phases.finish_step(
+            root,
+            phase,
+            step_of.get(max(step_of), "repair"),
+            status="failed",
+            error=_first_line(str(exc)),
+        )
+        return
+    print(
+        f"  {len(result.rounds)} round(s): {result.resolved} resolved, "
+        f"{result.remaining} still blocking"
+    )
+    if result.stopped and result.stopped != "clean":
+        print(f"  stopped: {result.stopped}")
+
+
+def _critics_requested(args) -> bool:
+    """Whether the critics should read the plan `writ plan` just committed.
+
+    Three states reach here, because `--critics` has three and the config has the
+    same three: absent (None) runs nothing, since each critic costs an agent run
+    and writ does not spend those unasked; `--critics` with no names, or
+    `plan.critics: true`, runs the configured set; and a list runs exactly those.
+    `False` has to be distinguished from `None` by value rather than truth — a
+    config that turns critics off looks identical to an absent flag otherwise.
+    """
+    requested = getattr(args, "critics", None)
+    if requested is None or requested is False:
+        return False
+    return True
+
+
 def _chosen_critics(args) -> list[critics.Critic]:
-    """Which critics to run: the ones named, or all of them."""
+    """Which critics to run: the ones named, the ones configured, or all of them.
+
+    `--critics coverage` names them outright. A bare `--critics`, or
+    `plan.critics: true`, defers to `critique.critics` — so a project that has
+    settled on a subset states it once rather than in both places — and with
+    neither, all of them.
+    """
     named = getattr(args, "critics", None)
-    return critics.by_name(named) if named else list(critics.CRITICS)
+    if isinstance(named, list) and named:
+        return critics.by_name(named)
+    configured = getattr(args, "critic_names", None)
+    if configured:
+        return critics.by_name(configured)
+    return list(critics.CRITICS)
 
 
-def _run_critics(args, *, root, doc, chosen, plan_path):
+def _run_critics(args, *, root, doc, chosen, plan_path, phase=None):
     """Run the critics over the committed plan and merge what they found.
 
     The plan they read is rebuilt from committed state rather than from the
@@ -519,7 +1478,45 @@ def _run_critics(args, *, root, doc, chosen, plan_path):
     data = state.load(root)
     plan_text = _plan_json(data)
     found = plans.findings(data, open_only=True)
-    directory = state.store_dir(root) / "reviews" / f"r{plans.revision(data)}"
+    revision = plans.revision(data)
+    directory = state.store_dir(root) / "reviews" / f"r{revision}"
+    parallel = bool(getattr(args, "parallel_critics", False))
+    step_id = _critic_steps(
+        root, phase, chosen, revision=revision, data=data, parallel=parallel
+    )
+    if parallel and not args.json:
+        grouped = critics.waves(chosen)
+        print(
+            "critics at once: "
+            + "; then ".join(", ".join(c.name for c in wave) for wave in grouped)
+        )
+
+    def record(critic, resolved, where) -> None:
+        """Mark the critic running, outside the lock `announce` is held behind."""
+        phases.start_step(
+            root,
+            phase,
+            step_id(critic.name),
+            resolved=resolved,
+            directory=where,
+            artifact=where / critics.REPORT_FILENAME,
+        )
+
+    def close(report) -> None:
+        counts = plancheck.tally(report.findings)
+        phases.finish_step(
+            root,
+            phase,
+            step_id(report.critic),
+            status="ok" if report.ok else "failed",
+            exit_code=report.exit_code,
+            error=_first_line(report.error or ""),
+            note=(
+                f"{counts['error']} blocking, {counts['warning']} advisory"
+                if report.ok
+                else ""
+            ),
+        )
 
     def announce(critic, resolved) -> None:
         if not args.json:
@@ -534,8 +1531,12 @@ def _run_critics(args, *, root, doc, chosen, plan_path):
             print(f"  {report.critic} failed: {report.error}", file=sys.stderr)
             return
         counts = plancheck.tally(report.findings)
+        # Named when the critics overlap. Sequentially the header two lines up
+        # says whose counts these are; concurrently four headers are printed
+        # before any of them report, so a bare count belongs to nobody.
+        who = f"{report.critic}: " if parallel else ""
         print(
-            f"  {counts['error']} blocking, {counts['warning']} advisory"
+            f"  {who}{counts['error']} blocking, {counts['warning']} advisory"
             + (f", confidence {report.confidence}" if report.confidence else "")
         )
         if report.summary:
@@ -553,8 +1554,11 @@ def _run_critics(args, *, root, doc, chosen, plan_path):
         cwd=args.cwd,
         found=found,
         stream=not args.quiet,
+        parallel=parallel,
         on_start=announce,
         on_finish=report_back,
+        on_launch=record,
+        on_close=close,
     )
     with state.transaction(root) as live:
         written = critics.record(live, reports, root=root.resolve())
@@ -566,6 +1570,61 @@ def _run_critics(args, *, root, doc, chosen, plan_path):
         if not written:
             print("the critics found nothing to report")
     return reports
+
+
+def _critic_steps(root, phase, chosen, *, revision: int, data, parallel: bool):
+    """Decide what to call each critic's step, and register a re-review's.
+
+    The critics can run more than once over one plan. `--repair` patches the plan
+    between rounds, `repair.apply_patch` bumps its revision, and `recheck` re-runs
+    every critic against the patched plan at that new revision — writing to a new
+    `reviews/r{n}` directory. So a second pass is not the declared step happening
+    again, it is a different run of the same critic against a different plan, and
+    giving it the declared step's id would overwrite the first pass's result with
+    the second's and point its transcript link at the wrong directory.
+
+    The first pass uses the declared ids, which is what lets those steps be visible
+    as pending before anything runs. A later pass mints `critic:<name>@r<revision>`
+    and appends them, because nobody could have known there would be one: it exists
+    only because the critics objected and the adjudicator patched what they found.
+    """
+    if not phase:
+        # `writ critique` and `writ adjudicate` keep no phase record; every
+        # `phases.*` call is a no-op, and the ids are never read.
+        return lambda name: f"critic:{name}"
+    record = phases.current(data) or {}
+    if record.get("id") != phase:
+        return lambda name: f"critic:{name}"
+    declared_now = {
+        str(entry.get("id")): entry for entry in record.get("steps", [])
+    }
+    first_pass = any(
+        declared_now.get(f"critic:{critic.name}", {}).get("status") == "pending"
+        for critic in chosen
+    )
+    if first_pass:
+        return lambda name: f"critic:{name}"
+
+    suffix = f"@r{revision}"
+    grouped = critics.waves(chosen) if parallel else [[critic] for critic in chosen]
+    declared = [
+        phases.make_step(
+            id=f"critic:{critic.name}{suffix}",
+            kind="critic",
+            # The revision is in the name, not only in the note: a re-review's note
+            # is rewritten with its verdict when it finishes, and without the
+            # revision the second pass then reads exactly like the first — five
+            # critic boxes twice over, with nothing to say which plan each read.
+            name=f"{critic.name} r{revision}",
+            summary=critic.brief,
+            wave=wave,
+            note=f"re-reviewing the patched plan at revision {revision}",
+        )
+        for wave, group in enumerate(grouped)
+        for critic in group
+    ]
+    phases.add(root, phase, declared, after="repair")
+    return lambda name: f"critic:{name}{suffix}"
 
 
 def _plan_json(data: dict[str, Any]) -> str:
@@ -798,7 +1857,7 @@ def _list_runs(data, args):
             continue
         if args.active and run["status"] not in runner.ACTIVE_RUN_STATUSES:
             continue
-        alive = runner.process_alive(run.get("pid"))
+        alive = runner.run_alive(run)
         rows.append(
             [
                 render.mark(run["status"]),
@@ -910,16 +1969,23 @@ def _list_gates(data, args):
 
 
 def _list_repairs(data, args):
-    """Every time a gate has asked for the plan to change, and what came of it."""
+    """Every time the plan has been asked to change, and what came of it.
+
+    Both occasions, in one list. A gate-scoped request names the gate that asked; a
+    plan-scoped one shows `plan`, because what asked was `writ adjudicate` before
+    any of it ran.
+    """
     items = repair.requests(data)
     if args.status:
         items = [item for item in items if item.get("status") == args.status]
     if args.task:
-        items = [item for item in items if item.get("gate") == args.task]
+        items = [
+            item for item in items if repair.scope_of(item) == args.task
+        ]
     rows = [
         [
             i.get("id", ""),
-            i.get("gate", ""),
+            repair.scope_of(i),
             i.get("status", ""),
             str(i.get("round", 1)),
             str(len(i.get("refusals") or [])),
@@ -929,7 +1995,7 @@ def _list_repairs(data, args):
         for i in items
     ]
     return (
-        ["ID", "GATE", "STATUS", "ROUND", "REFUSED", "FINDINGS", "SUMMARY"],
+        ["ID", "SCOPE", "STATUS", "ROUND", "REFUSED", "FINDINGS", "SUMMARY"],
         rows,
         list(items),
     )
@@ -954,7 +2020,7 @@ def cmd_show(args) -> None:
                 milestone_tasks(data, args.id), key=lambda t: t["id"]
             )
         elif kind == "run":
-            item = {**item, "alive": runner.process_alive(item.get("pid"))}
+            item = {**item, "alive": runner.run_alive(item)}
         render.emit_json(item)
         return
     renderer = {
@@ -1087,7 +2153,7 @@ def _render_run(run: dict[str, Any]) -> str:
     lines.append(f"timeout: {run.get('timeout') or '-'}")
     lines.append(
         f"pid: {run.get('pid') or '-'}  "
-        f"alive: {'yes' if runner.process_alive(run.get('pid')) else 'no'}"
+        f"alive: {'yes' if runner.run_alive(run) else 'no'}"
     )
     if run.get("supervisor_pid"):
         lines.append(f"supervisor pid: {run['supervisor_pid']}")
@@ -1096,6 +2162,18 @@ def _render_run(run: dict[str, Any]) -> str:
     lines.append(f"finished: {run.get('finished_at') or '-'}")
     if run.get("note"):
         lines.append(f"note: {run['note']}")
+    failure = run.get("failure")
+    if failure:
+        # The first question about a run that did not finish is whether to look at
+        # the code or at the machine. An unclassified error string made a reader
+        # guess, and a provider outage guesses as "the agent did badly".
+        lines.append(
+            f"failure: {failure.get('category')}"
+            + ("  (retryable)" if failure.get("retryable") else "")
+            + f"\n  {failure.get('reason', '')}"
+        )
+        for frame in failure.get("where") or []:
+            lines.append(f"  at {frame}")
     lines.append(f"dir: {run.get('dir')}")
     lines.append(f"\noutput: writ logs {run['id']}")
     lines.append(f"prompt: writ show {run['id']} --prompt")
@@ -1323,7 +2401,7 @@ def _status_payload(data: dict[str, Any]) -> dict[str, Any]:
                 "status": run["status"],
                 "pid": run.get("pid"),
                 "started_at": run.get("started_at"),
-                "alive": runner.process_alive(run.get("pid")),
+                "alive": runner.run_alive(run),
             }
             for run in active_runs
         ],
@@ -1902,7 +2980,7 @@ def _run_agent_on_task(args, *, role: str, task_id: str, extra: list[str]) -> in
     if not args.quiet:
         print("" + "─" * 62)
         sys.stdout.flush()
-    code = runner.execute(root, run_id, stream=not args.quiet, prefix="| ")
+    code = runner.execute_guarded(root, run_id, stream=not args.quiet, prefix="| ")
     if not args.quiet:
         print("" + "─" * 62)
     print(f"run {run_id} finished with exit code {code}")
@@ -2064,6 +3142,7 @@ def _configured_roles(root) -> list[dict[str, Any]]:
 ROLE_FALLBACKS = {
     "planner": "pi",
     "critic": "the planning agent",
+    "stage": "the planning agent",
     "implementer": "pi",
     "reviewer": "the implementing agent",
 }
@@ -2089,14 +3168,20 @@ def _print_roles(configured: list[dict[str, Any]], root) -> None:
     if any(row["source"] == config.FROM_CONFIG for row in configured):
         print(f"\nfrom {path}; a flag overrides any of it")
     else:
-        print(f"\nno {path}; bracketed values are what writ falls back to.")
-        print("A reviewer that is the implementing agent is the weakest of these:")
+        print(f"\nno {path}; bracketed values are what writ falls back to")
+    # Keyed on the reviewer rather than on whether anything is configured. Since
+    # `writ init` writes every field, "this project has a config" stopped implying
+    # "this project chose a reviewer" — and the unset reviewer is the whole reason
+    # this warning exists.
+    reviewer = next(row for row in configured if row["role"] == "reviewer")
+    if not reviewer["command"]:
+        print("\nreviewer is the implementing agent, the weakest of these:")
         print("a model checking its own work agrees with itself more than it should.")
 
 
 def cmd_supervise(args) -> int:
     """Internal: owns a detached run until the agent exits."""
-    return runner.execute(Path(args.root), args.run_id)
+    return runner.execute_guarded(Path(args.root), args.run_id)
 
 
 def cmd_serve(args) -> None:
@@ -2191,9 +3276,18 @@ def cmd_run(args) -> int:
     """Walk the DAG: dispatch what is ready, review what is reported, repeat.
 
     The individual commands each move one task one step. This is the one that
-    finishes a project, so its output is a progress log rather than a transcript:
-    with several agents interleaved, mirroring their stdout would be unreadable.
-    Each agent's full output is on disk, and `writ logs <task>` shows it.
+    finishes a project, so its output is a progress log first: one line per
+    transition, which is what a reader comes back to after lunch and reads.
+
+    The agents' own output is mirrored underneath it, each line tagged with the task
+    and role it came from. That used to be left out on the grounds that several
+    interleaved agents would be unreadable, which was true of an unlabelled
+    character-at-a-time mirror and is the reason `_tee` now writes whole lines under
+    one lock. The tradeoff it was trading against is worse: a silent terminal for
+    the length of a model call is indistinguishable from a hung one, and the state
+    it hides is exactly the state someone needs to see. `--no-stream` restores the
+    progress log alone, and `--json` never mirrors, because a machine-readable
+    stream with an agent's prose in it is not machine-readable.
     """
     root = Path(args.root)
     data = state.load(root)
@@ -2241,6 +3335,9 @@ def cmd_run(args) -> int:
 
     orchestrator.claim_session(root, force=args.force)
     parallel = max(1, args.parallel)
+    # `--json` is a machine-readable stream and an agent's prose is not part of it.
+    # `--quiet` asks for less, and an agent's whole transcript is not less.
+    stream = not getattr(args, "no_stream", False) and not args.json and not args.quiet
     if not args.json:
         print(
             f"running up to {parallel} agent{'s' if parallel > 1 else ''} at a time"
@@ -2254,8 +3351,14 @@ def cmd_run(args) -> int:
             )
         )
         print(f"logs: {state.runs_dir(root)}")
+        if not stream:
+            print("streaming off: transitions only (writ logs <task> for output)")
         print("─" * 62)
-    reporter = _RunReporter(quiet=args.quiet, json_events=args.json)
+    # Shared with the agents' mirrored output so the two cannot interleave mid-line.
+    output_lock = threading.Lock()
+    reporter = _RunReporter(
+        quiet=args.quiet, json_events=args.json, lock=output_lock
+    )
     try:
         session = orchestrator.run(
             root,
@@ -2270,7 +3373,10 @@ def cmd_run(args) -> int:
             timeout=args.timeout,
             cwd=args.cwd,
             max_rework=getattr(args, "max_rework", None),
+            max_infra_retries=getattr(args, "max_infra_retries", None),
             on_event=reporter,
+            stream=stream,
+            lock=output_lock,
         )
     finally:
         orchestrator.release_session(root)
@@ -2284,6 +3390,10 @@ def cmd_run(args) -> int:
                 "completed": session.completed,
                 "failed": session.failed,
                 "reworked": session.reworked,
+                # Separate keys, because these are not failures. A consumer that
+                # summed them into `failed` would report an outage as rejected work.
+                "infra_retries": session.infra_retries,
+                "infra_blocked": session.infra_blocked,
                 "errors": session.errors,
                 "stopped": session.stopped or session.aborted,
                 "remaining": [
@@ -2374,14 +3484,20 @@ def _first_line(text: str, limit: int = 96) -> str:
 class _RunReporter:
     """Turns scheduler events into a readable progress log.
 
-    Interleaved agent output is noise, so this reports transitions instead: what
-    started, what it produced, and what that unblocked.
+    Transitions only: what started, what it produced, and what that unblocked. When
+    the agents' own output is streamed it runs underneath these lines rather than
+    replacing them — the transcript says what an agent did, and this says what writ
+    did about it, which is the shorter and more re-readable of the two.
     """
 
-    def __init__(self, *, quiet: bool, json_events: bool) -> None:
+    def __init__(
+        self, *, quiet: bool, json_events: bool, lock: threading.Lock | None = None
+    ) -> None:
         self.quiet = quiet
         self.json_events = json_events
-        self.lock = threading.Lock()
+        # The same lock the streamed agent output holds, when there is any, so a
+        # transition line and an agent's line cannot land on top of each other.
+        self.lock = lock or threading.Lock()
 
     def __call__(self, name: str, payload: dict[str, Any]) -> None:
         with self.lock:
@@ -2416,6 +3532,16 @@ class _RunReporter:
             return f"cancelled {payload['task']} (run {payload['run']})"
         if name == "error":
             return f"error    {payload['task']}: {payload['message']}"
+        if name == "retrying":
+            # Said explicitly, and said as infrastructure. A retry that printed
+            # like a rework would have the reader looking for a review that never
+            # happened, which is the confusion this whole classification removes.
+            return (
+                f"retry    {payload['task']}  infrastructure "
+                f"{payload['attempt']}/{payload['budget']} "
+                f"in {payload['in']}s"
+                + (f"  ({_first_line(payload['reason'])})" if payload.get("reason") else "")
+            )
         return None
 
     def _finished(self, payload: dict[str, Any]) -> str:
@@ -2450,10 +3576,21 @@ class _RunReporter:
             )
 
         line = "  ".join(parts)
+        if payload.get("retry_in") is not None:
+            # An infrastructure failure that bought another attempt. The status is
+            # whatever the task was returned to, which on its own reads as work
+            # that quietly went nowhere.
+            line += f"  (retrying in {payload['retry_in']}s)"
         if payload["error"]:
             line += f"  ({payload['error']})"
         elif payload["exit_code"] not in (0, None):
             line += f"  (exit {payload['exit_code']})"
+        if payload.get("failure"):
+            # The classified failure, in addition to the exit code rather than
+            # instead of it. The code says what happened to the process; this says
+            # whether the reader should be looking at their code or at their
+            # provider, and only one of those is answerable from a number.
+            line += f"  ({payload['failure']})"
 
         detail = []
         reason = payload.get("summary")

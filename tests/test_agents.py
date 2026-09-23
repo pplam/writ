@@ -185,3 +185,53 @@ def test_agents_command_needs_no_project(tmp_path):
 
     code, out, _ = run("--root", str(tmp_path), "agents")
     assert code == 0 and "pi" in out
+
+
+# --------------------------------------------------------------------------
+# asking for the event stream, so a long run can be watched while it runs
+
+
+def test_events_are_not_asked_for_unless_wanted():
+    assert agents.resolve("pi", model="x").command == ["pi", "-p", "--model", "x"]
+    assert agents.resolve("pi").event_shape == ""
+
+
+def test_pi_asks_for_json_events_and_reports_its_shape():
+    resolved = agents.resolve("pi", events=True)
+    assert resolved.command == ["pi", "-p", "--mode", "json"]
+    assert resolved.event_shape == "pi"
+
+
+def test_claude_asks_for_its_own_stream_format():
+    resolved = agents.resolve("claude", events=True)
+    assert resolved.command == ["claude", "-p", "--output-format", "stream-json", "--verbose"]
+    assert resolved.event_shape == "claude"
+
+
+def test_an_agent_with_no_adapter_is_left_alone():
+    # codex has no event shape writ knows how to read, so nothing is added and
+    # nothing claims to be parseable
+    resolved = agents.resolve("codex", events=True)
+    assert resolved.command == ["codex", "exec", "-"]
+    assert resolved.event_shape == ""
+
+
+def test_an_operator_who_set_the_mode_themselves_keeps_it():
+    """Their flag decides the format, so writ must not claim a shape it may not get."""
+    resolved = agents.resolve("pi --mode rpc", events=True)
+    assert resolved.command == ["pi", "--mode", "rpc"]
+    assert resolved.event_shape == ""
+
+
+def test_the_event_flag_lands_before_a_stdin_suffix():
+    """A trailing `-` must stay trailing, or the agent reads the flag as the prompt."""
+    profile = agents.AgentProfile(
+        prefix=("exec",), suffix=("-",), event_args=("--json",), event_shape="pi"
+    )
+    agents.PROFILES["fake-agent"] = profile
+    try:
+        assert agents.resolve("fake-agent", events=True).command == [
+            "fake-agent", "exec", "--json", "-"
+        ]
+    finally:
+        del agents.PROFILES["fake-agent"]

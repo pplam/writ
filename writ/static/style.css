@@ -1,4 +1,4 @@
-/* built from ui/src (23891edef615) */
+/* built from ui/src (c4b5e6adf002) */
 /*
  * One stylesheet, no framework.
  *
@@ -230,6 +230,21 @@ code, .mono, pre { font-family: var(--mono); }
   gap: 14px;
   align-items: start;
 }
+
+/*
+ * A grid item is `min-width: auto`, which means "at least as wide as my content"
+ * — so a card holding something wide grows past its column instead of letting
+ * the scroller inside it scroll. The phase graph is that card: at fourteen steps
+ * it is 2900px wide, the card grew to match, `.phase-holder` had nothing left to
+ * scroll, and the whole page scrolled sideways instead. Everything past the
+ * critics — the repair round, the re-review, the approval — sat off the right
+ * edge of a page that gave no sign there was more, so a repair that had run read
+ * as one that never did.
+ *
+ * On the item rather than on `.phase-holder`, because it is every wide card's
+ * bug: the same thing happened to a long acceptance command in a task card.
+ */
+.grid > * { min-width: 0; }
 
 .grid.one { grid-template-columns: 1fr; }
 
@@ -948,6 +963,66 @@ pre.command {
 
 .held { border-left-color: var(--i-review); }
 
+/*
+ * The planning pipeline, as a sequence.
+ *
+ * Numbered and ordered because the order is the content: which stage stopped
+ * decides what the plan does and does not rest on, and a set of badges would not
+ * say that. A pending stage is dimmed rather than hidden — a pipeline missing its
+ * verification analysis has to look different from one that never had a third
+ * stage at all.
+ */
+.stage-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.stage {
+  border: 1px solid var(--line);
+  border-left-width: 2.5px;
+  border-left-color: var(--edge);
+  border-radius: var(--radius);
+  padding: 8px 12px;
+  background: var(--panel);
+}
+
+.stage header { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.stage p { margin: 3px 0 0; }
+.stage-mark { font-family: var(--mono); color: var(--dim); }
+
+.stage.ok { border-left-color: var(--i-completed); }
+.stage.reused { border-left-color: var(--i-running); }
+.stage.failed { border-left-color: var(--i-failed); }
+.stage.pending { opacity: 0.6; border-left-style: dashed; }
+
+.stage.ok .stage-mark { color: var(--i-completed); }
+.stage.failed .stage-mark { color: var(--i-failed); }
+
+.pill.ok, .pill.reused { background: var(--s-planned); color: var(--dim); }
+.pill.pending { border: 1px dashed var(--edge); color: var(--faint); }
+
+/*
+ * What the suite did before the plan existed.
+ *
+ * Sunken rather than a card of its own: it belongs to the inventory stage above it,
+ * and a red border here would read as this plan having broken something.
+ */
+.baseline {
+  margin-top: 10px;
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  background: var(--sunken);
+}
+
+.baseline header { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.baseline p { margin: 4px 0 0; }
+.baseline .meta-row { margin-top: 4px; }
+.baseline.bad { background: var(--s-failed); }
+
 .finding .command, .held .command, .card .ruling .command { margin: 8px 0 0; }
 
 /* The filter chip for the view you are on. */
@@ -993,3 +1068,41 @@ pre.command {
 .held-questions li { margin-bottom: 3px; }
 
 .pill.pass { background: var(--s-completed); color: var(--i-completed); }
+
+/*
+ * The planning phase graph.
+ *
+ * Reuses the task graph's node vocabulary — the same box, the same marks, the same
+ * `breathe` on a live one — because a reader should not have to learn two graphs.
+ * What it adds is the statuses a task never has: `pending` for a step writ has
+ * declared and not reached, `reused` for one whose artifact was already on disk,
+ * and `skipped` for one it decided against.
+ *
+ * `pending` is dashed and dimmed rather than absent. The whole point of declaring
+ * the steps up front is that the shape of the attempt is visible before it happens,
+ * and a box that is plainly not-yet is what says so.
+ */
+.phase-holder { overflow: auto; padding-bottom: 8px; margin-top: 10px; }
+.phase-dag { display: block; }
+
+.node.step .box { fill: var(--s-planned); stroke: var(--edge); }
+.node.step.pending .box { fill: none; stroke: var(--edge); stroke-dasharray: 4 3; }
+.node.step.running .box { fill: var(--s-running); stroke: var(--i-running); stroke-width: 1.6; }
+.node.step.ok .box { fill: var(--s-completed); stroke: var(--i-completed); }
+.node.step.reused .box { fill: var(--s-planned); stroke: var(--i-running); stroke-dasharray: 2 2; }
+.node.step.failed .box { fill: var(--s-failed); stroke: var(--i-failed); }
+.node.step.abandoned .box { fill: var(--s-review); stroke: var(--i-review); stroke-dasharray: 5 3; }
+.node.step.skipped .box { fill: none; stroke: var(--edge); opacity: 0.7; }
+
+.node.step.pending .node-title, .node.step.skipped .node-title { fill: var(--dim); }
+.node.step.ok .node-mark { fill: var(--i-completed); }
+.node.step.failed .node-mark { fill: var(--i-failed); }
+.node.step.running .node-mark { fill: var(--i-running); }
+
+/*
+ * The activity pane: what the agent is doing, in the terminal's own vocabulary.
+ *
+ * Shorter than the raw log beside it, because it is the summary — one line per tool
+ * call, per thought, per thing said — and the log below has the detail.
+ */
+pre.log.activity { max-height: 30vh; background: var(--sunken); border-radius: 6px; }

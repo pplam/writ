@@ -13,7 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, IO, Iterable
 
-from . import agents, decisions, planner, plans, repair, state, verdict
+from . import agents, decisions, failures, planner, plans, procs, repair, state, verdict
+from .stream import Renderer
 from .model import (
     DEFAULT_MAX_REWORK,
     add_evidence,
@@ -743,14 +744,45 @@ TIMEOUT_NOTE = "writ: agent exceeded its timeout and was terminated"
 
 
 def _tee(
-    source: IO[str], sink: IO[str], mirror: IO[str] | None, prefix: str = ""
+    source: IO[str],
+    sink: IO[str],
+    mirror: IO[str] | None,
+    prefix: str = "",
+    lock: threading.Lock | None = None,
 ) -> None:
     """Copy a stream to a file and optionally to the terminal, line by line.
 
     Read in small chunks rather than by line: an agent that draws progress with
     carriage returns and no newline would otherwise appear frozen.
+
+    `lock`, when given, makes each mirrored line one atomic write. Several agents
+    running at once each have two of these pumps, and a character-at-a-time mirror
+    would splice their output together mid-word — which is the reason `writ run`
+    had nothing to mirror to at all. Holding the lock for a whole line is enough:
+    the label at the start of a line is what makes interleaved output attributable,
+    and it is only true if nothing else can write between the label and the text.
+    The transcript on disk is unaffected either way, and stays byte-for-byte what
+    the agent wrote.
     """
     at_line_start = True
+    pending: list[str] = []
+
+    def flush_line(final: bool = False) -> None:
+        """Write one buffered line to the terminal under the lock."""
+        if mirror is None or not pending:
+            return
+        line = "".join(pending)
+        pending.clear()
+        if final and not line.endswith(("\n", "\r")):
+            line += "\n"
+        if lock is not None:
+            with lock:
+                mirror.write(line)
+                mirror.flush()
+        else:
+            mirror.write(line)
+            mirror.flush()
+
     while True:
         chunk = source.read(1)
         if not chunk:
@@ -760,13 +792,62 @@ def _tee(
         if mirror is None:
             continue
         if prefix and at_line_start:
-            mirror.write(prefix)
-        mirror.write(chunk)
-        mirror.flush()
+            pending.append(prefix)
+        pending.append(chunk)
         at_line_start = chunk in ("\n", "\r")
-    if mirror is not None and not at_line_start:
-        mirror.write("\n")
-        mirror.flush()
+        if at_line_start:
+            flush_line()
+    # Whatever the agent left without a trailing newline: a prompt it was waiting
+    # on, or a progress line it never finished.
+    flush_line(final=True)
+
+
+#: the agent's own event stream, kept beside the transcript it was rendered into
+EVENTS_FILENAME = "events.jsonl"
+
+
+def _pump_events(
+    source: IO[str],
+    transcript: IO[str],
+    raw: IO[str],
+    shape: str,
+    mirror: IO[str] | None,
+    prefix: str = "",
+    lock: threading.Lock | None = None,
+    reasons: list[str] | None = None,
+) -> None:
+    """Read a structured event stream, showing activity and recording speech.
+
+    Three destinations, because they answer different questions. `raw` gets every
+    event byte for afterwards — it is the only place the stop reason survives.
+    `transcript` gets just what the agent said, so `stdout.log` stays what text
+    mode would have written and everything that parses it keeps working. `mirror`
+    gets a line per event worth watching, which is the whole reason for asking
+    for events in the first place.
+
+    Line-oriented rather than chunked like `_tee`: an event is a line by
+    definition, and a partial line carries nothing to render yet.
+    """
+    renderer = Renderer(shape)
+    for line in source:
+        raw.write(line)
+        raw.flush()
+        rendered = renderer.feed(line)
+        if rendered.text:
+            transcript.write(rendered.text)
+            transcript.flush()
+        if rendered.stop_reason is not None and reasons is not None:
+            reasons.append(rendered.stop_reason)
+        if mirror is None or not rendered.activity:
+            continue
+        shown = "".join(f"{prefix}{item}\n" for item in rendered.activity)
+        if lock is not None:
+            with lock:
+                mirror.write(shown)
+                mirror.flush()
+        else:
+            mirror.write(shown)
+            mirror.flush()
 
 
 def _feed(process: subprocess.Popen, prompt: str) -> None:
@@ -795,6 +876,9 @@ def run_agent(
     *,
     stream: bool = False,
     prefix: str = "",
+    event_shape: str = "",
+    stop_reasons: list[str] | None = None,
+    mirror_lock: threading.Lock | None = None,
 ) -> int:
     """Run a coding agent to completion, leaving a full transcript on disk.
 
@@ -805,9 +889,24 @@ def run_agent(
     With `stream`, output is mirrored to this terminal as it arrives, so a long
     agent run is visibly working instead of looking hung. The transcript on disk
     is written either way and is the same bytes.
+
+    With `event_shape`, the agent was asked for structured events instead of
+    prose. They are rendered into activity for the terminal and speech for the
+    transcript, and kept verbatim in `events.jsonl`. `stdout.log` still holds
+    only what the agent said, so this changes what a watching person sees without
+    changing what anything downstream reads. Rendering happens whether or not
+    anyone is watching: `stop_reasons`, filled from the stream, is how a caller
+    tells a truncated run from one that never started, and `--quiet` should not
+    cost that.
+
+    `mirror_lock` is shared by every agent a caller runs at once, so each mirrored
+    line reaches the terminal whole. Without it two concurrent agents splice their
+    output together mid-word and the prefix that says which one is speaking stops
+    meaning anything.
     """
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "prompt.txt").write_text(prompt, encoding="utf-8")
+    piped = stream or bool(event_shape)
     with (directory / "stdout.log").open("w", encoding="utf-8") as out, (
         directory / "stderr.log"
     ).open("w", encoding="utf-8") as err:
@@ -815,13 +914,13 @@ def run_agent(
             command,
             cwd=str(cwd),
             stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE if stream else out,
-            stderr=subprocess.PIPE if stream else err,
+            stdout=subprocess.PIPE if piped else out,
+            stderr=subprocess.PIPE if piped else err,
             text=True,
             bufsize=1,
             start_new_session=True,
         )
-        if not stream:
+        if not piped:
             try:
                 process.communicate(input=prompt, timeout=timeout)
                 return process.returncode
@@ -830,48 +929,107 @@ def run_agent(
 
         # tee in threads: the agent may write a lot to either stream, and a
         # full pipe buffer would deadlock a single-threaded reader
-        pumps = [
-            threading.Thread(
-                target=_tee, args=(process.stdout, out, sys.stdout, prefix), daemon=True
-            ),
-            threading.Thread(
-                target=_tee, args=(process.stderr, err, sys.stderr, prefix), daemon=True
-            ),
-        ]
-        for pump in pumps:
-            pump.start()
+        raw: IO[str] | None = None
+        if event_shape:
+            raw = (directory / EVENTS_FILENAME).open("w", encoding="utf-8")
         try:
-            _feed(process, prompt)
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
+            if event_shape and raw is not None:
+                stdout_pump = threading.Thread(
+                    target=_pump_events,
+                    args=(
+                        process.stdout,
+                        out,
+                        raw,
+                        event_shape,
+                        sys.stdout if stream else None,
+                        prefix,
+                        mirror_lock,
+                        stop_reasons,
+                    ),
+                    daemon=True,
+                )
+            else:
+                stdout_pump = threading.Thread(
+                    target=_tee,
+                    args=(
+                        process.stdout,
+                        out,
+                        sys.stdout if stream else None,
+                        prefix,
+                        mirror_lock,
+                    ),
+                    daemon=True,
+                )
+            pumps = [
+                stdout_pump,
+                threading.Thread(
+                    target=_tee,
+                    args=(
+                        process.stderr,
+                        err,
+                        sys.stderr if stream else None,
+                        prefix,
+                        mirror_lock,
+                    ),
+                    daemon=True,
+                ),
+            ]
             for pump in pumps:
-                pump.join(timeout=1)
-            return _timed_out(process, directory, out, err)
-        for pump in pumps:
-            pump.join(timeout=5)
-        return process.returncode
+                pump.start()
+            try:
+                _feed(process, prompt)
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                for pump in pumps:
+                    pump.join(timeout=1)
+                return _timed_out(process, directory, out, err, raw=raw)
+            for pump in pumps:
+                pump.join(timeout=5)
+            return process.returncode
+        finally:
+            if raw is not None:
+                raw.close()
 
 
 def _timed_out(
-    process: subprocess.Popen, directory: Path, out: IO[str], err: IO[str]
+    process: subprocess.Popen,
+    directory: Path,
+    out: IO[str],
+    err: IO[str],
+    raw: IO[str] | None = None,
 ) -> int:
     """Kill a run that overran, recording whether it had said anything."""
     _terminate(process.pid)
     process.wait(timeout=10)
     out.flush()
     err.flush()
+    # The event stream counts as having said something even when the transcript is
+    # empty: an agent that spent the whole timeout thinking wrote nothing a person
+    # would read, but it plainly did run, and calling that silent sends whoever
+    # reads the message looking at authentication instead.
+    if raw is not None:
+        raw.flush()
+    busy = raw is not None and raw.tell() > 0
     # measured before writing our own note, so callers can still tell a silent
     # hang from an agent that produced output and then stalled
-    if err.tell() == 0 and out.tell() == 0:
+    if err.tell() == 0 and out.tell() == 0 and not busy:
         (directory / "silent").write_text("", encoding="utf-8")
     err.write(f"\n{TIMEOUT_NOTE}\n")
     return 124
 
 
 def produced_output(directory: Path) -> bool:
-    """Whether the agent itself wrote anything, ignoring writ's own notes."""
+    """Whether the agent itself wrote anything, ignoring writ's own notes.
+
+    An event stream counts. A run that thought for four minutes and was cut off
+    before it could act leaves no transcript at all, and the question this answers
+    is whether the agent ran — not whether it managed to say something.
+    """
     if (directory / "silent").exists():
         return False
+    events = directory / EVENTS_FILENAME
+    if events.exists() and events.stat().st_size > 0:
+        return True
     for name in ("stdout.log", "stderr.log"):
         path = directory / name
         if not path.exists():
@@ -1023,6 +1181,13 @@ def prepare(
             # starts. Without it there is a window between claiming and running
             # in which the run has no live pid and looks abandoned, so a second
             # process could claim the same task.
+            #
+            # `owner` is the composite identity — pid, start time, host, token —
+            # and `owner_pid` is the same pid on its own, kept because a project
+            # planned by an older writ has only that field and everything that
+            # reads ownership still has to work. A bare pid cannot survive being
+            # reused, which is what `owner` is for.
+            "owner": procs.identify().to_dict(),
             "owner_pid": os.getpid(),
             "dir": str(directory),
         }
@@ -1042,6 +1207,67 @@ def prepare(
     return run_id, directory, prompt, resolved
 
 
+def run_owner(run: dict[str, Any]) -> Any:
+    """The one process responsible for this run, or None if nothing is recorded.
+
+    A precedence chain, not a set, and the precedence is the point. Three things
+    can own a run over its life, and the later ones supersede the earlier:
+
+    * a detached supervisor, which outlives the CLI that spawned it;
+    * the agent's own process, once it has been spawned;
+    * the process that claimed the task, which covers only the window before an
+      agent has a pid at all.
+
+    So an agent that has died is a dead run even though the scheduler that claimed
+    it is still very much alive — asking whether *anything* on the list is running
+    would report every crashed agent as working, for as long as the terminal that
+    started it stayed open.
+
+    Returned as whatever the store holds: a composite identity where one was
+    recorded, a bare pid from an older writ, and `procs` accepts both.
+    """
+    for candidate in (
+        run.get("supervisor") or run.get("supervisor_pid"),
+        run.get("identity") or run.get("pid"),
+        run.get("owner") or run.get("owner_pid"),
+    ):
+        if candidate:
+            return candidate
+    return None
+
+
+def run_alive(run: dict[str, Any]) -> bool:
+    """Whether the process responsible for this run is still running.
+
+    Identity-checked, so a pid the kernel has since handed to an unrelated
+    process no longer counts as this run still working.
+
+    A settled run is never alive, whatever its recorded owner is doing. For a run
+    that finished in this very process the owner *is* the caller asking the
+    question, and without this a completed run would report itself live.
+    """
+    if run.get("status") not in ACTIVE_RUN_STATUSES:
+        return False
+    return procs.alive(run_owner(run))
+
+
+def run_abandoned(run: dict[str, Any]) -> bool:
+    """Whether the process responsible for this run is *provably* gone.
+
+    The inverse of `run_alive` is not good enough for reaping. Reaping rewrites a
+    task's status, so it wants proof rather than a failed probe: a run recorded on
+    another host, or one whose pid is alive but whose identity cannot be checked,
+    is left alone.
+
+    A run with no recorded owner is abandoned — nothing was ever claimed, so there
+    is nothing that could still be making progress.
+    """
+    owner = run_owner(run)
+    if owner is None:
+        return True
+    return procs.confirmed_dead(owner)
+
+
 def _live_run_for(data: dict[str, Any], task_id: str) -> str | None:
     """The id of a run on this task whose process is still alive, if any.
 
@@ -1052,18 +1278,28 @@ def _live_run_for(data: dict[str, Any], task_id: str) -> str | None:
         run = data["runs"].get(run_id)
         if run is None or run["status"] not in ACTIVE_RUN_STATUSES:
             continue
-        owner = run.get("supervisor_pid") or run.get("pid") or run.get("owner_pid")
-        if process_alive(owner):
+        if run_alive(run):
             return run_id
     return None
 
 
-def execute(root: Path, run_id: str, *, stream: bool = False, prefix: str = "") -> int:
+def execute(
+    root: Path,
+    run_id: str,
+    *,
+    stream: bool = False,
+    prefix: str = "",
+    lock: threading.Lock | None = None,
+) -> int:
     """Run the agent synchronously and record the outcome.
 
     Unlike `run_agent`, this records the pid in project state so another
     terminal can watch or cancel the run, and it converts the exit code into
     task status. With `stream`, output is also mirrored to this terminal.
+
+    `lock` is shared by every concurrent caller mirroring to the same terminal, so
+    `writ run` can stream several agents at once and have each line stay whole and
+    labelled. Without it a single run streams exactly as before.
     """
     data = state.load(root)
     run = data["runs"].get(run_id)
@@ -1093,12 +1329,12 @@ def execute(root: Path, run_id: str, *, stream: bool = False, prefix: str = "") 
                 pumps = [
                     threading.Thread(
                         target=_tee,
-                        args=(process.stdout, out, sys.stdout, prefix),
+                        args=(process.stdout, out, sys.stdout, prefix, lock),
                         daemon=True,
                     ),
                     threading.Thread(
                         target=_tee,
-                        args=(process.stderr, err, sys.stderr, prefix),
+                        args=(process.stderr, err, sys.stderr, prefix, lock),
                         daemon=True,
                     ),
                 ]
@@ -1123,6 +1359,32 @@ def execute(root: Path, run_id: str, *, stream: bool = False, prefix: str = "") 
         raise WritError(f"agent command not found: {run['command'][0]}") from exc
     _finish(root, run_id, code)
     return code
+
+
+def execute_guarded(root: Path, run_id: str, **kwargs: Any) -> int:
+    """`execute`, with the guarantee that a raise still settles the run.
+
+    For the single-shot entry points — `writ dispatch`, `writ review`, and the
+    detached supervisor — which have the same exposure the scheduler had: the task
+    is already claimed by `prepare`, so an exception between there and `_finish`
+    leaves it claimed by a process that is about to exit.
+
+    A later `reap` would recover it, since the owner really is dead by then. But
+    "recovered whenever someone next runs writ" is not the same as recovered: the
+    task is invisible to every queue until then, and the record says nothing about
+    what went wrong. The exception is re-raised unchanged, so the CLI reports it
+    exactly as before.
+    """
+    try:
+        return execute(root, run_id, **kwargs)
+    except BaseException as exc:
+        try:
+            reconcile(root, run_id, failures.classify(exc))
+        except Exception:  # pragma: no cover - the store is unavailable
+            # The original failure is the one worth raising. Reaping remains the
+            # backstop for the record.
+            pass
+        raise
 
 
 def _finish_repair(
@@ -1263,10 +1525,16 @@ def _patch_text(directory: Path) -> str | None:
 
 
 def _mark_running(root: Path, run_id: str, pid: int) -> None:
+    # The agent's identity is probed rather than stamped: its start time is read
+    # from the process itself, so a later check compares two readings of the same
+    # thing instead of trusting a clock we happened to look at. That is what makes
+    # `cancel` refuse to signal a pid the kernel has recycled since.
+    identity = procs.identify(pid)
     with state.transaction(root) as data:
         run = data["runs"][run_id]
         run["status"] = "running"
         run["pid"] = pid
+        run["identity"] = identity.to_dict()
         run["started_at"] = utcnow()
 
 
@@ -1364,28 +1632,6 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
                 return
 
         # No usable verdict. Record what happened without inventing a judgement.
-        # Where the task lands depends on which role failed to report, the same
-        # distinction `reap` draws: a lost implementation returns to the queue,
-        # but a lost *review* leaves the implementation standing and only the
-        # judgement missing, so the task goes back to `awaiting-review`. Sending
-        # it to `planned` discarded a completed implementation's place in the
-        # queue and left criteria marked passed under a status that says the work
-        # has not started — a state no reader can make sense of.
-        if task["status"] in ("running", "reviewing"):
-            if code != 0:
-                task["status"] = "failed"
-            elif role == "reviewer":
-                task["status"] = "awaiting-review"
-            else:
-                task["status"] = "planned"
-            task["updated_at"] = utcnow()
-        # Recorded on this path too, not only after a verdict is applied. The first
-        # question about a run that judged nothing is where the task ended up, and
-        # the answer is no longer the same for every such run: a lost review holds
-        # at `awaiting-review` while a lost implementation returns to the queue.
-        # Left unset, anything reporting this had to guess, and the dashboard
-        # guessed one of them for both.
-        run["resulting_status"] = task["status"]
         reason = "exited without writing a usable verdict" + (
             f" ({note})" if note else ""
         )
@@ -1419,6 +1665,53 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
                 "rather than made, so the model garbled the call syntax and the "
                 "turn ended without it doing the work"
             )
+        # Classified before the task's status is decided, because the
+        # classification is what decides it. Two of the ways a run ends unjudged
+        # are writ's own machinery failing rather than the work coming out wrong
+        # — a killed hang, and an agent that never reached a model — and neither
+        # raises, so neither reached `failures.classify`. Both used to land the
+        # task at `failed`, which reads as "this work was judged and found
+        # wanting" and is the exact signal corruption the classification exists
+        # to stop. It needs the `no_output` flag above, hence the order.
+        failure = failures.from_run(run)
+        if failure is not None:
+            run["failure"] = failure.to_dict()
+            if failure.retryable:
+                # Counted on the task, in the same place `reconcile` counts the
+                # exception path. The budget has to be the same budget whichever
+                # way the job died, and it has to survive a scheduler that is
+                # killed mid-backoff and resumed.
+                _note_infrastructure_failure(data, run, failure)
+        # Where the task lands depends on which role failed to report, the same
+        # distinction `reap` draws: a lost implementation returns to the queue,
+        # but a lost *review* leaves the implementation standing and only the
+        # judgement missing, so the task goes back to `awaiting-review`. Sending
+        # it to `planned` discarded a completed implementation's place in the
+        # queue and left criteria marked passed under a status that says the work
+        # has not started — a state no reader can make sense of.
+        if task["status"] in ("running", "reviewing"):
+            if failure is not None:
+                # Nothing judged this, so the task is returned to the status it
+                # was claimed from and is selectable again. Under the scheduler
+                # the retry comes out of the infrastructure budget; under a bare
+                # `dispatch` it means the operator fixes the timeout or the model
+                # id and runs it again, rather than first having to undo a status
+                # that says the work failed.
+                task["status"] = INTERRUPTED_STATUS.get(task["status"], "planned")
+            elif code != 0:
+                task["status"] = "failed"
+            elif role == "reviewer":
+                task["status"] = "awaiting-review"
+            else:
+                task["status"] = "planned"
+            task["updated_at"] = utcnow()
+        # Recorded on this path too, not only after a verdict is applied. The first
+        # question about a run that judged nothing is where the task ended up, and
+        # the answer is no longer the same for every such run: a lost review holds
+        # at `awaiting-review` while a lost implementation returns to the queue.
+        # Left unset, anything reporting this had to guess, and the dashboard
+        # guessed one of them for both.
+        run["resulting_status"] = task["status"]
         # On the run as well as the task. `dispatch` explains this at the time,
         # but a run read later is the confusing case: exit 0, status completed,
         # and nothing moved. Without this the record cannot answer why.
@@ -1433,7 +1726,13 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
             task,
             f"run {run_id} exited {code} without a usable verdict"
             + (" and without any output" if silent else "")
-            + (f" ({note})" if note else ""),
+            + (f" ({note})" if note else "")
+            + (
+                f"; {failure.described} — {run['task']} returned to "
+                f"{task['status']} without being judged"
+                if failure is not None
+                else ""
+            ),
             actor="writ",
         )
         refresh_milestones(data)
@@ -1524,13 +1823,26 @@ def detach(root: Path, run_id: str) -> int:
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
+    identity = procs.identify(process.pid)
     with state.transaction(root) as data:
+        data["runs"][run_id]["supervisor"] = identity.to_dict()
         data["runs"][run_id]["supervisor_pid"] = process.pid
         data["runs"][run_id]["detached"] = True
     return process.pid
 
 
-def _terminate(pid: int) -> None:
+def _terminate(record: Any) -> None:
+    """Signal a process group, but only one this run can prove is its own.
+
+    `killpg` is the one thing writ does that it cannot take back, and a bare pid
+    is not enough to aim it: a run recorded days ago may name a number the kernel
+    has since given to something else, and the blast radius is a process *group*.
+    `procs.safe_to_signal` returns None unless the recorded identity still
+    matches, and None means this does nothing at all.
+    """
+    pid = procs.safe_to_signal(record)
+    if pid is None:
+        return
     for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
             os.killpg(os.getpgid(pid), sig)
@@ -1542,15 +1854,15 @@ def _terminate(pid: int) -> None:
 
 
 def process_alive(pid: int | None) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    """Whether anything is running at this pid.
+
+    The cheap liveness probe, kept for what it is good for: telling a reader
+    whether a run's process is still there. It cannot tell a recycled pid from
+    the original, so nothing that *acts* on the answer — reaping, cancelling,
+    refusing a second claim — uses it. Those go through `procs`, which compares
+    the whole recorded identity.
+    """
+    return procs.running(pid)
 
 
 def cancel(root: Path, run_id: str) -> None:
@@ -1567,8 +1879,8 @@ def cancel(root: Path, run_id: str) -> None:
             raise WritError(f"unknown run: {run_id}")
         if run["status"] not in ACTIVE_RUN_STATUSES:
             raise WritError(f"run {run_id} is not active (status: {run['status']})")
-        pid = run.get("pid")
-        supervisor = run.get("supervisor_pid")
+        pid = run.get("identity") or run.get("pid")
+        supervisor = run.get("supervisor") or run.get("supervisor_pid")
         run["status"] = "cancelled"
         run["finished_at"] = utcnow()
         task = data["tasks"].get(run["task"])
@@ -1601,16 +1913,15 @@ def reap(root: Path) -> list[str]:
     forever: not running, not awaiting review, and invisible to every queue.
     """
     reaped: list[str] = []
+    # The other half of recovering from a crash. A process that died mid-write
+    # left a `state.json.tmp.*` behind, and this is the one place writ already
+    # runs to clean up after a death, so it is where the sweep belongs.
+    state.sweep_temporaries(root)
     with state.transaction(root) as data:
         for run_id, run in data["runs"].items():
             if run["status"] not in ACTIVE_RUN_STATUSES:
                 continue
-            owner = (
-                run.get("supervisor_pid")
-                or run.get("pid")
-                or run.get("owner_pid")
-            )
-            if process_alive(owner):
+            if not run_abandoned(run):
                 continue
             run["status"] = "interrupted"
             run["finished_at"] = utcnow()
@@ -1626,6 +1937,180 @@ def reap(root: Path) -> list[str]:
             reaped.append(run_id)
         refresh_milestones(data)
     return reaped
+
+
+@dataclass
+class Reconciliation:
+    """What settling a stranded run came to.
+
+    `attempt` is the count of infrastructure retries this task has now had, which
+    the scheduler reads to decide whether another is allowed. It is derived from
+    the durable record rather than from a counter in the scheduler's memory, so a
+    resumed session does not hand a task a fresh budget it already spent.
+    """
+
+    run_id: str
+    #: the status the run was left in
+    status: str
+    #: where the task ended up
+    task_status: str | None = None
+    #: whether this call was the one that settled it, as opposed to finding it
+    #: already settled by the worker it raced
+    settled: bool = False
+    attempt: int = 0
+
+
+def reconcile(
+    root: Path, run_id: str, failure: failures.Failure
+) -> Reconciliation:
+    """Settle a run whose worker did not get to settle it itself.
+
+    `prepare` claims a task by marking it `running` or `reviewing`. Everything
+    after that assumed the worker would reach `_finish` and record an outcome, so
+    an exception anywhere in between — a provider crash, a subprocess that could
+    not spawn, a state lock that timed out — left the task claimed by a process
+    that no longer exists. The run read as active, the pid was gone, and the task
+    was invisible to every queue until something thought to reap it.
+
+    This is the `finally` half of that: for every prepared run, exactly one of the
+    worker's own recording or this reconciliation happens.
+
+    Idempotent on purpose. A worker can raise *after* `_finish` committed — the
+    exception may come from the code that reads the result back — and in that case
+    the run is already settled and its recorded outcome is the true one. Then this
+    only attaches the classification, because how the worker died is still worth
+    knowing even when what it did is already written down.
+    """
+    with state.transaction(root) as data:
+        run = data["runs"].get(run_id)
+        if run is None:  # pragma: no cover - defensive
+            raise WritError(f"unknown run: {run_id}")
+        task = data["tasks"].get(run["task"])
+        run["failure"] = failure.to_dict()
+        settled = run["status"] in ACTIVE_RUN_STATUSES
+        if settled:
+            # `interrupted` for something that may yet succeed, `failed` for
+            # something that will not. The distinction is the same one `reap`
+            # draws, and it is what stops a transient provider timeout from
+            # reading, forever after, as a run that failed on its merits.
+            run["status"] = "interrupted" if failure.retryable else "failed"
+            run["finished_at"] = utcnow()
+            run.setdefault("note", failure.described)
+        if task is not None:
+            if settled and task["status"] in INTERRUPTED_STATUS:
+                task["status"] = INTERRUPTED_STATUS[task["status"]]
+                task["updated_at"] = utcnow()
+            if settled:
+                add_evidence(
+                    task,
+                    f"run {run_id} did not finish: {failure.described}"
+                    + (
+                        f"; {run['task']} returned to {task['status']}"
+                        if task["status"] in INTERRUPTED_STATUS.values()
+                        else ""
+                    ),
+                    actor="writ",
+                )
+        if settled and run.get("role") == "repair":
+            # A repair planner does not hold its gate, so there is no task status
+            # to restore — but `prepare` moved the request to `planning`, and a
+            # request stuck there is one the scheduler will not pick up again.
+            # Same treatment a refused patch gets: back to `open`.
+            request = repair.request_for_gate(data, run["task"])
+            if request is not None and request.get("status") == "planning":
+                request["status"] = "open"
+        attempt = (
+            _note_infrastructure_failure(data, run, failure)
+            if failure.retryable and task is not None
+            else _infra_attempts(task)
+        )
+        refresh_milestones(data)
+        return Reconciliation(
+            run_id=run_id,
+            status=run["status"],
+            task_status=None if task is None else task["status"],
+            settled=settled,
+            attempt=attempt,
+        )
+
+
+def _note_infrastructure_failure(
+    data: dict[str, Any],
+    run: dict[str, Any],
+    failure: failures.Failure,
+) -> int:
+    """Record one infrastructure retry against the task, durably.
+
+    On the task and not in the scheduler, because the budget has to survive the
+    scheduler. A session killed mid-backoff and resumed would otherwise give the
+    task a fresh set of retries, and a genuinely broken provider would be retried
+    without bound across enough restarts.
+
+    Deliberately *not* `open_rework`. The rework budget is for work a reviewer
+    read and rejected; nothing here read the work at all.
+    """
+    task = data["tasks"][run["task"]]
+    record = task.setdefault(
+        "infrastructure", {"attempts": [], "exhausted": False}
+    )
+    attempts = record.setdefault("attempts", [])
+    attempt = len(attempts) + 1
+    attempts.append(
+        {
+            "attempt": attempt,
+            "at": utcnow(),
+            "run": run["id"],
+            "role": run.get("role", "agent"),
+            "category": failure.category,
+            "reason": failure.reason,
+            # The logical attempt this run was, so two runs that are the same
+            # attempt retried can be told from two genuine attempts.
+            "key": failures.idempotency_key(
+                run["task"],
+                run.get("role", "agent"),
+                rework_attempts(task),
+                attempt,
+            ),
+        }
+    )
+    return attempt
+
+
+def _infra_attempts(task: dict[str, Any] | None) -> int:
+    if task is None:
+        return 0
+    record = task.get("infrastructure") or {}
+    return len(record.get("attempts") or [])
+
+
+def infrastructure_attempts(task: dict[str, Any] | None) -> int:
+    """How many times this task has been retried for infrastructure reasons."""
+    return _infra_attempts(task)
+
+
+def mark_infrastructure_exhausted(root: Path, task_id: str, reason: str) -> None:
+    """Record that a task has run out of infrastructure retries.
+
+    Its own field, and its own sentence in the evidence log. A task that stopped
+    because the machinery around it kept failing must not be readable as a task
+    whose implementation was rejected — that is the signal corruption this whole
+    classification exists to prevent.
+    """
+    with state.transaction(root) as data:
+        task = data["tasks"].get(task_id)
+        if task is None:  # pragma: no cover - defensive
+            return
+        record = task.setdefault("infrastructure", {"attempts": []})
+        record["exhausted"] = True
+        record["exhausted_at"] = utcnow()
+        record["reason"] = reason
+        add_evidence(
+            task,
+            f"out of infrastructure retries: {reason}. The task was not rejected "
+            "on technical merit — no reviewer judged this work.",
+            actor="writ",
+        )
+        refresh_milestones(data)
 
 
 def log_path(root: Path, run_id: str, stream: str) -> Path:

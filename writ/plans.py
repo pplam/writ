@@ -139,13 +139,15 @@ def not_runnable_message(data: dict[str, Any]) -> str:
             "Writ can prove about it, then `writ approve`."
         )
     if not counts["error"]:
-        # Nothing is objecting any more, but the status still says otherwise: the
-        # findings were answered after the last check, and the status comes from a
-        # check. Sending this reader to `--force` would have them overrule
-        # objections that are no longer there.
+        # Nothing blocking stands against this plan; it simply has not been signed
+        # off. That is the ordinary state of a freshly planned project now that a
+        # clean check no longer approves itself, so it gets the plain instruction
+        # rather than being sent to `--force` to overrule objections that are not
+        # there.
         return (
-            f"this plan is {status}, but nothing blocking is open any more. "
-            "Re-check it with `writ check` to approve it on that basis."
+            f"this plan is {status} and nothing blocking stands against it. "
+            "Read it with `writ check` and `writ coverage`, then approve it with "
+            "`writ approve`. For automation, plan with `--auto-approve`."
         )
     return (
         f"this plan is {status}: {counts['error']} blocking "
@@ -308,7 +310,11 @@ def finding_records(data: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def record_findings(
-    data: dict[str, Any], incoming: Iterable[Finding], *, scope: str = "plan"
+    data: dict[str, Any],
+    incoming: Iterable[Finding],
+    *,
+    scope: str = "plan",
+    reporter: str = "writ",
 ) -> list[Finding]:
     """Write findings to the ledger, keeping the ones already there.
 
@@ -318,6 +324,15 @@ def record_findings(
     revision that resolved it, rather than silently vanishing. That history is
     what makes a repair loop auditable — see the repeat-finding detection in
     `repair.py`.
+
+    `reporter` is who just looked, and it is what decides whose findings this batch
+    may close. Only the party that raised an objection can stop reporting it: writ's
+    deterministic check re-runs every rule it has, so its own silence is evidence;
+    a critic that read the plan again and no longer objects is evidence about *its*
+    finding and nothing else. Without that distinction a critic's objection could
+    never close at all — which is what left a repaired plan carrying every finding
+    the repair had answered — or, worse, one reporter's pass would close another's
+    finding it never looked for.
     """
     store = finding_records(data)
     current = revision(data)
@@ -335,7 +350,7 @@ def record_findings(
             existing["seen_at"] = utcnow()
             existing["seen_count"] = int(existing.get("seen_count", 1)) + 1
             existing["revision"] = current
-            if existing.get("disposition") == "resolved":
+            if _reopens(existing):
                 # It came back. Reopen rather than record a second finding: the
                 # useful fact is that this objection has now survived a repair.
                 existing["disposition"] = "open"
@@ -359,20 +374,70 @@ def record_findings(
         by_key[key] = payload
         written.append(finding)
     for key, payload in by_key.items():
-        if (
-            key not in seen_keys
-            and payload.get("scope") == scope
-            and payload.get("disposition") == "open"
-            and payload.get("source") in ("writ", None)
-        ):
-            # Only Writ's own findings are auto-closed. A critic's or a gate's
-            # objection is not disproved by a deterministic re-check that never
-            # looked for it.
-            payload["disposition"] = "resolved"
-            payload["resolved_at"] = utcnow()
-            payload["resolved_by"] = "writ"
-            payload["resolved_revision"] = current
+        if key in seen_keys or payload.get("scope") != scope:
+            continue
+        if payload.get("source") not in (reporter, None):
+            # Somebody else's objection. A pass by this reporter is not evidence
+            # about a finding it never looked for.
+            continue
+        if not _closeable(payload):
+            continue
+        payload["disposition"] = "resolved"
+        payload["resolved_at"] = utcnow()
+        payload["resolved_by"] = reporter
+        payload["resolved_revision"] = current
     return written
+
+
+#: actors whose disposition a later check may overturn.
+#:
+#: An agent closing its own objection is a claim, not a fact. A human doing it is a
+#: judgement, and judgements stand.
+AGENT_ACTORS = ("adjudicator", "repair-planner", "writ")
+
+
+def _closeable(payload: dict[str, Any]) -> bool:
+    """Whether this reporter's silence may close the finding.
+
+    `open` is the ordinary case. An *agent's* acceptance also closes, and that is
+    the half that was missing: the adjudicator accepts a finding and says which
+    work answers it, and `accepted` is exactly a claim awaiting evidence — the same
+    reasoning `_reopens` uses to overturn it when the finding comes back. A check
+    that then stops reporting it is the evidence, so it becomes `resolved` and the
+    plan stops carrying an objection that has been dealt with.
+
+    A *person's* disposition is left alone in both directions. A human who accepted
+    a known objection, or declined it, has made a judgement, and a check going quiet
+    does not retract a judgement — it only means there is nothing more to weigh.
+    """
+    disposition = payload.get("disposition", "open")
+    if disposition == "open":
+        return True
+    if disposition != "accepted":
+        return False
+    return str(payload.get("disposed_by", "")) in AGENT_ACTORS
+
+
+def _reopens(payload: dict[str, Any]) -> bool:
+    """Whether a finding that has come back should reopen.
+
+    `resolved` always reopens: it means a check had stopped seeing the finding and
+    now sees it again, which is precisely the repeat this ledger exists to catch.
+
+    `accepted` reopens only when an *agent* accepted it. That is the hole this
+    closes: a repair planner may accept a finding and say it added work that closes
+    it, and if the next check disagrees, the planner's word must not be what
+    settles it — otherwise the loop could launder a plan past its own critics by
+    asserting each objection away. A person who accepted a finding on the record has
+    made a judgement about a known objection, and re-reporting it does not overturn
+    that; they are told it is still open by `writ check` either way.
+    """
+    disposition = payload.get("disposition")
+    if disposition == "resolved":
+        return True
+    if disposition != "accepted":
+        return False
+    return str(payload.get("disposed_by", "")) in AGENT_ACTORS
 
 
 def _finding_key(payload: dict[str, Any]) -> str:
@@ -454,6 +519,16 @@ def run_check(
 ) -> list[Finding]:
     """Check the committed graph and set the plan's status from the result.
 
+    A clean check moves a draft to `needs-approval`, not to `approved`. Writ used
+    to approve it outright, which collapsed two different facts into one status:
+    "nothing writ can prove is wrong with this plan" and "somebody signed this
+    plan off". The first is what a check establishes, and it is a much weaker
+    claim — every defect in §3 of the review (an omitted requirement, a dependency
+    that is legal but incorrect, a criterion nothing can demonstrate) passes a
+    clean check by construction. Approval is a judgement, so it needs an actor:
+    `writ approve`, or `writ plan --auto-approve` for automation that has chosen
+    to make it in advance.
+
     An approved plan that still checks clean stays approved — a re-check is not a
     reason to ask for approval again. One that has acquired a blocking finding
     since approval goes back to `needs-approval`, because whatever was signed off
@@ -472,12 +547,8 @@ def run_check(
     if open_blocking:
         if record["status"] in ("draft", "approved", "needs-approval"):
             set_status(data, "needs-approval")
-    elif record["status"] in ("draft", "needs-approval"):
-        set_status(data, "approved")
-        record["approved_at"] = utcnow()
-        record["approved_by"] = "writ"
-        record["approval_note"] = "no blocking findings"
-        record["forced"] = False
+    elif record["status"] == "draft":
+        set_status(data, "needs-approval")
     return found
 
 

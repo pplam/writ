@@ -96,7 +96,7 @@ def inventoried(writ, project, design, tmp_path):
     artifact = tmp_path / "plan.json"
     artifact.write_text(json.dumps(PLAN), encoding="utf-8")
     writ("init")
-    writ("plan", str(design), "--from-plan", str(artifact))
+    writ("plan", str(design), "--from-plan", str(artifact), "--auto-approve")
     return writ
 
 
@@ -210,6 +210,66 @@ def test_a_finding_keeps_its_id_across_re_checks(inventoried, project):
     assert {f.id for f in second if f.severity == "error"} == ids
 
 
+def _critic_finding(message="nothing covers the queue depth view"):
+    return plancheck.Finding(
+        severity="error",
+        category="missing-coverage",
+        message=message,
+        where="REQ-003",
+        source="critic:coverage",
+    )
+
+
+def test_an_agents_acceptance_does_not_survive_the_finding_coming_back(
+    inventoried, project
+):
+    """A repair's claim to have closed a finding is not what settles it.
+
+    Otherwise the pre-execution repair loop could launder a plan past its own
+    critics: accept each objection, assert work that closes it, and the ledger would
+    agree. The check that still reports it has to win.
+    """
+    with state.transaction(project) as data:
+        written = plans.record_findings(
+            data, [_critic_finding()], scope="critic:coverage"
+        )
+        plans.dispose(
+            data, written[0].id, "accepted", actor="adjudicator", change="added a task"
+        )
+        assert plans.get_finding(data, written[0].id)["disposition"] == "accepted"
+        plans.record_findings(data, [_critic_finding()], scope="critic:coverage")
+        record = plans.get_finding(data, written[0].id)
+    assert record["disposition"] == "open"
+    assert record["reopened_at"]
+    assert record["seen_count"] == 2
+
+
+def test_a_persons_acceptance_stands_when_the_finding_comes_back(
+    inventoried, project
+):
+    """A human accepting a known objection has made a judgement, not a claim.
+
+    `writ check` still lists it, so nothing is hidden — but a re-check does not
+    overturn a decision somebody signed.
+    """
+    with state.transaction(project) as data:
+        written = plans.record_findings(
+            data, [_critic_finding()], scope="critic:coverage"
+        )
+        plans.dispose(
+            data,
+            written[0].id,
+            "accepted",
+            actor="tim",
+            reason="shipping without the depth view on purpose",
+        )
+        plans.record_findings(data, [_critic_finding()], scope="critic:coverage")
+        record = plans.get_finding(data, written[0].id)
+    assert record["disposition"] == "accepted"
+    assert record["disposed_by"] == "tim"
+    assert "reopened_at" not in record
+
+
 def test_a_finding_that_goes_away_is_resolved_not_deleted(inventoried, project):
     with state.transaction(project) as data:
         data["tasks"]["M01-001"]["acceptances"] = [
@@ -236,12 +296,170 @@ def test_a_finding_that_goes_away_is_resolved_not_deleted(inventoried, project):
         assert records[finding_id]["disposition"] == "resolved"
 
 
+def test_a_critic_that_stops_objecting_closes_its_own_finding(inventoried, project):
+    """The critic read the patched plan and no longer objects. That closes it.
+
+    Nothing could close a critic's finding before this. Auto-closing was restricted
+    to findings writ itself had raised, on the sound reasoning that a deterministic
+    re-check cannot disprove an objection it never looked for — but the restriction
+    was written as "source is writ" rather than "whoever is reporting", so the one
+    party whose silence *is* evidence about the finding could not close it either. A
+    repaired plan went on carrying every objection its repair had answered.
+    """
+    with state.transaction(project) as data:
+        written = plans.record_findings(
+            data,
+            [_critic_finding()],
+            scope="critic:coverage",
+            reporter="critic:coverage",
+        )
+        # The same critic, reading the plan again, with nothing to say about it.
+        plans.record_findings(
+            data, [], scope="critic:coverage", reporter="critic:coverage"
+        )
+        record = plans.get_finding(data, written[0].id)
+    assert record["disposition"] == "resolved"
+    assert record["resolved_by"] == "critic:coverage"
+    assert record["resolved_revision"]
+
+
+def test_one_reporters_silence_does_not_close_anothers_finding(inventoried, project):
+    """Only the party that raised it may stop reporting it.
+
+    A structural re-check never looks for what a critic objected to, so its passing
+    says nothing about that finding. The same in reverse: the acceptance critic's
+    pass is not evidence about what the coverage critic found.
+    """
+    with state.transaction(project) as data:
+        written = plans.record_findings(
+            data,
+            [_critic_finding()],
+            scope="critic:coverage",
+            reporter="critic:coverage",
+        )
+        # Writ's own deterministic pass over the same scope, which did not look.
+        plans.record_findings(data, [], scope="critic:coverage")
+        record = plans.get_finding(data, written[0].id)
+    assert record["disposition"] == "open"
+
+
+def test_an_agents_acceptance_is_resolved_once_the_check_agrees(inventoried, project):
+    """`accepted` by an agent is a claim awaiting evidence. Silence is the evidence.
+
+    The mirror of the reopening rule: if a finding coming back overturns an agent's
+    acceptance, a finding that does not come back settles it. Leaving it `accepted`
+    forever made a repaired plan read as one whose objections had merely been
+    asserted away.
+    """
+    with state.transaction(project) as data:
+        written = plans.record_findings(
+            data,
+            [_critic_finding()],
+            scope="critic:coverage",
+            reporter="critic:coverage",
+        )
+        plans.dispose(
+            data, written[0].id, "accepted", actor="adjudicator", change="added a task"
+        )
+        plans.record_findings(
+            data, [], scope="critic:coverage", reporter="critic:coverage"
+        )
+        record = plans.get_finding(data, written[0].id)
+    assert record["disposition"] == "resolved"
+
+
+def test_a_persons_disposition_is_not_overwritten_by_silence(inventoried, project):
+    """A judgement stands in both directions.
+
+    A person who accepted an objection knowingly, or declined it with evidence, has
+    made a ruling. A check going quiet is not a reason to rewrite whose decision the
+    record says it was.
+    """
+    with state.transaction(project) as data:
+        written = plans.record_findings(
+            data,
+            [_critic_finding()],
+            scope="critic:coverage",
+            reporter="critic:coverage",
+        )
+        plans.dispose(
+            data, written[0].id, "accepted", actor="tim", reason="shipping without it"
+        )
+        plans.record_findings(
+            data, [], scope="critic:coverage", reporter="critic:coverage"
+        )
+        record = plans.get_finding(data, written[0].id)
+    assert record["disposition"] == "accepted"
+    assert record["disposed_by"] == "tim"
+
+
 def test_only_a_blocking_finding_holds_the_plan(inventoried, project):
     data = state.load(project)
-    # The committed plan has warnings (the design's generic criteria) and still
-    # approved itself, because advisory findings are not a veto.
+    # The committed plan has warnings (the design's generic criteria) and
+    # `--auto-approve` still approved it, because advisory findings are not a veto.
     assert plans.plan_status(data)["status"] == "approved"
     assert plans.runnable(data)
+
+
+def test_a_clean_check_does_not_approve_the_plan(writ, project, design, tmp_path):
+    """A check says nothing is provably wrong. Approval says somebody decided.
+
+    These were one status until the planning review pointed out that they are
+    different claims, and that the weaker one was silently standing in for the
+    stronger: every defect a clean check cannot see — an omitted requirement, a
+    legal-but-wrong edge, a criterion nothing can demonstrate — passed straight
+    through to execution as an approved plan.
+    """
+    artifact = tmp_path / "plan.json"
+    artifact.write_text(json.dumps(PLAN), encoding="utf-8")
+    writ("init")
+    writ("plan", str(design), "--from-plan", str(artifact))
+    data = state.load(project)
+    assert not plancheck.blocking(plans.findings(data, open_only=True))
+    assert plans.plan_status(data)["status"] == "needs-approval"
+    assert not plans.runnable(data)
+    # Re-checking it does not change that, however many times it is run.
+    assert writ("check")[0] == 0
+    assert not plans.runnable(state.load(project))
+
+
+def test_auto_approve_signs_off_a_clean_plan_and_says_who(
+    writ, project, design, tmp_path
+):
+    artifact = tmp_path / "plan.json"
+    artifact.write_text(json.dumps(PLAN), encoding="utf-8")
+    writ("init")
+    code, out, _ = writ("plan", str(design), "--from-plan", str(artifact), "--auto-approve")
+    assert code == 0
+    record = plans.plan_status(state.load(project))
+    assert record["status"] == "approved"
+    assert record["approved_by"] == "writ --auto-approve"
+    assert record["forced"] is False
+    assert "approved by writ --auto-approve" in out
+
+
+def test_auto_approve_will_not_override_a_blocking_finding(
+    writ, project, design, tmp_path
+):
+    """The one thing --auto-approve must not become: a silent --force.
+
+    Automation needs to get from a document to a running graph unattended, which
+    is what the flag is for. Letting it also overrule writ's own objections would
+    make every blocking finding advisory for anyone in a hurry.
+    """
+    broken = json.loads(json.dumps(PLAN))
+    # a task that depends on something no plan defines: a blocking finding
+    broken["milestones"][0]["tasks"][0]["requirement_ids"] = ["REQ-404"]
+    artifact = tmp_path / "plan.json"
+    artifact.write_text(json.dumps(broken), encoding="utf-8")
+    writ("init")
+    code, out, _ = writ("plan", str(design), "--from-plan", str(artifact), "--auto-approve")
+    assert code == 0
+    data = state.load(project)
+    assert plancheck.blocking(plans.findings(data, open_only=True))
+    assert plans.plan_status(data)["status"] == "needs-approval"
+    assert not plans.runnable(data)
+    assert "writ approve" in out
 
 
 # --------------------------------------------------------------------------

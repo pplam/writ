@@ -437,3 +437,40 @@ def test_a_blocked_task_gets_a_section_and_an_unblocked_one_does_not():
     """
     assert evaluate("blockedSection({blocked_on: 'needs a decision first'}) !== null") is True
     assert evaluate("blockedSection({blocked_on: ''}) === null") is True
+
+
+# ------------------------------------------------------------------- the route
+
+
+def test_a_planning_step_is_linkable():
+    """A step's route survives a reload, like a task's and a run's.
+
+    Worth pinning because a step id carries a colon — `stage:requirements`,
+    `critic:feasibility@r2` — so it has to round-trip through the encoding. A hash
+    that decoded to a different id would open the drawer on nothing.
+    """
+    for step in ("stage:requirements", "critic:feasibility@r2"):
+        hashed = evaluate(f"toHash({{view: 'plan', step: {step!r}}})")
+        assert ":" not in hashed.split("/step/")[1], hashed
+        assert evaluate(f"parseHash({hashed!r})") == {"view": "plan", "step": step}
+
+
+def test_a_step_route_keeps_its_view():
+    assert evaluate("parseHash('#/plan/step/synthesis')") == {
+        "view": "plan",
+        "step": "synthesis",
+    }
+    # An unknown view falls back rather than routing nowhere.
+    assert evaluate("parseHash('#/nope/step/synthesis')")["view"] == "overview"
+
+
+def test_an_open_step_is_a_dismissable_detail():
+    """The drawer's dismissal logic has to know about steps too.
+
+    Otherwise a click elsewhere would leave the step panel open forever, since
+    `detailKey` returning null means "nothing is open".
+    """
+    assert evaluate(
+        "dismissesOnClick({openKey: 'step:stage:requirements', "
+        "keyAtPress: 'step:stage:requirements', insideDrawer: false})"
+    ) is True

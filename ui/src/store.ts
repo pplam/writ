@@ -8,7 +8,7 @@
  * the next one, and a reconnect needs no replay.
  */
 
-import type { Run, Snapshot, Task } from './types.js';
+import type { Run, Snapshot, StepOutput, Task } from './types.js';
 
 type Listener = (snapshot: Snapshot) => void;
 type StateListener = (state: ConnectionState) => void;
@@ -147,6 +147,21 @@ export class Store {
 
   run(id: string): Promise<Run> {
     return this.fetchJson<Run>(`api/run/${encodeURIComponent(id)}`);
+  }
+
+  /**
+   * A planning step's live output, polled rather than pushed.
+   *
+   * Polled for two reasons. The snapshot stream fires on `state.json` changing,
+   * and a step's transcript grows continuously while that file does not move at
+   * all — so a snapshot watcher would never learn there was new output. And a
+   * second `EventSource` would take another of the roughly six connections a
+   * browser allows per origin, which is the bug the visibility handling above
+   * exists to avoid; a short poll of a small payload, only while someone is
+   * looking at that step, gives the connection straight back.
+   */
+  stepOutput(id: string): Promise<StepOutput> {
+    return this.fetchJson<StepOutput>(`api/phase/step/${encodeURIComponent(id)}`);
   }
 
   private async fetchJson<T>(path: string): Promise<T> {

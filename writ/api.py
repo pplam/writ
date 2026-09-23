@@ -23,7 +23,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from . import orchestrator, plancheck, plans, render, repair, runner, state, verdict
+from . import (
+    analysis,
+    orchestrator,
+    phases,
+    plancheck,
+    plans,
+    render,
+    repair,
+    runner,
+    state,
+    stream,
+    verdict,
+)
 from .model import (
     acceptance_summary,
     blocked_on,
@@ -38,6 +50,17 @@ from .model import (
 #: shipping a megabyte of transcript into a JSON payload; the full file stays one
 #: request away.
 LOG_TAIL_BYTES = 60_000
+
+#: Activity lines sent with a step's live output. The terminal shows every line
+#: an agent produces; a page catching up mid-run wants the recent past, not all of
+#: it, and the raw `events.jsonl` stays on disk for anyone who wants the rest.
+STEP_ACTIVITY_LINES = 300
+
+#: How much of an event log is rendered per request. This is polled every second
+#: while a reader watches a step, and a long agent turn can put megabytes in that
+#: file, so an uncapped read would re-parse all of it every second to show the last
+#: screenful. Past the cap the oldest events are dropped rather than the newest.
+STEP_EVENT_BYTES = 2_000_000
 
 #: Node geometry for the graph view. Here rather than in the TypeScript because
 #: the layout maths that uses it is here.
@@ -103,7 +126,77 @@ def plan(data: dict[str, Any]) -> dict[str, Any]:
         "uncovered": [row["id"] for row in rows if row["state"] == "uncovered"],
         "open_repairs": [r["id"] for r in repair.open_requests(data)],
         "held_gates": [{"id": k, "reason": v} for k, v in sorted(held.items())],
+        # What the plan was built on, when it came from the staged pipeline. The
+        # baseline is the part worth a dashboard's space: a project whose suite
+        # was already failing when planning started will attribute that failure to
+        # whichever task trips over it first, and nothing else on this payload
+        # would say so.
+        "pipeline": _pipeline(record),
     }
+
+
+def _pipeline(record: dict[str, Any]) -> dict[str, Any]:
+    """The staged pipeline's provenance, or empty for a plan without one."""
+    pipeline = record.get("pipeline")
+    if not isinstance(pipeline, dict) or not pipeline:
+        return {}
+    baseline = pipeline.get("baseline") or {}
+    return {
+        "plan_id": pipeline.get("plan_id", ""),
+        "directory": pipeline.get("directory", ""),
+        "at": pipeline.get("at", ""),
+        "stages": sorted(pipeline.get("stages", {})),
+        # The pipeline as a pipeline: every stage writ knows about, in the order it
+        # runs, whether or not this plan got that far. `stages` above is a set of
+        # names and reads the same for a pipeline that stopped at `requirements` as
+        # for one that never ran that stage — which are different situations, and
+        # the second one is the one worth seeing.
+        "stage_rows": _stage_rows(pipeline),
+        "requirements": len(pipeline.get("requirement_ids", []) or []),
+        "ambiguities": int(pipeline.get("ambiguities", 0) or 0),
+        "unresolved_ambiguities": int(pipeline.get("unresolved_ambiguities", 0) or 0),
+        "undemonstrable": list(pipeline.get("undemonstrable", []) or []),
+        "baseline": {
+            "status": baseline.get("status", "unknown"),
+            "commands": list(baseline.get("commands", []) or []),
+            "known_failures": list(baseline.get("known_failures", []) or []),
+        },
+    }
+
+
+def _stage_rows(pipeline: dict[str, Any]) -> list[dict[str, Any]]:
+    """Each analysis stage in pipeline order, with what it produced.
+
+    Ordered by `analysis.STAGES` rather than by what the record happens to hold,
+    so the dashboard draws the pipeline's shape and marks where it stopped. A
+    stage with no entry is `pending`: never reached, as against run and failed.
+    """
+    stored = pipeline.get("stages")
+    stored = stored if isinstance(stored, dict) else {}
+    rows = []
+    for stage in analysis.STAGES:
+        entry = stored.get(stage.name)
+        entry = entry if isinstance(entry, dict) else None
+        if entry is None:
+            state_name = "pending"
+        elif entry.get("error"):
+            state_name = "failed"
+        elif entry.get("reused"):
+            state_name = "reused"
+        else:
+            state_name = "ok"
+        rows.append(
+            {
+                "name": stage.name,
+                "summary": stage.summary,
+                "state": state_name,
+                "artifact": Path(str(entry.get("artifact", ""))).name if entry else "",
+                "error": str(entry.get("error") or "") if entry else "",
+                "exit_code": entry.get("exit_code") if entry else None,
+                "at": str(entry.get("at") or "") if entry else "",
+            }
+        )
+    return rows
 
 
 def findings(data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -138,16 +231,22 @@ def coverage(data: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def repairs(data: dict[str, Any]) -> list[dict[str, Any]]:
-    """Every request a gate has made for the plan to change."""
+    """Every request to change the plan: from a gate, or from adjudication.
+
+    `gate` stays as it was for a gate-scoped request and is empty for a plan-scoped
+    one; `scope` is the field to read when what matters is which occasion it was.
+    """
     return [
         {
             "id": request.get("id", ""),
             "gate": request.get("gate", ""),
+            "scope": repair.scope_of(request),
             "status": request.get("status", ""),
             "round": int(request.get("round", 1)),
             "summary": request.get("summary", ""),
             "findings": list(request.get("findings", [])),
             "applied_tasks": list(request.get("applied_tasks", [])),
+            "revised_tasks": list(request.get("revised_tasks", [])),
             "refusals": len(request.get("refusals") or []),
             "opened_at": request.get("opened_at", ""),
         }
@@ -407,6 +506,11 @@ def _run_row(run: dict[str, Any]) -> dict[str, Any]:
         "unmet": reported.get("unmet", []),
         "decisions": reported.get("decisions", []),
         "note": run.get("note") or "",
+        # How a run that did not finish was classified. An infrastructure failure
+        # and a rejected implementation both leave a run that did not complete, and
+        # a page that showed them identically would have a reader debugging code
+        # when the provider was down.
+        "failure": run.get("failure") or None,
     }
 
 
@@ -608,6 +712,210 @@ def _edges(
     return out
 
 
+# ---------------------------------------------------------------- phase
+
+
+def phase(data: dict[str, Any]) -> dict[str, Any]:
+    """The most recent planning attempt, laid out as a graph.
+
+    Empty for a project planned by a writ that did not keep this record, which is
+    the one case the page has to handle by falling back: `plan.pipeline.stage_rows`
+    still describes what the pipeline produced, retroactively, and is what the Plan
+    page showed before there was anything to watch.
+
+    The newest attempt rather than all of them. A failed planning run stays on the
+    record — `phases` accumulates like `plans` does — but the question the page
+    answers is "what is happening, or what just happened", and that is one attempt.
+    """
+    record = phases.current(data)
+    if not record:
+        return {}
+    described = phases.describe(record)
+    nodes = _phase_layout(described["steps"])
+    placed = {node["id"]: node for node in nodes}
+    described.update(
+        {
+            "steps": nodes,
+            "edges": _phase_edges(nodes, placed),
+            "width": max((n["x"] + NODE_WIDTH for n in nodes), default=0) + MARGIN,
+            "height": max((n["y"] + NODE_HEIGHT for n in nodes), default=0) + MARGIN,
+            "counts": _phase_counts(nodes),
+            "live": [n["id"] for n in nodes if n["status"] == "running"],
+        }
+    )
+    return described
+
+
+def _phase_layout(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Waves across, members down — the same formula the task graph uses.
+
+    A column is a wave, and a wave is what `analysis.waves` and `critics.waves`
+    already decided may run at once. So the picture is those rules drawn: two boxes
+    side by side means writ really will run them together, and the same constants
+    place them as place a task, because one implementation laying out both is one
+    fewer thing that can disagree.
+    """
+    rows: dict[int, int] = {}
+    nodes = []
+    for entry in sorted(steps, key=lambda e: (int(e.get("wave", 0)), e.get("id", ""))):
+        column = int(entry.get("wave", 0))
+        row = rows.get(column, 0)
+        rows[column] = row + 1
+        node = dict(entry)
+        node.update(
+            {
+                "id": str(entry.get("id", "")),
+                "artifact": Path(str(entry.get("artifact", ""))).name,
+                "directory": str(entry.get("directory", "")),
+                "command": " ".join(str(part) for part in entry.get("command", [])),
+                "duration": _phase_duration(entry),
+                "x": MARGIN + column * (NODE_WIDTH + COLUMN_GAP),
+                "y": MARGIN + row * (NODE_HEIGHT + ROW_GAP),
+                "column": column,
+                # Whether this step has a transcript worth polling. A commit or an
+                # approval is writ's own work and has no agent behind it, so the
+                # page must not offer an output pane that would always be empty.
+                "has_output": bool(entry.get("directory")),
+            }
+        )
+        nodes.append(node)
+    return nodes
+
+
+def _phase_edges(
+    nodes: list[dict[str, Any]], placed: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """What each step waited for, drawn from its own declaration.
+
+    `depends_on` is what the declaration said, and it is empty for a step that was
+    appended mid-phase — nobody declared a second repair round's edges. Those fall
+    back to the whole previous column, which is what actually had to finish.
+    """
+    by_column: dict[int, list[str]] = {}
+    for node in nodes:
+        by_column.setdefault(int(node["column"]), []).append(node["id"])
+    out = []
+    for node in nodes:
+        sources = [dep for dep in node.get("depends_on", []) if dep in placed]
+        if not sources:
+            sources = by_column.get(int(node["column"]) - 1, [])
+        for dep in sources:
+            source, target = placed[dep], node
+            out.append(
+                {
+                    "from": dep,
+                    "to": node["id"],
+                    "x1": source["x"] + NODE_WIDTH,
+                    "y1": source["y"] + NODE_HEIGHT / 2,
+                    "x2": target["x"],
+                    "y2": target["y"] + NODE_HEIGHT / 2,
+                    "satisfied": source["status"] in ("ok", "reused"),
+                }
+            )
+    return out
+
+
+def _phase_counts(nodes: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for node in nodes:
+        status = str(node.get("status", ""))
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def _phase_duration(entry: dict[str, Any]) -> float | None:
+    """How long the step has been going, or took. None when it never started."""
+    started = entry.get("started_at")
+    if not started:
+        return None
+    try:
+        begin = datetime.fromisoformat(str(started))
+        finished = entry.get("finished_at")
+        end = datetime.fromisoformat(str(finished)) if finished else _now(begin)
+    except ValueError:
+        return None
+    return max(0.0, (end - begin).total_seconds())
+
+
+def step_output(data: dict[str, Any], root: Path, step_id: str) -> dict[str, Any]:
+    """What the agent behind one step is saying, right now.
+
+    Rendered through `writ/stream.py` — the same renderer the terminal mirrors
+    through — so the page shows `· tool`, `~ thinking…` and `> text` because it is
+    running writ's renderer over writ's events, not a second implementation of the
+    same idea in TypeScript that would drift from it.
+
+    The path comes from the record, never from the request. `step_id` selects a
+    step and the directory is whatever that step wrote down when it started, so a
+    crafted id cannot name a file: an unknown one is a `KeyError` the server turns
+    into a 404.
+    """
+    record = phases.current(data)
+    if not record:
+        raise KeyError(step_id)
+    entry = phases.step(record, step_id)
+    if entry is None:
+        raise KeyError(step_id)
+    directory = Path(str(entry.get("directory") or ""))
+    payload = {
+        "step": step_id,
+        "status": _live_status(record, step_id),
+        "activity": [],
+        "text": {"text": "", "bytes": 0, "truncated": False},
+        "directory": str(directory),
+    }
+    if not directory.exists():
+        return payload
+    events = directory / "events.jsonl"
+    if events.exists():
+        payload["activity"] = _activity_lines(events, entry)
+    # The tail regardless. Events carry what the agent did; stdout carries what it
+    # wrote, and a step that produced no events at all — an agent whose event
+    # shape writ does not know, or one that died before its first event — has the
+    # log and nothing else.
+    payload["text"] = _tail(directory / "stdout.log")
+    return payload
+
+
+def _live_status(record: dict[str, Any], step_id: str) -> str:
+    """The step's status as `describe` reports it, with a dead owner accounted for."""
+    for entry in phases.describe(record)["steps"]:
+        if entry.get("id") == step_id:
+            return str(entry.get("status", ""))
+    return ""
+
+
+def _activity_lines(events: Path, entry: dict[str, Any]) -> list[str]:
+    """The step's event log as activity lines, most recent last.
+
+    Rendered from the start of the file rather than from the tail, because the
+    renderer is stateful: a tool call is announced when it opens and named again
+    only if it fails, so beginning halfway through would report failures for calls
+    it never saw announced. Past `STEP_EVENT_BYTES` that stops being affordable at
+    one request per second, so the oldest events are dropped — which costs a few
+    unattributed failures at the top of a very long turn, not the recent activity
+    anyone is actually reading.
+    """
+    shape = str(entry.get("event_shape") or "")
+    if not shape:
+        return []
+    renderer = stream.Renderer(shape)
+    lines: list[str] = []
+    try:
+        with events.open("rb") as handle:
+            size = handle.seek(0, 2)
+            if size > STEP_EVENT_BYTES:
+                handle.seek(size - STEP_EVENT_BYTES)
+                handle.readline()  # the partial line the seek landed inside
+            else:
+                handle.seek(0)
+            for raw in handle:
+                lines.extend(renderer.feed(raw.decode("utf-8", "replace")).activity)
+    except OSError:
+        return []
+    return lines[-STEP_ACTIVITY_LINES:]
+
+
 # ---------------------------------------------------------------- activity
 
 
@@ -682,6 +990,10 @@ def everything(root: Path) -> dict[str, Any]:
         "runs": runs(data),
         "decisions": decisions(data),
         "graph": graph(data),
+        # What is happening before anything is executed. Written as the plan phase
+        # runs rather than after it, so this is the one part of the payload that
+        # can be non-empty while nothing at all has been dispatched.
+        "phase": phase(data),
         "activity": activity(data),
         "findings": findings(data),
         "coverage": coverage(data),

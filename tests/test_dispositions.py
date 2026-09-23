@@ -39,7 +39,7 @@ def held(writ, project, design, tmp_path):
     artifact = tmp_path / "plan.json"
     artifact.write_text(json.dumps(PLAN), encoding="utf-8")
     writ("init")
-    writ("plan", str(design), "--from-plan", str(artifact))
+    writ("plan", str(design), "--from-plan", str(artifact), "--auto-approve")
     with state.transaction(project) as data:
         plans.record_findings(
             data,
@@ -166,7 +166,7 @@ def test_answering_the_last_blocker_points_at_the_check(held, writ):
     for finding_id in held["findings"]:
         code, out, _ = writ("set", finding_id, "accepted", "--reason", "known, shipping")
         assert code == 0
-    # A disposition does not approve the plan; a check does.
+    # A disposition does not approve the plan, and neither does a clean check.
     assert "next: writ check" in out
 
 
@@ -175,10 +175,16 @@ def test_a_plan_with_nothing_open_is_not_told_to_force(held, writ, project):
         writ("set", finding_id, "accepted", "--reason", "known, shipping")
     code, _, err = writ("run", "--agent", "false")
     assert code == 2
-    assert "nothing blocking is open any more" in err
+    # Nothing is objecting any more, so the reader is not sent to `--force` to
+    # overrule objections that are not there — they are sent to approve it.
+    assert "nothing blocking stands against it" in err
+    assert "writ approve" in err
     assert "--force" not in err
-    # And the check it names does approve it.
+    # A check still does not approve it: answering every objection establishes
+    # that nothing is wrong, which is not the same as somebody signing it off.
     assert writ("check")[0] == 0
+    assert not plans.runnable(state.load(project))
+    assert writ("approve")[0] == 0
     assert plans.runnable(state.load(project))
 
 

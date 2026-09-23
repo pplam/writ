@@ -73,7 +73,7 @@ def writ(project: Path):
 #: leaves the plan-level checks out. Tests about graph shape, dispatch order and
 #: the read model want a graph with depth and nothing else in it; naming the flags
 #: here means the reason appears once instead of in forty call sites.
-LEGACY_PLAN = ("--extract", "--chain", "--no-gates")
+LEGACY_PLAN = ("--extract", "--chain", "--no-gates", "--auto-approve")
 
 
 @pytest.fixture
@@ -94,9 +94,14 @@ def planned(writ, design: Path):
 
 @pytest.fixture
 def approved(writ, design: Path):
-    """A plan as `writ plan` builds one now: stated edges only, gates installed."""
+    """A plan as `writ plan` builds one now: stated edges only, gates installed.
+
+    Approved explicitly, because a clean check no longer approves itself. The
+    fixture is named for the state it produces, and `--auto-approve` is what
+    produces it now — the flag automation uses for exactly this reason.
+    """
     writ("init")
-    writ("plan", str(design), "--extract")
+    writ("plan", str(design), "--extract", "--auto-approve")
     return writ
 
 

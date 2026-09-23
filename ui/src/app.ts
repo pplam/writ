@@ -18,6 +18,7 @@ import { renderDecisions } from './views/decisions.js';
 import { fitTitles, renderGraph } from './views/graph.js';
 import { renderMilestones } from './views/milestones.js';
 import { renderOverview } from './views/overview.js';
+import { fitStepTitles, isPhase, renderStepDetail } from './views/phase.js';
 import { FINDING_FILTERS, renderPlan } from './views/plan.js';
 import { renderRunDetail, renderRunList, RUN_FILTERS } from './views/runs.js';
 import { FILTERS, renderTaskDetail, renderTaskList } from './views/tasks.js';
@@ -80,7 +81,12 @@ interface Route {
   view: ViewName;
   task?: string;
   run?: string;
+  /** A planning step, from the phase graph on the Plan page. */
+  step?: string;
 }
+
+/** How often a watched step's output is re-fetched while it is still running. */
+const OUTPUT_POLL_MS = 1000;
 
 class App {
   private store = new Store();
@@ -99,6 +105,10 @@ class App {
   private drawer = el('aside', { class: 'drawer', 'aria-live': 'polite' });
   /** What was open when the current click began; see `dismissesOnClick`. */
   private keyAtPress: string | null = null;
+  /** The timer following a live step's output; see `followStep`. */
+  private outputPoll: number | null = null;
+  /** The step that timer is following, so a repaint does not restart it. */
+  private watching: string | null = null;
 
   async start(): Promise<void> {
     document.body.append(this.header(), this.body, this.drawer);
@@ -169,6 +179,7 @@ class App {
   private detailKey(): string | null {
     if (this.route.task) return `task:${this.route.task}`;
     if (this.route.run) return `run:${this.route.run}`;
+    if (this.route.step) return `step:${this.route.step}`;
     return null;
   }
 
@@ -342,6 +353,7 @@ class App {
       onRun: (id: string) => this.go({ view: this.route.view, run: id }),
       onGoto: (view: string) => this.go({ view: view as ViewName }),
       onSelect: (id: string) => this.go({ view: this.route.view, task: id }),
+      onStep: (id: string) => this.go({ view: this.route.view, step: id }),
     };
 
     switch (this.route.view) {
@@ -419,8 +431,8 @@ class App {
           snapshot.findings,
           snapshot.coverage,
           snapshot.repairs,
-          { filter: this.findingFilter },
-          { onTask: handlers.onTask },
+          { filter: this.findingFilter, phase: snapshot.phase, step: this.route.step ?? null },
+          { onTask: handlers.onTask, onStep: handlers.onStep },
         );
         this.body.replaceChildren(
           this.toolbar(
@@ -432,6 +444,10 @@ class App {
           ),
           holder,
         );
+        // After it is in the document: `getComputedTextLength` is zero for an SVG
+        // that has not been laid out, so clipping before the swap would measure
+        // nothing and clip nothing.
+        fitStepTitles(holder);
         break;
       }
       case 'decisions': {
@@ -483,12 +499,14 @@ class App {
    * during a run — its criteria fill in as the agent reports them.
    */
   private paintDrawer(): void {
-    const { task, run } = this.route;
-    if (!task && !run) {
+    const { task, run, step } = this.route;
+    if (!task && !run && !step) {
+      this.stopFollowing();
       this.drawer.classList.remove('open');
       this.drawer.replaceChildren();
       return;
     }
+    if (!step) this.stopFollowing();
     this.drawer.classList.add('open');
     if (!this.drawer.querySelector('.detail-head')) {
       this.drawer.replaceChildren(el('p', { class: 'muted' }, 'Loading…'));
@@ -502,6 +520,10 @@ class App {
       onTask: (id: string) => this.go({ view: this.route.view, task: id }),
     };
 
+    if (step) {
+      this.paintStep(step, close);
+      return;
+    }
     if (run) {
       void this.store
         .run(run)
@@ -525,6 +547,116 @@ class App {
       .catch((error) => this.drawerError(close, error));
   }
 
+  /**
+   * A planning step: its record from the snapshot, its output from a poll.
+   *
+   * The record is already in hand — the phase graph was drawn from it — so the
+   * panel paints immediately and the output fills in. That matters for a running
+   * step: waiting on the fetch would leave the drawer saying "Loading…" for a
+   * second every time a snapshot arrived, which during planning is constantly.
+   */
+  private paintStep(id: string, close: HTMLElement): void {
+    const phase = this.store.current?.phase;
+    const found = isPhase(phase) ? phase.steps.find((entry) => entry.id === id) : undefined;
+    if (!found) {
+      // The step is not on the current phase — an older attempt's link, or a
+      // record that has since been trimmed.
+      this.stopFollowing();
+      this.drawer.replaceChildren(
+        close,
+        el('p', { class: 'muted' }, 'That step is not part of the most recent planning attempt.'),
+      );
+      return;
+    }
+    if (this.watching !== found.id || this.outputPoll === null) {
+      // First paint, or one whose poll has stopped: show the record now and let
+      // the output arrive. Re-rendering a step already being followed would throw
+      // away output that is on screen and replace it with "Loading…".
+      const holder = el('div', { class: 'detail' });
+      renderStepDetail(holder, found, null);
+      this.drawer.replaceChildren(close, holder);
+    }
+    this.followStep(found.id, found.status === 'running');
+  }
+
+  /**
+   * Fetch a step's output, and keep fetching while it is still running.
+   *
+   * Polled rather than pushed, and only while the drawer is open on that step.
+   * `store.stepOutput` says why at length: a transcript grows without `state.json`
+   * moving, so the snapshot stream never learns there is more of it, and a second
+   * EventSource would take one of the handful of connections the browser allows.
+   */
+  private followStep(id: string, live: boolean): void {
+    // Already following it, so leave the timer alone. Snapshots arrive every few
+    // tenths of a second during planning and each one repaints the drawer; a
+    // restart per snapshot would fetch far more often than the interval says, and
+    // the interval itself would never get to fire.
+    if (live && this.watching === id && this.outputPoll !== null) return;
+    this.stopFollowing();
+    this.watching = id;
+    const paint = () => {
+      void this.store
+        .stepOutput(id)
+        .then((output) => {
+          if (this.route.step !== id) return; // the reader moved on while fetching
+          const phase = this.store.current?.phase;
+          const found = isPhase(phase) ? phase.steps.find((entry) => entry.id === id) : undefined;
+          if (!found) return;
+          const holder = el('div', { class: 'detail' });
+          renderStepDetail(holder, found, output);
+          const close = el('button', { class: 'close', type: 'button', 'aria-label': 'close' }, '×');
+          close.addEventListener('click', () => this.dismiss());
+          const scrolled = this.drawerOffsets();
+          this.drawer.replaceChildren(close, holder);
+          this.restoreDrawerScroll(scrolled);
+          // Stop when the step does. A finished step's transcript is fixed, so
+          // polling it further would be asking the same question forever.
+          if (found.status !== 'running') this.stopFollowing();
+        })
+        .catch(() => undefined);
+    };
+    paint();
+    if (live) this.outputPoll = window.setInterval(paint, OUTPUT_POLL_MS);
+  }
+
+  private stopFollowing(): void {
+    this.watching = null;
+    if (this.outputPoll === null) return;
+    window.clearInterval(this.outputPoll);
+    this.outputPoll = null;
+  }
+
+  /**
+   * Where the drawer's log panes are scrolled, so a poll does not rewind them.
+   *
+   * Same problem as the graph's offsets, and worse here: replacing the pane every
+   * second would throw a reader back to the top of an agent's output every second,
+   * which is exactly while they are reading it.
+   */
+  private drawerOffsets(): Map<string, [number, number]> {
+    const saved = new Map<string, [number, number]>();
+    for (const pane of this.drawer.querySelectorAll<HTMLElement>('[data-scroll-key]')) {
+      const key = pane.dataset.scrollKey;
+      if (key) saved.set(key, [pane.scrollLeft, pane.scrollTop]);
+    }
+    return saved;
+  }
+
+  private restoreDrawerScroll(saved: Map<string, [number, number]>): void {
+    for (const pane of this.drawer.querySelectorAll<HTMLElement>('[data-scroll-key]')) {
+      const key = pane.dataset.scrollKey;
+      const offset = key ? saved.get(key) : undefined;
+      if (offset) {
+        [pane.scrollLeft, pane.scrollTop] = offset;
+        continue;
+      }
+      // A pane that was not there before starts at the tail, which for a live
+      // agent's output is the part worth reading.
+      pane.scrollTop = pane.scrollHeight;
+    }
+  }
+
   private drawerError(close: HTMLElement, error: unknown): void {
     this.drawer.replaceChildren(
       close,
@@ -543,7 +675,7 @@ class App {
 
   private onKey(event: KeyboardEvent): void {
     if (event.target instanceof HTMLInputElement) return;
-    if (event.key === 'Escape' && (this.route.task || this.route.run)) {
+    if (event.key === 'Escape' && (this.route.task || this.route.run || this.route.step)) {
       this.dismiss();
       return;
     }
@@ -567,12 +699,14 @@ function parseHash(hash: string): Route {
   const known = VIEWS.some((v) => v.name === view) ? (view as ViewName) : 'overview';
   if (kind === 'task' && id) return { view: known, task: decodeURIComponent(id) };
   if (kind === 'run' && id) return { view: known, run: decodeURIComponent(id) };
+  if (kind === 'step' && id) return { view: known, step: decodeURIComponent(id) };
   return { view: known };
 }
 
 function toHash(route: Route): string {
   if (route.task) return `#/${route.view}/task/${encodeURIComponent(route.task)}`;
   if (route.run) return `#/${route.view}/run/${encodeURIComponent(route.run)}`;
+  if (route.step) return `#/${route.view}/step/${encodeURIComponent(route.step)}`;
   return `#/${route.view}`;
 }
 

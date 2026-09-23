@@ -6,6 +6,10 @@
     "whatever you leave out falls back to writ's own default. Writ never writes",
     "this file: nothing will be reformatted or changed behind you.",
     "",
+    "This is a filled-in example, not the full schema — it sets the things a",
+    "project usually cares about. `writ init` generates a file holding every",
+    "field writ accepts at writ's own default, with a line explaining each one.",
+    "",
     "Any key starting with _ is a comment, since JSON has nowhere else to put one.",
     "Unknown keys are refused rather than ignored — a misspelled 'reviewer' would",
     "otherwise leave review running on the implementing model while this file",
@@ -25,6 +29,17 @@
     "critic": {
       "command": "codex",
       "model": "gpt-5-codex",
+      "timeout": 1800
+    },
+
+    "_stage": [
+      "The three analyses — requirements, inventory, verification. Reading a",
+      "document and a repository is cheaper work than synthesising a plan from",
+      "them, so it is worth pointing somewhere cheaper. Unset: the planner."
+    ],
+    "stage": {
+      "command": "claude",
+      "model": "sonnet",
       "timeout": 1800
     },
 
@@ -50,6 +65,84 @@
     "_": "defaults for `writ run`, all overridable per invocation",
     "parallel": 3,
     "order": "id",
-    "max_rework": 2
+    "max_rework": 2,
+    "_stream": [
+      "Mirror each agent's own output to the terminal while it works, tagged",
+      "with the task and role it came from. On by default: a run that prints",
+      "nothing for the length of a model call looks identical to a hung one.",
+      "false keeps the progress log alone. The transcript is on disk either way."
+    ],
+    "stream": true
+  },
+
+  "plan": {
+    "_stages": [
+      "The staged pipeline: three analyses write artifacts before a synthesis",
+      "agent decomposes the work from them. false is the older single-shot",
+      "planner, which makes all of those judgements in one response."
+    ],
+    "stages": true,
+    "gates": true,
+
+    "_parallel_stages": [
+      "Run the analysis stages that need nothing from each other at once:",
+      "requirements beside inventory, then verification, which needs both. Buys",
+      "a stage's wall-clock and costs the inventory its coverage claims — it has",
+      "no requirement ids to attach them to yet, so it is told to make none.",
+      "Leave it false where `already satisfied by this repository` matters."
+    ],
+    "parallel_stages": false,
+
+    "_parallel_critics": [
+      "Run the critics that only read the repository at once, and each critic",
+      "that runs the project's own commands alone. The interference writ avoids",
+      "by running them one at a time comes from the commands, not the reading,",
+      "so four of the five overlap and the feasibility critic still gets the",
+      "working tree to itself."
+    ],
+    "parallel_critics": true,
+
+    "_critics": [
+      "Run the critics over every plan straight after committing it. Costs an",
+      "agent run each, which is why writ does not do it unasked; this project",
+      "has decided it is worth it."
+    ],
+    "critics": true,
+
+    "_repair": [
+      "Answer the plan's blocking findings with the bounded repair loop before",
+      "approval, the same loop `writ adjudicate` runs. Pair it with critics and",
+      "auto_approve for a project that goes from document to running graph",
+      "unattended: the critics report, this answers them, and approval is judged",
+      "last on what they left. Without it a plan the critics object to waits at",
+      "needs-approval for a person, which is the right shape when there is one."
+    ],
+    "repair": true
+  },
+
+  "critique": {
+    "_": "which critics run, here and for plan.critics. Unset means all of them.",
+    "critics": ["coverage", "dependency", "acceptance", "feasibility"],
+    "_parallel": "the same concurrency as plan.parallel_critics, for writ critique",
+    "parallel": true
+  },
+
+  "adjudicate": {
+    "_": [
+      "the bounded repair loop that answers a plan's findings before it runs",
+      "(writ adjudicate). Two repairs may land; a finding still open after that",
+      "needs a decision rather than another patch."
+    ],
+    "max_rounds": 2,
+    "_critics": [
+      "re-run the critics after each patch, so a finding closes on a re-review",
+      "rather than on the patch's word. Costs a critic pass per round."
+    ],
+    "critics": true
+  },
+
+  "serve": {
+    "_host": "loopback by default; the page has no authentication",
+    "port": 8731
   }
 }

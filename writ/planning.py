@@ -20,7 +20,8 @@ from pathlib import Path
 from typing import Any
 
 from . import agents, plancheck, runner, state
-from .plancheck import Requirement
+from .stream import truncated
+from .plancheck import Finding, Requirement
 from .planner import PlannedMilestone, PlannedTask, section_text
 from .state import WritError
 
@@ -157,6 +158,158 @@ Rules:
 
 Write no code and change no file other than the plan JSON. You are planning."""
 
+#: what changes when the plan is synthesized from analyses rather than written cold.
+#:
+#: Almost all of it is about the requirement inventory being *fixed*. A single-shot
+#: planner writes the inventory and the tasks together, so the two cannot disagree
+#: — it simply never records an obligation it was not going to cover. Splitting the
+#: stages makes that disagreement possible and therefore detectable, and these
+#: rules are what the synthesizer is held to. `reconcile` checks them afterwards.
+SYNTHESIS_RULES = """\
+Because the analyses above are established, this plan is held to them:
+- Copy the requirement inventory into your `requirements` array exactly: every id
+  that was given to you, with the same text, priority and source. You may change
+  a `status` — to `existing` if the repository inventory shows it is already done,
+  or to `out-of-scope`/`deferred` with a reason — but you may not drop an entry or
+  add one. A requirement missing from your plan is reported as dropped, and an id
+  that was not given to you is reported as invented; both hold the plan.
+- Where the inventory found a requirement already satisfied with evidence, mark it
+  `existing` and carry that evidence across rather than planning the work again.
+- Build acceptance criteria out of the verification analysis. Where it named a
+  command or a test path for a requirement, the task covering that requirement
+  should state that command or path as its bar. Do not invent a different way to
+  check something that was already worked out.
+- Where the verification analysis said a method does not exist yet (`exists`:
+  false), the test or harness it describes is itself work: give it a task, or
+  fold it into the task whose bar needs it. A criterion citing a command nobody
+  has written is not checkable.
+- Where verification listed missing infrastructure, plan it before the tasks that
+  need it, and say so with an edge.
+- Where a requirement was listed as undemonstrable, do not paper over it with a
+  plausible-sounding criterion. Cover it with the closest real check and record
+  the gap in the task's notes.
+- Where the requirements analysis recorded an unresolved ambiguity, note it in the
+  notes of the task it affects. Do not silently pick a reading."""
+
+
+def _artifact_lines(artifacts: Any) -> list[str]:
+    """Render the analyses into the synthesis prompt.
+
+    Rendered rather than pasted as JSON. The synthesizer has to *use* this, and
+    three schemas of raw JSON is a worse read than the same content as a briefing
+    — but the requirement inventory is rendered id-first and in full, because that
+    is the one part it will be checked against verbatim.
+    """
+    lines: list[str] = []
+    requirements = getattr(artifacts, "requirements", None)
+    if requirements is not None:
+        lines.append(
+            "REQUIREMENTS — the fixed inventory. Reproduce every one of these ids "
+            "in your `requirements` array. Do not add, drop, or renumber."
+        )
+        for requirement in requirements.requirements:
+            lines.append(
+                f"- {requirement.id} [{requirement.priority}] {requirement.text}"
+            )
+            if requirement.source:
+                lines.append(f"    source: {requirement.source}")
+        lines.append("")
+        unresolved = requirements.open_questions
+        if unresolved:
+            lines.append(
+                "Unresolved ambiguities. Note these in the affected task's notes; "
+                "do not decide them silently:"
+            )
+            for entry in unresolved:
+                affected = ", ".join(entry.get("requirement_ids", []) or [])
+                lines.append(
+                    f"- {entry.get('id', 'AMB')}: {entry.get('question', '')}"
+                    + (f" (affects {affected})" if affected else "")
+                )
+            lines.append("")
+
+    inventory = getattr(artifacts, "inventory", None)
+    if inventory is not None:
+        lines.append("REPOSITORY — what is already here.")
+        for component in inventory.components:
+            paths = ", ".join(str(path) for path in component.get("paths", []))
+            lines.append(f"- {component.get('name')}: {paths or 'no paths given'}")
+            behavior = str(component.get("existing_behavior", "")).strip()
+            if behavior:
+                lines.append(f"    today: {behavior}")
+            tests = ", ".join(str(path) for path in component.get("test_locations", []))
+            if tests:
+                lines.append(f"    tests: {tests}")
+            for risk in component.get("risks", []) or []:
+                lines.append(f"    risk: {risk}")
+        if inventory.conventions:
+            lines.append("  conventions to match:")
+            lines.extend(f"    - {item}" for item in inventory.conventions)
+        if inventory.baseline_commands:
+            lines.append(
+                f"  baseline: {', '.join(inventory.baseline_commands)} "
+                f"→ {inventory.baseline_status}"
+            )
+        if inventory.known_failures:
+            lines.append(
+                "  already failing before this plan starts (do not plan around "
+                f"these as if your work caused them): {', '.join(inventory.known_failures)}"
+            )
+        already = [
+            entry
+            for entry in inventory.existing_coverage
+            if entry.get("status") in ("full", "partial")
+        ]
+        if already:
+            lines.append("  requirements the repository already covers:")
+            for entry in already:
+                lines.append(
+                    f"    - {entry.get('requirement_id')} [{entry.get('status')}] "
+                    f"{entry.get('evidence', 'no evidence given')}"
+                )
+        lines.append("")
+
+    verification = getattr(artifacts, "verification", None)
+    if verification is not None:
+        lines.append(
+            "VERIFICATION — how each requirement can be demonstrated. Build your "
+            "acceptance criteria from these."
+        )
+        for entry in verification.verification:
+            req_id = entry.get("requirement_id")
+            for method in entry.get("methods", []) or []:
+                detail = (
+                    str(method.get("command", "")).strip()
+                    or str(method.get("location", "")).strip()
+                    or str(method.get("observable", "")).strip()
+                )
+                exists = method.get("exists")
+                mark = "" if exists is not False else "  (DOES NOT EXIST YET)"
+                lines.append(f"- {req_id}: {method.get('kind', 'check')} — {detail}{mark}")
+                needs = str(method.get("needs", "")).strip()
+                if needs:
+                    lines.append(f"    needs first: {needs}")
+        for entry in verification.missing_infrastructure:
+            blocks = ", ".join(entry.get("blocks", []) or [])
+            lines.append(
+                f"- MISSING INFRASTRUCTURE: {entry.get('need')}"
+                + (f" (blocks {blocks})" if blocks else "")
+            )
+            suggestion = str(entry.get("suggestion", "")).strip()
+            if suggestion:
+                lines.append(f"    suggested: {suggestion}")
+        for entry in verification.undemonstrable:
+            lines.append(
+                f"- NOT DEMONSTRABLE: {entry.get('requirement_id')} — "
+                f"{entry.get('why', '')}"
+            )
+            closest = str(entry.get("closest", "")).strip()
+            if closest:
+                lines.append(f"    closest real check: {closest}")
+        lines.append("")
+    return lines
+
+
 
 # --------------------------------------------------------------------------
 # prompt
@@ -174,24 +327,53 @@ def build_prompt(
     plan_path: Path,
     instructions: str | None = None,
     context: dict[str, Any] | None = None,
+    artifacts: Any = None,
 ) -> str:
-    """Compose the planning prompt: read the doc and repo, emit plan JSON."""
+    """Compose the planning prompt: read the doc and repo, emit plan JSON.
+
+    With `artifacts` — the analyses from `writ/analysis.py` — this becomes the
+    synthesis stage instead, and the prompt changes shape accordingly: the agent
+    is no longer asked to work out what the document requires, what the repository
+    holds, or how any of it could be proved. Those are given, and its one job is
+    the decomposition. The requirement inventory in particular arrives as a fixed
+    list it must account for, rather than one it writes for itself.
+    """
     context = context or {}
+    synthesizing = artifacts is not None and getattr(artifacts, "requirements", None)
     lines: list[str] = []
-    lines.append(
-        "You are planning implementation work for this repository. "
-        "You are not implementing it."
-    )
+    if synthesizing:
+        lines.append(
+            "You are decomposing already-analysed work into an executable plan "
+            "for this repository. You are not implementing it, and you are not "
+            "re-deciding what it requires."
+        )
+    else:
+        lines.append(
+            "You are planning implementation work for this repository. "
+            "You are not implementing it."
+        )
     lines.append("")
     lines.append(f"Repository root: {root}")
     lines.append(f"Design document: {doc}")
     lines.append("")
-    lines.append(
-        "Read the design document in full, then read enough of the repository to "
-        "ground the plan in real paths, existing conventions, and work that is "
-        "already done."
-    )
+    if synthesizing:
+        lines.append(
+            "Three analyses have already been done for you, below: what the "
+            "document requires, what the repository already is, and how each "
+            "requirement could be demonstrated. Read them as established. Read "
+            "the design document too — the analyses are a reading of it, not a "
+            "replacement for it — and read enough of the repository to ground "
+            "each task in real paths."
+        )
+    else:
+        lines.append(
+            "Read the design document in full, then read enough of the repository to "
+            "ground the plan in real paths, existing conventions, and work that is "
+            "already done."
+        )
     lines.append("")
+    if synthesizing:
+        lines.extend(_artifact_lines(artifacts))
     existing_docs = [
         path for path in context.get("design_docs", []) if path != str(doc)
     ]
@@ -228,6 +410,9 @@ def build_prompt(
     lines.append(SCHEMA)
     lines.append("")
     lines.append(RULES)
+    if synthesizing:
+        lines.append("")
+        lines.append(SYNTHESIS_RULES)
     lines.append("")
     lines.append(
         "If you cannot write that file, print the same JSON to stdout inside a "
@@ -275,10 +460,17 @@ def generate(
     context: dict[str, Any],
     stream: bool = False,
     on_start=None,
+    artifacts: Any = None,
+    plan_id: str | None = None,
 ) -> tuple[PlanDocument, Path, int]:
-    """Run the planning agent and return the validated plan it produced."""
-    resolved = agents.resolve(agent, agent_args, model)
-    plan_id = new_plan_id(doc)
+    """Run the planning agent and return the validated plan it produced.
+
+    With `artifacts`, this is the synthesis stage of a staged pipeline and writes
+    into that pipeline's directory, beside the analyses it was built from. Without
+    them it is the older single-shot planner, which decides everything at once.
+    """
+    resolved = agents.resolve(agent, agent_args, model, events=True)
+    plan_id = plan_id or new_plan_id(doc)
     directory = state.plan_dir(root, plan_id)
     directory.mkdir(parents=True, exist_ok=True)
     plan_path = directory / "plan.json"
@@ -288,9 +480,11 @@ def generate(
         plan_path=plan_path,
         instructions=instructions,
         context=context,
+        artifacts=artifacts,
     )
     if on_start is not None:
         on_start(resolved, directory)
+    stop_reasons: list[str] = []
     try:
         code = runner.run_agent(
             resolved.command,
@@ -300,13 +494,17 @@ def generate(
             timeout,
             stream=stream,
             prefix="  | " if stream else "",
+            event_shape=resolved.event_shape,
+            stop_reasons=stop_reasons,
         )
     except FileNotFoundError as exc:
         raise WritError(f"planning agent not found: {resolved.command[0]}") from exc
 
     text = _plan_text(directory, plan_path)
     if text is None:
-        raise WritError(_no_plan_message(resolved, directory, code))
+        raise WritError(
+            _no_plan_message(resolved, directory, code, stop_reasons=stop_reasons)
+        )
     try:
         document = load_document(text)
     except WritError as exc:
@@ -315,7 +513,10 @@ def generate(
 
 
 def _no_plan_message(
-    resolved: agents.ResolvedAgent, directory: Path, code: int
+    resolved: agents.ResolvedAgent,
+    directory: Path,
+    code: int,
+    stop_reasons: list[str] | None = None,
 ) -> str:
     """Explain a planner that produced nothing, and why it may have hung."""
     produced_output = runner.produced_output(directory)
@@ -323,6 +524,23 @@ def _no_plan_message(
         detail = "the planning agent was killed for exceeding its timeout"
         if not produced_output:
             detail += f"\n  {agents.hang_hint(resolved)}"
+    elif truncated(stop_reasons or []):
+        # The agent ran, worked, and was cut off mid-turn having spent its whole
+        # output allowance. Said explicitly because the alternative reading —
+        # "it wrote nothing, so it never started" — sends whoever reads this to
+        # check a model id and an API key that were never the problem.
+        detail = (
+            "the planning agent ran out of output budget before it could write "
+            "the plan"
+        )
+        detail += (
+            "\n  its last turn ended on the model's output ceiling, so nothing "
+            "was written and nothing was printed"
+        )
+        detail += (
+            "\n  a plan for this many requirements needs a model with more output "
+            "headroom; the same model on another provider may have far more"
+        )
     else:
         detail = f"the planning agent exited {code} without producing a plan"
         if not produced_output:
@@ -491,6 +709,16 @@ def load_document(text: str) -> PlanDocument:
     return PlanDocument(milestones=milestones, requirements=requirements)
 
 
+def load_requirement_inventory(value: Any) -> list[Requirement]:
+    """Validate a requirement inventory from any source.
+
+    Public because the requirements *stage* (`writ/analysis.py`) writes the same
+    object in its own artifact, and a second validator would let an inventory be
+    legal in one file and illegal in the other.
+    """
+    return _requirements(value)
+
+
 def _requirements(value: Any) -> list[Requirement]:
     """Validate the requirement inventory, or accept its absence.
 
@@ -633,3 +861,46 @@ def unresolved_sections(milestones: list[PlannedMilestone], doc: Path) -> list[s
             if not section_text(doc, task.section):
                 missing.append(task.section)
     return sorted(set(missing))
+
+
+def untraceable_requirements(
+    requirements: list[Requirement], doc: Path
+) -> list[Finding]:
+    """Requirements citing a heading the design document does not have.
+
+    The same check `unresolved_sections` makes for tasks, pointed at the inventory.
+    It is worth making deterministically rather than leaving to the coverage critic,
+    because it is the cheapest available evidence that a requirement was *read*
+    rather than assumed: an obligation traced to a heading that does not exist is
+    one the stage may have supplied from its own expectations of what a document
+    like this would say, and that is how work with no mandate enters a plan.
+
+    Advisory, not blocking. A document can be restructured after planning, and a
+    heading cited loosely is a citation problem rather than an invented obligation —
+    a reader given the id and the claimed source can settle it in a moment.
+    """
+    findings: list[Finding] = []
+    for requirement in requirements:
+        source = (requirement.source or "").strip()
+        if not source:
+            continue
+        if section_text(doc, source):
+            continue
+        findings.append(
+            Finding(
+                severity="warning",
+                category="untraceable-requirement",
+                where=requirement.id,
+                requirement_ids=[requirement.id],
+                message=(
+                    f"{requirement.id} cites {source!r}, which is not a heading in "
+                    f"{doc.name}"
+                ),
+                suggested_action=(
+                    "Cite the heading the obligation actually came from, or check "
+                    "that the document states it at all."
+                ),
+                source="stage:requirements",
+            )
+        )
+    return findings

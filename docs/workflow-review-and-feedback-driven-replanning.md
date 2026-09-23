@@ -1538,3 +1538,118 @@ Implement this first as a **checkpoint-based repair loop**:
 Later, allow unrelated branches to continue during repair.
 
 This gives Writ the key capability it currently lacks: **a wrong initial plan becomes a recoverable hypothesis, rather than a fixed contract that execution must somehow force to succeed.**
+
+---
+
+# Implementation status
+
+What of the above is in the codebase, as of the staged-planning work.
+
+## The pipeline
+
+```text
+Design document
+      │
+      ▼
+1. Requirements extraction     writ/analysis.py — requirements.json
+      │
+      ▼
+2. Repository reconnaissance   writ/analysis.py — inventory.json (incl. baseline)
+      │
+      ▼
+3. Test and verification       writ/analysis.py — verification.json
+      │
+      ▼
+   (4. candidate plans — deliberately removed, see below)
+      │
+      ▼
+5. Plan synthesis              writ/planning.py — plan.json, + analysis.reconcile
+      │
+      ▼
+6. Adversarial plan review     writ/critics.py — five critics, opt-in
+      │
+      ▼
+7. Repair / adjudication       writ/plans.py dispositions; repair.py post-execution
+      │
+      ▼
+8. Static validation           writ/plancheck.py + the baseline from stage 2
+      │
+      ▼
+9. Approval                    writ approve, or writ plan --auto-approve
+      │
+      ▼
+10. Execution                  writ/orchestrator.py
+      │
+      ▼
+11. Milestone gate review      writ/gates.py — one gate per milestone
+      │
+      ▼
+12. Global acceptance review   writ/gates.py — G-FINAL over every milestone gate
+```
+
+## Stage 4 was removed rather than built
+
+Independent candidate plans are the one recommendation above that is not
+implemented, and the reason is a consequence of implementing stage 1 first.
+
+With the requirement inventory fixed before any decomposition, the useful
+disagreement about a plan is about *coverage of a known list* — and that is what
+the critics produce, by reading the one plan adversarially against the inventory.
+Two candidate plans with no shared vocabulary would need a third agent to choose
+between them, and that agent would be an unreviewed author again: the exact failure
+mode §3.3 describes, reintroduced one level up. The cost is also real — each
+candidate is a full planning run, and the synthesis step that merges them is the
+least reviewable part of the pipeline.
+
+What stage 4 was for is covered instead by:
+
+- `analysis.reconcile`, which catches a plan that dropped or invented a requirement
+- the five critics, which disagree with the plan as written rather than proposing
+  a rival to it
+- `--refresh` and `--plan-id`, which make re-running a stage cheap when its output
+  was poor
+
+## What staging actually bought
+
+The point is not that three agents are better than one. It is that fixing each
+judgement in an artifact makes the *next* one checkable:
+
+| defect | before | now |
+|---|---|---|
+| an obligation the planner never noticed | left no trace — no list it was missing from | `dropped-requirement`, blocking for a `must` |
+| work the plan invented | indistinguishable from work the design asked for | `invented-requirement`, blocking |
+| a criterion nobody could demonstrate | read the same as one that could | verification stage says so per requirement; `undemonstrable` is warned |
+| a pre-existing test failure | attributed to whichever task tripped over it | baseline recorded before planning, surfaced in `writ plan` and the API |
+| work the repository already did | replanned silently | `replanned-requirement` |
+| verification worked out and then ignored | nothing noticed | `unused-verification` |
+| a requirement traced to a heading that does not exist | nothing noticed | `untraceable-requirement` |
+
+## Stage 9: what changed
+
+A clean check used to approve the plan itself, which collapsed two different
+claims into one status: "nothing writ can prove is wrong with this plan" and
+"somebody signed this plan off". The first is much weaker — every defect in §3
+passes a clean check by construction — so a clean check now lands at
+`needs-approval`, and approval takes an actor. `writ plan --auto-approve` is the
+automation path, and it will not override a blocking finding; that remains
+`writ approve --force --reason ...`.
+
+## Known limits
+
+- **`unused-verification` is a substring match.** It compares the command or path
+  the verification stage named against the text of the covering tasks' criteria.
+  A task that states the same bar in different words is flagged spuriously, and one
+  that cites the command inside an otherwise meaningless criterion is not flagged
+  at all. It is a warning for that reason. Judging whether a criterion really
+  demonstrates a requirement is the acceptance critic's job.
+- **Stages are sequential and expensive.** Three analyses plus synthesis is four
+  agent runs before any code, nine with critics. `--plan-id` and `--refresh` make
+  retries cheap, and `--no-stages` remains for projects where that cost is not
+  worth it.
+- **Stage 3 spans two levels.** Verification is per requirement; acceptance
+  criteria are per task and must be task-local. The synthesizer bridges that, and
+  `reconcile` only checks the bridge weakly (see above).
+- **Requirement `source` is checked, but only for existence.**
+  `planning.untraceable_requirements` proves the cited heading is in the document;
+  it cannot prove the obligation is what that section says. Advisory, since a
+  document restructured after planning would otherwise block a correct plan.

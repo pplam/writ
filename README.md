@@ -48,7 +48,7 @@ cd ~/projects/my-service
 
 writ init
 writ plan docs/design.md --dry-run     # see what the planner will be asked
-writ plan docs/design.md               # an agent reads the doc and the repo
+writ plan docs/design.md               # three analyses, then a plan built on them
 
 writ check                             # what writ can prove about the plan
 writ coverage                          # every requirement, and what covers it
@@ -82,16 +82,24 @@ writ review M01-001 --agent codex      # a different agent checks the claim
 <project>/.writ/
   state.json          the whole project: the plan and its status, requirements,
                       milestones, tasks and gates, runs, findings, repair
-                      requests, decisions
+                      requests, decisions, and the planning attempts — the only
+                      record here written while the thing it describes is still
+                      happening, which is what lets `writ serve` show a plan
+                      being made rather than only a plan that was made
   config.json         your defaults: which agent fills each role, and how
-                      `writ run` behaves. Optional, and writ never writes it
+                      `writ run` behaves. Written once by `writ init` holding
+                      writ's own defaults, and never touched again
   decisions.md        human-readable mirror of the decision log
-  run.session         the pid of the active `writ run`, if any
+  state.lock          advisory lock around each write. An OS-level `flock` where
+                      the platform has one, so it is released if a holder dies
+                      and cannot be taken from a holder that is merely slow
+  run.session         the identity of the active `writ run`, if any
   plans/<plan-id>/
     prompt.txt        what the planning agent was asked
     plan.json         the plan it returned, before validation
     stdout.log
     stderr.log
+    <stage>/          one per analysis stage: its own prompt, logs and events
   reviews/r<revision>/<critic>/
     prompt.txt        what that critic was asked, at that plan revision
     findings.json     what it found
@@ -111,18 +119,74 @@ a detached run and an interactive `writ status` never corrupt each other.
 
 ## Planning
 
-`writ plan` hands the design document and the repository to a coding agent and
-asks for a plan as JSON: milestones, tasks, checkable acceptance criteria, the
-dependency edges between them, and the paths each task may touch. Planning is a
-judgement call — which work is one bounded session, what the real bar is, what
-must land first — and reading the repo is part of making it.
+`writ plan` turns a design document into a task DAG: milestones, tasks, checkable
+acceptance criteria, the dependency edges between them, and the paths each task
+may touch. Planning is a judgement call — which work is one bounded session, what
+the real bar is, what must land first — and reading the repo is part of making it.
+
+It runs as a **staged pipeline** rather than one agent call, because those are
+different judgements and running them together loses what makes a plan checkable.
+Three analyses write artifacts first, then a synthesis agent decomposes the work
+from them:
+
+```text
+requirements.json   every obligation the document states, one per entry
+inventory.json      what the repository already is, does, and tests — plus the
+                    baseline: did the suite pass before any of this started
+verification.json   how each obligation could actually be demonstrated
+        │
+        ▼
+plan.json           the decomposition, synthesized from all three
+```
+
+Each artifact is checkable before the next stage sees it: an inventory claiming
+coverage of a requirement nobody recorded is rejected at the stage that invented
+it, rather than becoming a task no obligation asked for. And the synthesizer is
+held to them — the requirement inventory arrives as a fixed list, and a dropped or
+invented id is a finding on the plan (`analysis.reconcile`). A single agent writing
+the inventory and the tasks together can never disagree with itself, so the
+omission leaves no trace anywhere; fixing the list first is what makes it findable.
 
 ```bash
 writ plan docs/design.md --dry-run     # print the planning prompt
-writ plan docs/design.md               # plan, validate, commit
+writ plan docs/design.md               # analyse, synthesize, validate, commit
 writ plan docs/design.md --agent claude --model opus
 writ plan docs/design.md --instructions "storage layer first"
+
+writ plan docs/design.md --stage requirements   # stop after one analysis
+writ plan docs/design.md --plan-id design-20260101T120000   # resume a pipeline
+writ plan docs/design.md --refresh              # redo stages already done
+writ plan docs/design.md --parallel-stages      # requirements beside inventory
+writ plan docs/design.md --no-stages            # the older single-shot planner
 ```
+
+Stages are resumable. Artifacts live under `.writ/plans/<plan-id>/`, and a stage
+whose artifact is already there is reused rather than re-run, so a pipeline that
+failed at synthesis does not pay for three analyses again. A failed stage stops the
+pipeline instead of synthesising from a partial set.
+
+They run one at a time by default. `--parallel-stages` runs the ones that need
+nothing from each other at once, which is requirements beside inventory:
+verification is asked how to prove each requirement, so a list of them is its
+input, but the survey of the repository does not depend on what the document asks
+for. The grouping comes from what each stage declares it needs, not from a hardcoded
+pair.
+
+It costs something, and the cost is printed rather than left to be discovered. The
+inventory normally receives the requirement ids so its `existing_coverage` can say
+which stated obligation the existing code already discharges — the `already
+satisfied by this repository` line, the synthesizer's note about what not to plan
+again, and the `replanned-requirement` finding all come from that field. Running
+beside the requirements stage, it has no ids, so it is told to leave the field
+empty. Coverage claims are still checked against the real ids once both artifacts
+land: a stage that invented `REQ-099` and marked it satisfied fails, because the
+instruction was to make no claim rather than to guess.
+
+Deliberately absent: competing candidate plans. With the requirement inventory
+fixed, the useful disagreement about a plan is about coverage of a known list —
+which the critics below produce by reading the one plan adversarially. Two plans
+with no shared vocabulary would need a third agent to choose between them, and
+that agent would be the unreviewed author again.
 
 The agent's output is mirrored to your terminal as it arrives, prefixed with
 `|`, so a long planning run is visibly working rather than looking hung. The
@@ -154,6 +218,8 @@ instead of paying for another run.
 | `--critics [NAMES]` | after committing, have independent critics read it (all five if unnamed) |
 | `--critic-agent CMD` | agent for the critics (default: the planning agent) |
 | `--critic-model NAME` | model for the critics |
+| `--parallel-stages` | run requirements beside inventory (see above) |
+| `--parallel-critics` | run all five critics at once |
 | `--append` | plan additional work alongside an existing plan |
 | `--force` | replace the existing plan |
 | `-- <args>` | everything after `--` is passed to the agent |
@@ -175,9 +241,9 @@ A plan can be structurally perfect and still be wrong: complete in shape,
 infeasible in practice, or quietly missing an obligation the design stated. So
 committing a plan is not the same as accepting it.
 
-`writ plan` asks the agent for a **requirement inventory** before any task — every
-obligation the document states, one per entry, each with the heading it came from.
-Tasks then name the requirements they discharge. That is what makes coverage
+The pipeline's first stage produces a **requirement inventory** before any task —
+every obligation the document states, one per entry, each with the heading it came
+from. Tasks then name the requirements they discharge. That is what makes coverage
 checkable rather than a matter of reading both documents side by side:
 
 ```bash
@@ -198,13 +264,37 @@ writ list findings --open     # the ledger
 
 Findings carry a severity. Only an `error` blocks: the plan is held at
 `needs-approval` and `writ run` refuses to start it. Warnings and notes are
-recorded and readable and do not stop anything. A plan with no blocking findings
-approves itself; one with them waits for a person:
+recorded and readable and do not stop anything.
+
+A clean check does **not** approve the plan. Those are different claims — "nothing
+writ can prove is wrong with this" is much weaker than "somebody signed this off",
+and every defect a deterministic check cannot see (an omitted requirement, an edge
+that is legal but incorrect, a criterion nothing can demonstrate) passes a clean
+check by construction. So approval takes an actor:
 
 ```bash
 writ approve --by ada --reason "read it through"
 writ approve --force --reason "known gap, shipping the spike"
 ```
+
+For automation that has to get from a document to a running graph unattended:
+
+```bash
+writ plan docs/design.md --auto-approve
+writ plan docs/design.md --critics --repair --auto-approve   # review, repair, approve
+```
+
+which approves the plan only when nothing blocking stands against it. It is not a
+silent `--force`: a blocking finding still holds the plan, because overruling
+writ's own objection is a judgement and the record has to say whose.
+
+The order is what makes the second line work. Approval is judged last — after the
+critics have reported and after `--repair` has answered what they found — so what
+is approved is the plan as everything that read it left it. Without `--repair` a
+plan the critics object to stops at `needs-approval` however unattended the run
+was, because there is nobody whose job is to answer them; that is the shape to
+reach for when a person will read the findings, and `--repair` is the shape for
+when nobody will.
 
 Or answer one finding at a time, which is the more useful shape when you disagree
 with a particular objection rather than with all of them:
@@ -250,6 +340,7 @@ agents that did not write it, each with one question:
 ```bash
 writ critique                             # all five, over the committed plan
 writ critique --critics coverage,scope    # just those
+writ critique --parallel-critics          # all five at once
 writ plan design.md --critics             # plan and critique in one pass
 ```
 
@@ -268,6 +359,18 @@ quietly reducing to whoever succeeded. Finding nothing is a legitimate result.
 
 A review is tied to the plan revision it read, so `writ check` can tell you the
 critics passed a plan that has since been repaired.
+
+Critics run one at a time by default, and `--parallel-critics` runs all five at
+once. They are independent by construction — each has its own brief, none reads
+another's findings, and nothing downstream cares which finished first — so the only
+reason to serialise them was the working tree: `feasibility` is asked to run the
+project's build and tests, and two test runs in one tree report the interference as
+if it were a finding about the plan. But that needs two critics running commands and
+there is only one; the other four are told not to touch the suite, which is what
+makes one wave safe. `feasibility` is told in turn that the tree is shared, so a
+load-dependent failure is reported as unproven rather than as a broken baseline.
+Reports come back in the order the critics were asked for whatever order they
+finished in, so a review reads the same either way.
 
 ### Gates, and repair
 
@@ -303,6 +406,19 @@ Both loops are bounded. A gate that has asked for repair twice, or whose finding
 keep coming back, stops for a human rather than cycling; so does a planner whose
 patches writ keeps refusing. `writ run` reports a held gate as waiting, not as
 failed, because the work behind it is not broken — it is parked on a decision.
+
+The bound counts patches that **landed**, not agent runs. A refused patch changed
+nothing and is handed straight back with the reason it broke, so spending a round
+on it would stop the loop over a plan that had never actually been repaired.
+
+A finding closes when the party that raised it stops reporting it. Writ's own
+checks re-run every time the plan changes, so their silence is evidence
+immediately; a critic's finding closes when that critic reads the patched plan and
+no longer objects, which is what the re-review after each applied patch is for.
+Nobody closes anybody else's objection: a structural pass never looked for what a
+critic found. The adjudicator's `accepted` is a claim in the meantime — the same
+claim a returning finding overturns — and it becomes `resolved` once a check
+agrees, so a repaired plan stops carrying what its repair answered.
 
 ### Extraction fallback
 
@@ -512,6 +628,36 @@ slot it had already spent. And `awaiting-review` still does not unblock dependen
 work built on a task whose review might send it back is work built on a premise
 that has not been checked.
 
+### Rework is not for broken machinery
+
+Rework is what a task spends when a reviewer read its work and said no. A provider
+timeout, a subprocess that would not spawn, a state lock writ could not take — none
+of those are readings of the work, and charging them to rework did two kinds of
+damage at once: the task lost attempts it never used, and when they ran out writ
+reported it as having failed on technical merit. The record then said a reviewer
+rejected work no reviewer had seen.
+
+So a failure is classified before anything is charged for it, and an
+infrastructure failure gets its own budget: `--max-infra-retries`, 2 by default,
+with exponential backoff and jitter. The retries are counted on the task in the
+store, so a session killed mid-backoff and resumed does not hand out a fresh
+allowance.
+
+```
+retry    M01-002  infrastructure 1/2 in 1.8s  (the agent exceeded its timeout (600s) and was killed)
+```
+
+A task that exhausts the budget is reported as *out of infrastructure retries*,
+not as failed, and its status is whatever it was returned to — it is still waiting
+to be attempted. `writ show <run>` names the category, so the first question about
+a run that did not finish (look at the code, or look at the machine) has an answer
+without guessing.
+
+```
+failure: infrastructure  (retryable)
+  the agent exceeded its timeout (600s) and was killed
+```
+
 ### The decision log
 
 A task's verdict also carries the choices the design document did not make. An
@@ -579,25 +725,58 @@ So a project can write its choices down once, in `.writ/config.json`:
     "implementer": {"command": "claude", "model": "sonnet"},
     "reviewer":    {"command": "codex",  "model": "gpt-5-codex"}
   },
-  "run": {"parallel": 3, "order": "depth", "max_rework": 2}
+  "run": {"parallel": 3, "order": "depth", "max_rework": 2},
+  "plan": {"stages": true, "gates": true, "critics": true}
 }
 ```
 
-Then `writ run` with no flags uses all of it. `config.example.json` in this
-repository is the same thing with every option commented; copy it across and
-edit.
+Then `writ run` with no flags uses all of it. `writ init` writes this file for
+you, holding every field writ accepts at writ's own default, so editing it is a
+matter of changing a value rather than working out what can be set. A comment
+block at the top explains it: one line per setting, grouped by section, and what
+each `null` falls back to — so the tables below are in the project rather than
+only here.
+`config.example.json` in this repository is a filled-in example.
 
-Four roles, because that is how many writ actually distinguishes:
+Five roles, because that is how many writ actually distinguishes:
 
 | role | used by | falls back to |
 |---|---|---|
-| `planner` | `writ plan` | `pi` |
+| `planner` | `writ plan` — its synthesis | `pi` |
 | `critic` | `writ critique`, `writ plan --critics` | the planning agent |
+| `stage` | the analysis stages of `writ plan` | the planning agent |
 | `implementer` | `writ run`, `writ dispatch`, **and gates and repair planners** | `pi` |
 | `reviewer` | `writ review`, `writ run` | the implementing agent |
 
-Each takes `command`, `model`, and `timeout`. Under `run`: `parallel`, `order`,
-and `max_rework`, which `writ review` honours too since it is the same budget.
+Each takes `command`, `model`, and `timeout`.
+
+**Every flag that is a standing decision is in the file**, not just the agents.
+The sections mirror the commands:
+
+| section | what it holds |
+|---|---|
+| `run` | `parallel`, `order`, `max_rework` (which `writ review` honours too, being the same budget), `max_tasks`, `stream` |
+| `plan` | `stages`, `gates`, `chain`, `critics`, `repair`, `auto_approve`, `refresh`, `parallel_stages`, `parallel_critics`, `instructions`, `extract`, `level`, `flat` |
+| `critique` | `critics` — which of them run — and `parallel` |
+| `dispatch` | `detach` |
+| `check`, `coverage` | `all`, `uncovered` |
+| `status` | `watch`, `interval`, `until_idle`, `clear` |
+| `list`, `show`, `graph`, `logs` | what each one prints by default |
+| `serve` | `port`, `host`, `open` |
+| `common` | `cwd`, `quiet`, `json`, `dry_run`, applied wherever a command takes them |
+
+`plan.stages` is the one most worth knowing about. `--no-stages` swaps the staged
+pipeline for the older single-shot planner, which makes every judgement the three
+analyses make in one response — a decision about how this project plans, and so
+exactly the kind that belongs in a file rather than in a flag you have to remember.
+`plan.critics` is the other: critics cost an agent run each, which is why writ does
+not run them unasked, and a project that wants them on every plan says so once here.
+
+**What is deliberately not configurable**, because a default would make writ
+misreport the project: anything naming one piece of work (a design document, a task
+id, `--stage`, `--plan-id`), the filters on `list` and `coverage` — a standing
+`--uncovered` would show a subset while looking like it showed everything — and
+every `--force`, each of which overrides a check writ exists to make.
 
 Note where gates sit. A gate judges whether integrated work adds up, which is a
 review, but it runs on the implementing agent — so the model that wrote the code
@@ -612,11 +791,17 @@ ROLE         COMMAND                   MODEL        TIMEOUT
 -----------  ------------------------  -----------  -------
 planner      claude                    opus         1800
 critic       codex                     gpt-5-codex  -
+stage        -                         -            -
 implementer  claude                    sonnet       -
 reviewer     codex                     gpt-5-codex  1800
 
 from .writ/config.json; a flag overrides any of it
 ```
+
+A flag wins in both directions, including for the settings spelled negatively:
+`--gates/--no-gates`, and `--open`/`--clear` against `serve.open` and
+`status.clear`. A boolean in a config you cannot argue with for one run would not
+be a default.
 
 **An unknown key is an error, not a shrug.** A config is hand-edited, so a typo
 in one is as likely as a typo in a flag — and a silently ignored `"reviewr"` would
@@ -625,10 +810,15 @@ not. So it is refused, with the name it was probably reaching for:
 
 ```
 writ: .writ/config.json: unknown role 'reviewr' (did you mean 'reviewer'?);
-known roles: planner, critic, implementer, reviewer
+known roles: planner, critic, stage, implementer, reviewer
 ```
 
 That happens before any agent starts, not three tasks into a run.
+
+**`null` means writ's default**, the same as leaving the key out. That is what
+lets the generated config name every field: an unset `implementer.timeout` means
+*no* timeout, and an unset `reviewer.command` means the implementing agent, and
+neither has a value that says so.
 
 Any key beginning with `_` is a comment, since JSON has nowhere else to put one —
 useful for the reason behind a choice, which outlives the choice:
@@ -640,10 +830,15 @@ useful for the reason behind a choice, which outlives the choice:
 }}
 ```
 
-Writ does not write this file. `writ init` does not create one and `init --force`
-does not delete it: it says how this project runs agents, which is still true of
-the next plan written in it. Note that `.writ/` is usually gitignored, so this is
-a per-checkout file rather than a shared one.
+`writ init` creates this file, and that is the only time writ writes it. Every
+value in the generated file is the one writ would have used anyway, so a project
+that never opens it runs exactly as it would with no config at all — including
+the reviewer, which is `null` rather than pinned to an agent, because its real
+default is the implementing agent and no value says that. After that it is
+yours: nothing reformats or edits it, and `init --force` resets project state
+while keeping it — how this project runs agents is still true of the next plan
+written in it. Note that `.writ/` is usually gitignored, so this is a
+per-checkout file rather than a shared one.
 
 ## Commands
 
@@ -655,9 +850,16 @@ operates on.
 | Command | Purpose |
 |---|---|
 | `writ init [--force]` | create the project store |
-| `writ plan <doc>` | have an agent derive requirements, milestones, tasks, acceptance criteria |
+| `writ plan <doc>` | analyse the document and repo in stages, then synthesize milestones, tasks, acceptance criteria |
+| `writ plan <doc> --stage NAME` | run the analyses up to that stage and stop, committing nothing |
+| `writ plan <doc> --plan-id ID [--refresh]` | resume a pipeline, reusing (or redoing) the artifacts it already wrote |
+| `writ plan <doc> --parallel-stages` | run requirements beside inventory; the inventory then claims no existing coverage |
+| `writ plan <doc> --critics --parallel-critics` | run all five critics at once instead of one after another |
+| `writ plan <doc> --no-stages` | the older single-shot planner: one agent, every judgement at once |
+| `writ plan <doc> --auto-approve` | approve, once everything that reads the plan has, when nothing blocking stands against it |
+| `writ plan <doc> --repair [--max-rounds N] [--adjudicator-agent CMD]` | answer the plan's blocking findings with the bounded repair loop, before approval |
 | `writ check [--all] [--quiet]` | re-check the committed plan and report what stands against it |
-| `writ critique [--critics NAMES] [--agent CMD] [--model M] [--timeout S] [--cwd D] [--quiet]` | independent critics read the plan and report findings |
+| `writ critique [--critics NAMES] [--parallel-critics] [--agent CMD] [--model M] [--timeout S] [--cwd D] [--quiet]` | independent critics read the plan and report findings |
 | `writ approve [--by WHO] [--reason R] [--force]` | sign the plan off, which is what `writ run` requires |
 
 **Look**
@@ -684,7 +886,7 @@ operates on.
 
 | Command | Purpose |
 |---|---|
-| `writ run [--parallel N] [--order id\|depth\|unlocks] [--max-tasks N] [--max-rework N] [--agent CMD] [--model M] [--reviewer CMD] [--reviewer-model M] [--reviewer-timeout S] [--timeout S] [--cwd D] [--force] [--quiet] [--dry-run]` | walk the whole graph until it is done or stuck |
+| `writ run [--parallel N] [--order id\|depth\|unlocks] [--max-tasks N] [--max-rework N] [--max-infra-retries N] [--agent CMD] [--model M] [--reviewer CMD] [--reviewer-model M] [--reviewer-timeout S] [--timeout S] [--cwd D] [--force] [--quiet] [--no-stream] [--dry-run]` | walk the whole graph until it is done or stuck |
 | `writ dispatch <id> [--agent CMD] [--model M] [--detach] [--force] [--timeout S] [--cwd D] [--quiet] [--dry-run] [-- args]` | an agent implements the task and reports a verdict |
 | `writ review [id] [--agent CMD] [--model M] [--timeout S] [--cwd D] [--max-rework N] [--force] [--quiet] [--dry-run]` | a second agent verifies and signs off; no id reviews all awaiting |
 | `writ cancel [run-id]` | stop a run, or reap dead ones when given no id |
@@ -825,6 +1027,83 @@ them apart is how a plan gets approved with a requirement nobody implemented —
 status looked fine on its own. Gates held for a human come first when there are
 any, because that is the state where nothing is running, nothing is broken, and
 nothing will change until a person acts.
+
+#### Watching the plan being made
+
+The Plan view's first card is the planning phase itself: every agent writ runs
+before a single task is dispatched, as a graph, live.
+
+This was the one stretch of writ the dashboard could not see. `writ plan --critics
+--repair` is four to fourteen agent runs, and none of them used to write anything
+to `state.json` until the commit at the end — so the page a reader most wanted to
+watch during planning had nothing at all to say for the whole of it, while the
+terminal beside it scrolled. Now the record is written as the phase runs.
+
+```
+Planning  running  * requirements, inventory    design-20250101T091200   just now
+
+Running the agents that produce the plan. Nothing is dispatched until this
+finishes and the plan is approved.
+
+ ┌───────────────────┐   ┌──────────────────┐   ┌──────────────┐   ┌───────────┐
+ │ * requirements 41s│──▶│ ○ verification   │──▶│ ○ synthesis  │──▶│ ○ commit  │
+ │   what the design │   │   how each could │   │   decompose  │   │   validate│
+ └───────────────────┘   └──────────────────┘   └──────────────┘   └───────────┘
+ ┌───────────────────┐ ▲
+ │ * inventory    38s│─┘
+ │   what the repo is│
+ └───────────────────┘
+
+2/6 steps    a column runs at once
+```
+
+Three things about that picture are deliberate.
+
+**A column is a wave, and the waves are the real ones.** The columns come from
+`analysis.waves` and `critics.waves` — the same functions that decide what writ
+actually runs at once. Two boxes side by side is not a drawing convention, it is
+writ saying it will run those two together, so `--parallel-stages` is visible as a
+shape rather than as a flag you have to remember passing.
+
+**Pending steps are drawn before they happen.** The whole step list is declared
+from the flags at the start, so the graph shows the shape of the attempt — which
+analyses, which critics, whether repair is armed — instead of boxes appearing from
+nowhere one at a time. The exceptions are the steps nobody could foresee: a repair
+round exists only because the critics objected, and re-reviewing a patched plan is
+a second pass of critics at a new revision, so those are appended as they open.
+
+**Clicking a step shows what its agent is saying.** The command that ran it, the
+transcript directory, and its live output — rendered through writ's own stream
+renderer, so the `· tool` and `~ thinking…` lines read exactly as they do in the
+terminal, because it is the same code producing them. A step that is still running
+is polled while you are looking at it and stops when it ends.
+
+A failed or killed planning run stays on the record rather than disappearing. A
+step still marked running when the process died is reported `abandoned`, not
+running forever — writ checks whether the owning process is provably gone before
+saying so, the same test `writ run` uses before reaping a run.
+
+The card also carries what the plan rests on — the requirement count, the open
+questions, anything undemonstrable, and the repository's own baseline:
+
+```
+3 requirements inventoried    2 undemonstrable
+
+Baseline  fail   the suite was already failing when planning started
+ran pytest -q
+2 known failures: tests/test_legacy.py::test_a  tests/test_legacy.py::test_b
+```
+
+Two things there are worth the space. A stage marked `pending` never ran, which
+says what the plan does *not* rest on: with no verification artifact, nothing
+worked out how any requirement would be demonstrated, and every acceptance bar in
+the plan is the synthesizing agent's own invention. And the baseline is the
+repository's own suite *before* any of this work started — a project whose tests
+were already red will otherwise blame that on whichever task first runs into it.
+
+Plans made by a writ that kept no phase record — and plans from `--extract` or
+`--from-plan`, which run no agents at all — fall back to the older stage list,
+which says the same thing about what the pipeline produced, after the fact.
 
 It is read-only, like the rest of the dashboard. Disposing of a finding takes a
 reason, and a reason is something to type deliberately, so the page shows the
@@ -1020,7 +1299,7 @@ One task, one step at a time. `writ run` does exactly this, repeatedly:
          │
    1. select    ── the graph says M01-002 is ready
          │
-   2. claim     ── status: planned -> running, owner_pid recorded
+   2. claim     ── status: planned -> running, owner identity recorded
          │          (from here the task is no longer selectable)
          │
    3. prompt    ── runs/M01-002-…/prompt.txt
@@ -1041,6 +1320,19 @@ Step 2 is what makes concurrency safe. The claim is a write inside the same
 advisory lock as every other write, so a task stops being selectable *before* its
 agent starts rather than after. Two schedulers cannot both pick it up, and
 neither can a `writ dispatch` running alongside.
+
+The owner is recorded as a composite identity — pid, process start time, hostname
+and a token — rather than a bare pid. PIDs are reused, and every question writ
+asks about an owner is load-bearing: whether to return a task to the queue, and
+whether to send a signal to a process group. A recycled pid would answer both
+wrongly, in the two directions that hurt most: a wedged task nothing reclaims, and
+a `kill` aimed at a stranger.
+
+And every prepared run is settled exactly once. If the worker reaches the end it
+records its own outcome; if it raises — a provider that fell over, a subprocess
+that would not spawn — writ reconciles the run and returns the task to the queue
+before reporting the failure. Neither path can leave a task claimed by a process
+that no longer exists.
 
 Step 4 is what makes progress real. The task's status comes from the file the
 agent wrote, not from its exit code — a process can exit 0 having done nothing.
@@ -1190,9 +1482,8 @@ question is only ever asked in one place.
 
 ### Reading the progress log
 
-The log is one line per event, not a transcript. Several agents talking at once
-is unreadable, so `writ run` reports transitions instead — what started, what it
-produced, and what that changed:
+The log is one line per event: what started, what it produced, and what that
+changed.
 
 ```
 dispatch M01-002  ->  claude -p                 an agent started
@@ -1235,11 +1526,37 @@ parse, so no criterion moved and the task went back to `planned` — it kept the
 three bars the implementer had already earned rather than losing them to a
 reviewer's malformed file.
 
-`--quiet` drops the started lines and keeps the transitions. `--json` emits the
-same events as objects, each carrying `status`, `criteria`, `unmet`, `summary`,
-and `decisions`, so a wrapper does not have to parse the text.
+Underneath those lines, each agent's own output is mirrored as it arrives, every
+line tagged with the task and the role it came from:
 
-Full agent output is always on disk, whatever the log shows:
+```
+dispatch M01-002  ->  claude -p
+M01-002 impl   | reading src/frame.py and the two tests that cover it
+M01-002 impl   | running: pytest -q tests/test_frame.py
+M01-002 impl   | 14 passed
+         ? M01-002  awaiting-review  3/3
+review   M01-002  ->  codex exec -
+M01-002 review | re-running the command the verdict cites
+```
+
+This used to be left out, on the grounds that several agents talking at once is
+unreadable. That was true of the mirror writ had — it copied a character at a
+time, so two agents ended up inside each other's sentences. It writes whole lines
+under one lock now, shared with the progress log, so with `--parallel 4` every
+line still arrives intact and says who is talking. The tradeoff it was trading
+against is the worse one: a terminal that prints nothing for the length of a model
+call is indistinguishable from a hung one, and "nothing is happening" is exactly
+the state you need to be able to see.
+
+`--no-stream` goes back to the progress log alone, and `run.stream: false` in
+`config.json` makes that the project's default. `--quiet` drops the started lines
+and does not mirror. `--json` emits the events as objects — each carrying
+`status`, `criteria`, `unmet`, `summary`, and `decisions` — and never mirrors,
+because a machine-readable stream with an agent's prose in it is not
+machine-readable.
+
+Full agent output is always on disk, whatever the log shows, and the file is what
+the agent wrote — the labels belong to the terminal, not the transcript:
 
 ```bash
 writ logs M01-002                      # what that agent actually printed

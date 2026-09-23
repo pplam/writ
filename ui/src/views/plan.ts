@@ -14,7 +14,8 @@
 
 import { classes, code, el, replace } from '../dom.js';
 import { ago, percent, plural } from '../format.js';
-import type { Coverage, Finding, Plan, Repair } from '../types.js';
+import type { Coverage, Finding, Phase, Pipeline, PipelineStage, Plan, Repair } from '../types.js';
+import { isPhase, renderPhase, type PhaseHandlers } from './phase.js';
 
 /** Which findings a reader is shown first. */
 export const FINDING_FILTERS: Record<string, (finding: Finding) => boolean> = {
@@ -26,6 +27,7 @@ export const FINDING_FILTERS: Record<string, (finding: Finding) => boolean> = {
 
 export interface PlanHandlers {
   onTask?: (id: string) => void;
+  onStep?: (id: string) => void;
 }
 
 export function renderPlan(
@@ -34,16 +36,157 @@ export function renderPlan(
   findings: Finding[],
   coverage: Coverage[],
   repairs: Repair[],
-  options: { filter: string },
+  options: { filter: string; phase?: Phase | Record<string, never>; step?: string | null },
   handlers: PlanHandlers = {},
 ): void {
   const shown = findings.filter(FINDING_FILTERS[options.filter] ?? FINDING_FILTERS.open);
+  const pipeline = plan.pipeline as Pipeline;
+  const phase = options.phase;
+  const watched = isPhase(phase);
   replace(host,
+    // First, because it comes first in time. The status card says whether work may
+    // start; this says whether the thing being judged has finished being built —
+    // and while planning is running it is the only card with news.
+    watched ? phaseCard(phase, options.step ?? null, handlers) : null,
     statusCard(plan),
     plan.held_gates.length ? heldCard(plan, handlers) : null,
+    // Above the findings: the findings say what is wrong with the plan, and this
+    // says what the plan was derived from. A reader deciding whether to trust a
+    // finding about coverage wants to know whether a requirements stage ran at all.
+    pipeline && pipeline.plan_id ? pipelineCard(pipeline, !watched) : null,
     findingsCard(shown, findings, options.filter),
     coverage.length ? coverageCard(coverage, handlers) : null,
     repairs.length ? repairsCard(repairs, handlers) : null,
+  );
+}
+
+/** The phase graph, in its own card so the Plan page stays a stack of cards. */
+function phaseCard(phase: Phase, step: string | null, handlers: PlanHandlers): HTMLElement {
+  const card = el('section', { class: classes('card', 'phase-card', phase.status === 'failed' && 'urgent') });
+  const forward: PhaseHandlers = { onStep: (id) => handlers.onStep?.(id) };
+  renderPhase(card, phase, step, forward);
+  return card;
+}
+
+/** How each stage ended, as a mark and a word. */
+const STAGE_MARKS: Record<PipelineStage['state'], string> = {
+  ok: '✓',
+  reused: '·',
+  failed: '✗',
+  pending: '○',
+};
+
+/**
+ * The staged pipeline the plan came out of.
+ *
+ * The plan's own status card says whether work may start. This says what the plan
+ * rests on, which is a different question and the one that explains a finding: a
+ * pipeline that stopped at `inventory` produced no verification artifact, so
+ * nothing worked out how any requirement would be demonstrated, and every
+ * acceptance bar in the plan is the synthesizer's own invention.
+ *
+ * The baseline gets its own line for the reason the API comments on: a suite that
+ * was already failing when planning started will be blamed on whichever task first
+ * runs into it.
+ */
+function pipelineCard(pipeline: Pipeline, withStages: boolean): HTMLElement {
+  const failed = pipeline.stage_rows.filter((stage) => stage.state === 'failed');
+  const pending = pipeline.stage_rows.filter((stage) => stage.state === 'pending');
+  const stopped = failed.length > 0 || pending.length > 0;
+  const baseline = pipeline.baseline;
+  return el(
+    'section',
+    { class: classes('card', failed.length > 0 && 'urgent') },
+    el(
+      'header',
+      { class: 'plan-head' },
+      el('h2', {}, 'Pipeline'),
+      code(pipeline.plan_id),
+      pipeline.at ? el('span', { class: 'muted small', title: pipeline.at }, ago(pipeline.at)) : null,
+    ),
+    el('p', { class: 'muted small' },
+      stopped
+        ? 'The plan does not rest on every analysis: what is missing was never established.'
+        : 'Each analysis ran and the synthesized plan was checked against all of them.'),
+    // Only when there is no phase graph above. The graph draws the same steps and
+    // draws them live, so showing both would put two accounts of one pipeline on
+    // one page — and the reader would have to work out that they agree. Plans made
+    // by an older writ, which kept no phase record, still get the list.
+    withStages ? el('ol', { class: 'stage-list' }, ...pipeline.stage_rows.map(stageRow)) : null,
+    el(
+      'div',
+      { class: 'meta-row' },
+      el('span', {}, `${plural(pipeline.requirements, 'requirement')} inventoried`),
+      pipeline.unresolved_ambiguities
+        ? el('span', { class: 'count warn' },
+            el('b', {}, String(pipeline.unresolved_ambiguities)),
+            el('span', { class: 'label' }, 'open questions'))
+        : null,
+      // A requirement nothing can demonstrate will be signed off on an agent's word
+      // and nothing else, which is worth a reader's attention before approval.
+      pipeline.undemonstrable.length
+        ? el('span', { class: 'count bad' },
+            el('b', {}, String(pipeline.undemonstrable.length)),
+            el('span', { class: 'label' }, 'undemonstrable'))
+        : null,
+    ),
+    pipeline.undemonstrable.length
+      ? el('p', { class: 'muted small' }, 'no way to prove: ', ...pipeline.undemonstrable.map(code))
+      : null,
+    baselineRow(baseline),
+    pipeline.directory ? el('pre', { class: 'command' }, pipeline.directory) : null,
+  );
+}
+
+function stageRow(stage: PipelineStage): HTMLElement {
+  return el(
+    'li',
+    { class: classes('stage', stage.state) },
+    el(
+      'header',
+      {},
+      el('span', { class: 'stage-mark' }, STAGE_MARKS[stage.state]),
+      el('b', {}, stage.name),
+      el('span', { class: classes('pill', stage.state) }, stage.state),
+      stage.artifact ? code(stage.artifact) : null,
+      stage.at ? el('span', { class: 'muted small', title: stage.at }, ago(stage.at)) : null,
+    ),
+    el('p', { class: 'muted small' }, stage.summary),
+    stage.error ? el('p', { class: 'prose error' }, stage.error) : null,
+  );
+}
+
+/**
+ * What the repository's own suite did before any of this work started.
+ *
+ * `unknown` is its own case rather than being folded into a failure: an inventory
+ * stage that did not report a baseline is a gap in the analysis, not a red suite.
+ */
+function baselineRow(baseline: Pipeline['baseline']): HTMLElement | null {
+  if (!baseline || (!baseline.status && !baseline.commands.length)) return null;
+  const bad = baseline.status === 'fail';
+  return el(
+    'div',
+    { class: classes('baseline', bad && 'bad') },
+    el(
+      'header',
+      {},
+      el('b', {}, 'Baseline'),
+      el('span', { class: classes('pill', bad ? 'failed' : baseline.status === 'pass' ? 'completed' : 'planned') },
+        baseline.status || 'unknown'),
+      bad
+        ? el('span', { class: 'muted small' }, 'the suite was already failing when planning started')
+        : null,
+    ),
+    baseline.commands.length
+      ? el('div', { class: 'meta-row' }, el('span', {}, 'ran '), ...baseline.commands.map(code))
+      : null,
+    baseline.known_failures.length
+      ? el('p', { class: 'muted small' },
+          `${plural(baseline.known_failures.length, 'known failure')}: `,
+          ...baseline.known_failures.slice(0, 6).map(code),
+          baseline.known_failures.length > 6 ? el('span', {}, ' …') : null)
+      : null,
   );
 }
 
