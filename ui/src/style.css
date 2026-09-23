@@ -230,6 +230,21 @@ code, .mono, pre { font-family: var(--mono); }
   align-items: start;
 }
 
+/*
+ * A grid item is `min-width: auto`, which means "at least as wide as my content"
+ * — so a card holding something wide grows past its column instead of letting
+ * the scroller inside it scroll. The phase graph is that card: at fourteen steps
+ * it is 2900px wide, the card grew to match, `.phase-holder` had nothing left to
+ * scroll, and the whole page scrolled sideways instead. Everything past the
+ * critics — the repair round, the re-review, the approval — sat off the right
+ * edge of a page that gave no sign there was more, so a repair that had run read
+ * as one that never did.
+ *
+ * On the item rather than on `.phase-holder`, because it is every wide card's
+ * bug: the same thing happened to a long acceptance command in a task card.
+ */
+.grid > * { min-width: 0; }
+
 .grid.one { grid-template-columns: 1fr; }
 
 /*

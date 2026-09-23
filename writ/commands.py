@@ -1018,6 +1018,48 @@ def cmd_critique(args) -> int:
     return 1 if blocking or any(not report.ok for report in reports) else 0
 
 
+def _phase_for_adjudication(data: dict[str, Any]) -> str | None:
+    """The planning phase whose plan this is, or None if there is no record.
+
+    Matched on `plan_id` rather than just taking the newest: adjudication is about
+    one committed plan, and attaching its rounds to some other plan's attempt would
+    draw them into a graph they were no part of. None is a working answer — every
+    `phases.*` call is a no-op for it — which is what a project planned by an older
+    writ, or one whose plan came from `--from-plan`, gets.
+    """
+    record = phases.current(data)
+    if not record:
+        return None
+    # A positive match, not the absence of a mismatch. `pipeline.plan_id` is what
+    # names the planning run on disk and is the id `phases.begin` was given; a plan
+    # committed with `--from-plan` has no pipeline and so nothing to match on. That
+    # case has to be None: falling through on a missing id attached the rounds to
+    # whatever attempt happened to be newest, which is how a repair ends up drawn
+    # into a graph belonging to a different plan.
+    pipeline = plans.plan_status(data).get("pipeline") or {}
+    plan_id = str(pipeline.get("plan_id") or "")
+    if not plan_id or str(record.get("plan_id") or "") != plan_id:
+        return None
+    return str(record.get("id") or "") or None
+
+
+def _last_phase_step(root: Path, phase: str | None) -> str:
+    """The id of the step in the last column, which a new round follows.
+
+    A resumed loop appends after whatever the previous attempt ended with — the
+    approval it skipped, or the last re-review — so the new round is drawn where it
+    happened rather than back among the steps it came after.
+    """
+    if not phase:
+        return ""
+    data = state.load(root)
+    record = phases.current(data) or {}
+    steps = record.get("steps") or []
+    if not steps:
+        return ""
+    return str(max(steps, key=lambda entry: int(entry.get("wave", 0))).get("id") or "")
+
+
 def cmd_adjudicate(args) -> int:
     """Repair the plan against its own findings, bounded, before it executes.
 
@@ -1059,15 +1101,80 @@ def cmd_adjudicate(args) -> int:
         return 0
     doc = Path(args.doc) if getattr(args, "doc", None) else None
     directory = state.store_dir(root) / "adjudication" / f"r{plans.revision(data)}"
+    # Attach to the planning phase this plan was built by, so a round run from
+    # `writ adjudicate` reaches the dashboard the same way one run by
+    # `writ plan --repair` does.
+    #
+    # `writ adjudicate` is how a repair is resumed: the loop stops for a human, the
+    # human answers, and this is the command that carries on. Recording nothing
+    # meant the page kept showing the planning run that stopped — the same critics,
+    # the same one repair box — while rounds two and three were on disk and in
+    # `state.json`. The loop had run, and the only view of it said it had not.
+    phase = _phase_for_adjudication(data)
+    step_of: dict[int, str] = {}
+
+    # The revision as the loop starts, which is what `directory` is named for. Used
+    # in the step ids too so a step and the round directory it points at carry the
+    # same number; re-reading the revision per round would have named round 2 after
+    # the revision round 1 created, while its transcript sat under the old one.
+    opened_at_revision = plans.revision(data)
+
+    def step_for(number: int) -> str:
+        """The step id for this round, declared the first time the round opens."""
+        if number not in step_of:
+            step_of[number] = f"repair:r{opened_at_revision}-{number}"
+            phases.add(
+                root,
+                phase,
+                [
+                    phases.make_step(
+                        id=step_of[number],
+                        kind="repair",
+                        name=f"repair round {number}",
+                        summary="answer the plan's blocking findings",
+                    )
+                ],
+                after=_last_phase_step(root, phase),
+            )
+        return step_of[number]
 
     def announce(number: int, resolved) -> None:
+        phases.start_step(
+            root,
+            phase,
+            step_for(number),
+            resolved=resolved,
+            directory=directory / f"round-{number}",
+        )
         if args.json:
             return
         print(f"adjudication round {number}: {len(open_blocking)} blocking")
         print(f"  running: {resolved.display}")
         sys.stdout.flush()
 
+    def record(round_) -> None:
+        """Close this round's step with how it ended. The record goes first."""
+        step = step_of.get(round_.number)
+        if step is None:
+            return
+        if round_.error:
+            phases.finish_step(
+                root, phase, step, status="failed", error=_first_line(round_.error)
+            )
+            return
+        if round_.refused:
+            note = f"writ refused the patch ({len(round_.refused)} reason(s))"
+        elif round_.questions:
+            note = f"raised {len(round_.questions)} question(s) for a human"
+        else:
+            note = (
+                f"applied at plan revision {round_.applied.get('revision')}; "
+                f"blocking now {round_.blocking_after}"
+            )
+        phases.finish_step(root, phase, step, status="ok", note=note)
+
     def report(round_) -> None:
+        record(round_)
         if args.json:
             return
         if round_.error:
@@ -1097,23 +1204,33 @@ def cmd_adjudicate(args) -> int:
         chosen = _chosen_critics(args)
         if not args.json:
             print("  re-reviewing the patched plan")
-        _run_critics(args, root=root, doc=doc, chosen=chosen, plan_path=None)
+        _run_critics(
+            args, root=root, doc=doc, chosen=chosen, plan_path=None, phase=phase
+        )
         return []
 
-    result = adjudicate.loop(
-        root=root,
-        doc=doc,
-        directory=directory,
-        agent=getattr(args, "adjudicator_agent", None) or args.agent,
-        model=getattr(args, "adjudicator_model", None) or args.model,
-        timeout=args.timeout,
-        cwd=args.cwd,
-        max_rounds=args.max_rounds,
-        recheck=recheck,
-        stream=not args.quiet,
-        on_round=report,
-        on_start=announce,
-    )
+    # The phase closed when planning ended; these rounds reopen it. In a `finally`,
+    # because every way out of here — a clean plan, a spent budget, an adjudicator
+    # that would not start — has to leave the record settled rather than showing an
+    # attempt still in flight after the process is gone.
+    phases.resume(root, phase)
+    try:
+        result = adjudicate.loop(
+            root=root,
+            doc=doc,
+            directory=directory,
+            agent=getattr(args, "adjudicator_agent", None) or args.agent,
+            model=getattr(args, "adjudicator_model", None) or args.model,
+            timeout=args.timeout,
+            cwd=args.cwd,
+            max_rounds=args.max_rounds,
+            recheck=recheck,
+            stream=not args.quiet,
+            on_round=report,
+            on_start=announce,
+        )
+    finally:
+        phases.finish(root, phase, status="done")
     data = state.load(root)
     if args.json:
         render.emit_json(
@@ -1494,7 +1611,11 @@ def _critic_steps(root, phase, chosen, *, revision: int, data, parallel: bool):
         phases.make_step(
             id=f"critic:{critic.name}{suffix}",
             kind="critic",
-            name=critic.name,
+            # The revision is in the name, not only in the note: a re-review's note
+            # is rewritten with its verdict when it finishes, and without the
+            # revision the second pass then reads exactly like the first — five
+            # critic boxes twice over, with nothing to say which plan each read.
+            name=f"{critic.name} r{revision}",
             summary=critic.brief,
             wave=wave,
             note=f"re-reviewing the patched plan at revision {revision}",

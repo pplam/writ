@@ -675,6 +675,12 @@ DEFAULTS: dict[str, dict[str, Default]] = {
             "critic_model": Default("agents.critic.model"),
             "critics": Default("critique.critics"),
             "no_critics": Default("adjudicate.critics", True),
+            # The re-review after a patch is the same five agents `writ plan` runs,
+            # so it follows the same setting. Without this the flag parsed and was
+            # then always false: a project that had asked for parallel critics got
+            # them on the first pass and one-at-a-time on every re-read, which is
+            # the slower half of the loop and the half nobody was watching.
+            "parallel_critics": Default("critique.parallel", False),
         },
         "check": {"all": Default("check.all", False)},
         "coverage": {"uncovered": Default("coverage.uncovered", False)},

@@ -446,6 +446,29 @@ def add(
     _edit_phase(root, phase_id, apply)
 
 
+def resume(root: Path, phase_id: str | None) -> None:
+    """Reopen a finished phase, because more of it is about to happen.
+
+    `writ adjudicate` continues a planning attempt that has already closed: the loop
+    stopped with findings open, a human settled them, and the rounds that follow
+    belong to the same attempt. Adding a `running` step to a phase still marked
+    `done` would describe something that cannot be true, and `describe` only
+    corrects a dead owner on a phase that claims to be running — so a done phase
+    with a live step in it would have shown that step spinning forever.
+
+    The owner is retaken, since this process is now the one doing the work and is
+    the one a reader should be able to prove alive or dead.
+    """
+    def apply(phase: dict[str, Any]) -> None:
+        if phase.get("status") == "running":
+            return
+        phase["status"] = "running"
+        phase["finished_at"] = None
+        phase["owner"] = procs.identify().to_dict()
+
+    _edit_phase(root, phase_id, apply)
+
+
 def finish(
     root: Path,
     phase_id: str | None,

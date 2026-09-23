@@ -340,3 +340,21 @@ def test_each_view_reaches_the_bundle():
         assert f"---- views/{path.stem}.js ----" in body, (
             f"views/{path.stem}.js contributed nothing to writ/static/app.js"
         )
+
+
+def test_a_grid_card_may_not_grow_past_its_column():
+    """A wide card has to let its own scroller scroll.
+
+    A grid item's `min-width` defaults to `auto` — "at least as wide as my
+    content" — so a card holding something wider than its column grows to fit it
+    rather than clipping. The phase graph is that card: fourteen steps make it
+    ~2900px, the card grew to match, the `overflow: auto` holder inside it had
+    nothing left to scroll, and the page scrolled sideways instead. Every step past
+    the first critics — the repair round, the re-review, the approval — was off the
+    right edge with nothing on screen to suggest it was there, so a repair that had
+    run looked like one that never happened.
+    """
+    assert _rule(".grid > *").get("min-width") == "0", (
+        "`.grid > * { min-width: 0 }` is missing, so a card wider than its column "
+        "will push the page sideways instead of scrolling inside itself"
+    )

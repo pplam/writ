@@ -18,7 +18,7 @@ import sys
 
 import pytest
 
-from writ import adjudicate, plancheck, plans, repair, state
+from writ import adjudicate, phases, plancheck, plans, repair, state
 from writ.state import WritError
 
 from tests.test_plans import PLAN
@@ -76,6 +76,41 @@ findings = [] if not first else [{
 open(path, "w").write(json.dumps({
     "findings": findings,
     "summary": "read it" if not first else "one hole",
+    "confidence": "high",
+}))
+"""
+
+
+#: a critic that objects to something *different* each time it reads.
+#:
+#: The production case the seventy-note bug was hiding: a patch closes what was
+#: raised, and the re-read of the patched plan finds a new hole in the work the patch
+#: just added. That is the loop's whole purpose — and it needs two rounds, so a stub
+#: that reports the same thing forever (which escalates) cannot express it.
+CRITIC_MOVES_ON = """
+import json, os, re, sys
+prompt = sys.stdin.read()
+path = re.search(r'Write your findings as JSON to this exact path:\\n  (\\S+)', prompt).group(1)
+marker = os.environ["WRIT_TEST_READS"]
+reads = len(open(marker).read()) if os.path.exists(marker) else 0
+open(marker, "a").write("x")
+# A new requirement each read, so each finding is its own objection rather than the
+# same one coming back. Two of them, then satisfied.
+holes = ["REQ-003", "REQ-004"]
+findings = []
+if reads < len(holes):
+    findings = [{
+        "severity": "blocking",
+        "category": "missing-coverage",
+        "where": holes[reads],
+        "message": f"No task implements {holes[reads]}",
+        "suggested_action": "add a task, or mark it out of scope with a reason",
+        "requirement_ids": [holes[reads]],
+        "evidence": "searched the plan and the repository",
+    }]
+open(path, "w").write(json.dumps({
+    "findings": findings,
+    "summary": "another hole" if findings else "clean",
     "confidence": "high",
 }))
 """
@@ -695,6 +730,74 @@ def test_a_finding_that_survives_its_repair_is_escalated(objected, project):
     assert "survived" in repair.plan_exhausted(state.load(project), max_rounds=9)
 
 
+def test_repeated_advisories_do_not_escalate_the_plan(objected, project):
+    """The bound is about findings that were repaired, so advisories are not it.
+
+    A critic re-reports every note it still believes each time it re-reads, so a
+    plan with seventy notes crosses any seen-count limit the first time the critics
+    run twice — on a plan whose blocking findings were being fixed exactly as
+    intended. Counting those stopped the loop after one round and called a plan
+    beyond repair over objections no patch had ever been asked to answer.
+    """
+    with state.transaction(project) as data:
+        plans.record_findings(
+            data,
+            [
+                plancheck.Finding(
+                    severity=severity,
+                    category="unjustified-task",
+                    message="nothing in the design asks for it",
+                    where="M01-001",
+                    suggested_action="name the requirement it serves",
+                    source="critic:scope",
+                )
+                for severity in ("note", "warning")
+            ],
+            scope="critic:scope",
+        )
+        for record in plans.finding_records(data):
+            if record["severity"] in ("note", "warning"):
+                record["seen_count"] = repair.REPEAT_FINDING_LIMIT + 2
+                record["reopened_at"] = "2026-01-01T00:00:00Z"
+        repair.open_request(
+            data,
+            gate_id=None,
+            finding_ids=[],
+            summary="one round landed",
+            actor="adjudicator",
+        )["status"] = "applied"
+    data = state.load(project)
+    assert repair.plan_repeat_findings(data) == []
+    assert repair.plan_exhausted(data, max_rounds=9) == ""
+
+
+def test_a_blocking_finding_reopened_once_escalates(objected, project):
+    """`reopened_at` alone is the signal: a re-check disagreed with a patch.
+
+    Separate from the seen-count path because it needs no repetition to be
+    conclusive — the patch said it closed the finding and the critic that raised it
+    found it again on the patched plan.
+    """
+    with state.transaction(project) as data:
+        record = [
+            item
+            for item in plans.finding_records(data)
+            if item["source"] == "critic:coverage"
+        ][0]
+        record["seen_count"] = 1
+        record["reopened_at"] = "2026-01-01T00:00:00Z"
+        repair.open_request(
+            data,
+            gate_id=None,
+            finding_ids=[record["id"]],
+            summary="still open",
+            actor="adjudicator",
+        )["status"] = "applied"
+    data = state.load(project)
+    assert repair.plan_repeat_findings(data) == [record["id"]]
+    assert "survived" in repair.plan_exhausted(data, max_rounds=9)
+
+
 def test_the_plan_bound_counts_only_applied_repairs(objected, project):
     with state.transaction(project) as data:
         repair.open_request(
@@ -939,3 +1042,181 @@ def test_plan_without_repair_leaves_the_findings_standing(
     data = state.load(project)
     assert repair.requests(data) == []
     assert plans.plan_status(data)["status"] == "needs-approval"
+
+
+def test_a_resumed_round_reaches_the_phase_record(objected, project, monkeypatch):
+    """`writ adjudicate` draws its rounds into the attempt they belong to.
+
+    The command is how a stopped loop is resumed: the loop gives up with findings
+    open, a human settles them, and this carries on. It wrote nothing to the phase
+    record, so the dashboard kept showing the planning run that stopped — the same
+    critics, the one repair box it had already drawn — while the rounds that
+    followed were on disk and in `state.json`. The loop had run and the only view of
+    it said it had not.
+    """
+    patched(monkeypatch, ADDS_THE_TASK)
+    # A phase for the plan under test, as `writ plan` would have left it: closed,
+    # with the steps that ran. The fixture commits from `--from-plan`, which records
+    # no pipeline, so the id the two are matched on is set here too.
+    plan_id = "design-20260101T000000"
+    with state.transaction(project) as data:
+        plans.plan_status(data)["pipeline"] = {"plan_id": plan_id}
+    phase_id = phases.begin(
+        project,
+        doc="design.md",
+        plan_id=plan_id,
+        steps=[phases.make_step(id="commit", kind="commit", name="commit", wave=0)],
+    )
+    phases.finish(project, phase_id, status="done")
+
+    code, out, _ = objected(
+        "adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics"
+    )
+    assert code == 0, out
+    record = phases.current(state.load(project)) or {}
+    rounds = [
+        entry for entry in record.get("steps", []) if entry.get("kind") == "repair"
+    ]
+    assert rounds, [entry.get("id") for entry in record.get("steps", [])]
+    assert rounds[0]["status"] == "ok", rounds[0]
+    assert "applied" in rounds[0].get("note", ""), rounds[0]
+    # And the phase it reopened is closed again, so nothing looks in flight.
+    assert record.get("status") == "done", record.get("status")
+    assert record.get("finished_at")
+
+
+def test_a_round_is_not_drawn_into_another_plans_attempt(objected, project, monkeypatch):
+    """A phase for a different plan is left alone.
+
+    Adjudication is about one committed plan. Attaching its rounds to whatever
+    attempt happened to be newest would draw them into a graph they were no part of,
+    so a phase whose `plan_id` does not match is declined and the rounds go
+    unrecorded rather than recorded in the wrong place.
+    """
+    patched(monkeypatch, ADDS_THE_TASK)
+    phase_id = phases.begin(
+        project,
+        doc="other.md",
+        plan_id="some-other-plan",
+        steps=[phases.make_step(id="commit", kind="commit", name="commit", wave=0)],
+    )
+    phases.finish(project, phase_id, status="done")
+
+    code, out, _ = objected(
+        "adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics"
+    )
+    assert code == 0, out
+    record = phases.current(state.load(project)) or {}
+    assert record.get("plan_id") == "some-other-plan"
+    assert [e for e in record.get("steps", []) if e.get("kind") == "repair"] == []
+
+
+def test_a_new_blocking_finding_after_a_patch_opens_another_round(
+    writ, project, design, tmp_path, monkeypatch
+):
+    """The loop keeps going while each round is answering something new.
+
+    This is the case the production bug broke, and nothing covered it: round 1 lands,
+    the critics re-read the patched plan, and they object to the work the patch just
+    added. That must open round 2 — a plan is not beyond repair because repairing it
+    revealed the next problem.
+
+    It broke because the repeat-finding bound counted advisories. A real plan carries
+    dozens of notes the critics re-report on every read, so the first re-review pushed
+    all of them past the limit at once and the loop escalated, leaving the blocking
+    findings it had just been handed unanswered.
+    """
+    artifact = tmp_path / "plan.json"
+    artifact.write_text(json.dumps(PLAN), encoding="utf-8")
+    writ("init")
+    monkeypatch.setenv("WRIT_TEST_READS", str(tmp_path / "reads"))
+    # Advisories alongside the blocking ones, at the volume a real plan has, so the
+    # test fails if they are ever counted towards escalation again.
+    patched(monkeypatch, ADDS_THE_TASK)
+    with state.transaction(project) as data:
+        plans.record_findings(
+            data,
+            [
+                plancheck.Finding(
+                    severity="note",
+                    category="unknown-path",
+                    message=f"allowed path 'src/thing{n}.py' does not exist yet",
+                    where="M01-001",
+                    suggested_action="confirm the path",
+                    source="critic:scope",
+                )
+                for n in range(40)
+            ],
+            scope="critic:scope",
+        )
+        for record in plans.finding_records(data):
+            if record["severity"] == "note":
+                record["seen_count"] = repair.REPEAT_FINDING_LIMIT + 3
+
+    code, out, _ = writ(
+        "plan", str(design), "--from-plan", str(artifact),
+        "--critics", "coverage", "--critic-agent", agent(CRITIC_MOVES_ON),
+        "--repair", "--adjudicator-agent", agent(ADJUDICATOR),
+        "--max-rounds", "4", "--quiet",
+    )
+    data = state.load(project)
+    applied = [r for r in repair.requests(data) if r.get("status") == "applied"]
+    assert len(applied) >= 2, (
+        f"the loop stopped after {len(applied)} round(s); out:\n{out}"
+    )
+    # Both objections were answered, and nothing blocking is left standing.
+    # Both of the critic's objections were answered. Deliberately not "nothing
+    # blocking is left": the stub patch adds a task owning a path an earlier one
+    # owns, so writ's own shared-ownership check objects to the fixture — which is
+    # that check doing its job, and not what this test is about.
+    raised = [
+        record
+        for record in plans.finding_records(data)
+        if record["scope"] == "critic:coverage"
+    ]
+    assert len(raised) == 2, [r["id"] for r in raised]
+    for record in raised:
+        assert record["disposition"] in ("resolved", "accepted"), record
+    # Each round answered a different objection, which is what distinguishes this
+    # from a finding surviving its repair.
+    assert {record["where"] for record in raised} == {"REQ-003", "REQ-004"}
+
+
+def test_each_resumed_round_gets_its_own_step(objected, project, monkeypatch):
+    """Two rounds, two boxes. The second is appended when it opens.
+
+    How many rounds there will be is not knowable when the loop starts — it depends
+    on what each patch fixed — so the record has to grow as the loop does. A single
+    step reused by every round would show one repair where three happened.
+    """
+    monkeypatch.setenv("WRIT_TEST_READS", str(project / "reads"))
+    patched(monkeypatch, ADDS_THE_TASK)
+    plan_id = "design-20260101T000000"
+    with state.transaction(project) as data:
+        plans.plan_status(data)["pipeline"] = {"plan_id": plan_id}
+    phase_id = phases.begin(
+        project,
+        doc="design.md",
+        plan_id=plan_id,
+        steps=[phases.make_step(id="commit", kind="commit", name="commit", wave=0)],
+    )
+    phases.finish(project, phase_id, status="done")
+
+    code, out, _ = objected(
+        "adjudicate",
+        "--agent", agent(ADJUDICATOR),
+        "--critics", "coverage",
+        "--critic-agent", agent(CRITIC_MOVES_ON),
+        "--max-rounds", "4",
+    )
+    record = phases.current(state.load(project)) or {}
+    rounds = [e for e in record.get("steps", []) if e.get("kind") == "repair"]
+    assert len(rounds) >= 2, (
+        f"{len(rounds)} repair step(s) for a loop that ran more than one round; "
+        f"steps: {[e.get('id') for e in record.get('steps', [])]}\n{out}"
+    )
+    # Distinct ids, each pointing at its own transcript directory.
+    assert len({e["id"] for e in rounds}) == len(rounds), rounds
+    assert len({e.get("directory") for e in rounds}) == len(rounds), rounds
+    # And the re-reviews landed on the same phase.
+    assert [e for e in record.get("steps", []) if e.get("kind") == "critic"], record

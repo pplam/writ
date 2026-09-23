@@ -1,4 +1,4 @@
-/* built from ui/src (8fbc97cd0338) */
+/* built from ui/src (c4b5e6adf002) */
 /*
  * writ dashboard — compiled from ui/src by ui/build.mjs.
  * Do not edit: change the TypeScript and rebuild.

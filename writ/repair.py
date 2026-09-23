@@ -421,18 +421,31 @@ def plan_repeat_findings(data: dict[str, Any]) -> list[str]:
 
 
 def _repeat_findings(data: dict[str, Any], in_scope) -> list[str]:
-    counts: dict[str, int] = {}
+    """Blocking findings that survived a repair, by id.
+
+    Only `error` severity counts. An advisory is never what a patch was asked to
+    close — the loop repairs what blocks, and the critics re-report every note they
+    still believe on each re-read — so counting advisories here escalated on the
+    ordinary case: one repair lands, the critics re-read the patched plan, and
+    seventy notes they had already made cross the limit together. The plan was then
+    declared beyond repair over findings nothing had ever tried to fix, while the
+    blocking findings the re-check had just raised went unanswered.
+
+    Two ways in, because they are different evidence. `reopened_at` is a finding a
+    re-check raised again after a patch claimed to close it — one is enough, and it
+    is the signal this bound exists for. A high `seen_count` is the same story told
+    by a critic that never stopped reporting it.
+    """
+    repeated = []
     for payload in plans.finding_records(data):
         if not in_scope(str(payload.get("scope", ""))):
             continue
+        if str(payload.get("severity", "")) != "error":
+            continue
         seen = int(payload.get("seen_count", 1))
         if payload.get("reopened_at") or seen > REPEAT_FINDING_LIMIT:
-            counts[payload["id"]] = seen
-    return sorted(
-        finding_id
-        for finding_id, seen in counts.items()
-        if seen > REPEAT_FINDING_LIMIT
-    )
+            repeated.append(str(payload["id"]))
+    return sorted(repeated)
 
 
 # --------------------------------------------------------------------------
