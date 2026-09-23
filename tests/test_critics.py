@@ -303,11 +303,44 @@ def test_only_the_critic_that_runs_commands_says_so():
     assert any("run them" in check.lower() for check in feasibility.checks)
 
 
-def test_the_waves_read_together_and_run_alone():
+def test_only_the_baseline_critic_is_allowed_to_run_the_suite():
+    """What makes one wave safe, since the schedule no longer does.
+
+    Five agents in one working tree is fine while only one of them runs the tests.
+    The prompt is the only thing enforcing that, so it is worth a test.
+    """
+    from pathlib import Path
+
+    prompts = {
+        critic.name: critics.build_prompt(
+            critic,
+            root=Path("/repo"),
+            doc=None,
+            plan_text=json.dumps(PLAN),
+            report_path=Path("/repo/findings.json"),
+        )
+        for critic in critics.CRITICS
+    }
+    for critic in critics.CRITICS:
+        prompt = prompts[critic.name]
+        if critic.runs_commands:
+            assert "at the same time as you" in prompt
+        else:
+            assert "Do not run the project's build, test or lint suite" in prompt
+            # But not at the cost of its actual job: it still has to read the
+            # files that say whether a command is real.
+            assert "Read whatever you need" in prompt
+
+
+def test_the_critics_all_go_in_one_wave():
+    """Including the one that runs commands.
+
+    Holding it back bought nothing: the collision worth avoiding is two critics
+    running the suite at once, and only one of them is asked to run it at all.
+    """
     grouped = critics.waves(critics.CRITICS)
     assert [[critic.name for critic in wave] for wave in grouped] == [
-        ["coverage", "dependency", "scope", "acceptance"],
-        ["feasibility"],
+        ["coverage", "dependency", "scope", "acceptance", "feasibility"],
     ]
     # A partition: every critic runs exactly once, whatever the grouping.
     assert [critic for wave in grouped for critic in wave] == list(critics.CRITICS)

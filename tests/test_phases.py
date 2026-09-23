@@ -77,7 +77,12 @@ def test_waves_are_the_columns_the_pipeline_actually_runs():
     assert by_wave["stage:verification"] > by_wave["stage:requirements"]
 
 
-def test_critic_waves_keep_the_command_runner_alone():
+def test_the_critics_are_declared_as_one_column():
+    """Five boxes in one wave, the command-runner among them.
+
+    The phase graph is drawn from `critics.waves`, so a critic held back into its
+    own wave would be drawn as a second column of one. None is.
+    """
     from writ import critics
 
     declared = phases.declare(
@@ -87,9 +92,10 @@ def test_critic_waves_keep_the_command_runner_alone():
     for entry in declared:
         if entry["kind"] == "critic":
             waves.setdefault(entry["wave"], []).append(entry["name"])
-    runner = next(c.name for c in critics.CRITICS if c.runs_commands)
-    alone = [names for names in waves.values() if names == [runner]]
-    assert alone, f"{runner} should have a wave to itself: {waves}"
+    assert len(waves) == 1, f"the critics should share one wave: {waves}"
+    assert sorted(next(iter(waves.values()))) == sorted(
+        critic.name for critic in critics.CRITICS
+    )
 
 
 def test_nothing_is_declared_for_work_that_was_not_asked_for():

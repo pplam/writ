@@ -71,9 +71,11 @@ class Critic:
     #: report the same thing
     out_of_scope: str = ""
     #: whether this critic is asked to *run* things in the repository, rather than
-    #: only read it. The distinction decides what may run concurrently: two readers
-    #: of the same tree do not disturb each other, while a critic running the test
-    #: suite alongside anything else produces findings about the interference.
+    #: only read it. It no longer decides the schedule — everything runs at once
+    #: (see `waves`) — but it still decides what the prompt says: the one critic
+    #: measuring a build and test baseline is told the tree is shared, and the four
+    #: that are not are told to leave that suite alone so the baseline means
+    #: something.
     runs_commands: bool = False
 
     @property
@@ -310,6 +312,31 @@ def build_prompt(
     lines.extend(f"{n}. {check}" for n, check in enumerate(critic.checks, start=1))
     if critic.out_of_scope:
         lines.extend(["", critic.out_of_scope])
+    # The critics run concurrently in one working tree, so the suite is spoken for.
+    # Only one of them is measuring a baseline from it, and a second run alongside
+    # that one is how a green repository comes back looking broken.
+    if critic.runs_commands:
+        lines.extend(
+            [
+                "",
+                "Other critics are reading this repository at the same time as you. "
+                "They have been told not to run the build or the test suite, so the "
+                "baseline you measure is yours — but they are reading files while "
+                "you run, so treat a timing-dependent or load-dependent failure as "
+                "unproven rather than as a baseline failure.",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "",
+                "Do not run the project's build, test or lint suite. Another critic "
+                "is running it to establish the baseline, and a second run in the "
+                "same working tree corrupts that measurement. Read whatever you "
+                "need — including test files, build configuration and scripts, "
+                "which is how you check that a command or path is real.",
+            ]
+        )
     already = [finding for finding in found if finding.severity != "note"]
     if already:
         lines.extend(
@@ -412,21 +439,30 @@ def _shorten(text: str, limit: int = 200) -> str:
 
 
 def waves(chosen: Iterable[Critic]) -> list[list[Critic]]:
-    """The critics grouped into what may run at the same time.
+    """The critics grouped into what may run at the same time: all of them.
 
-    Two critics that only read the repository do not disturb each other, so they
-    go in one wave. A critic that runs the project's commands gets a wave to
-    itself: the feasibility critic is asked to run the build and the tests, and a
-    test suite sharing a working tree with anything else reports interference as
-    if it were a finding about the plan.
+    This used to hold the feasibility critic back into a wave of its own, because
+    it is asked to run the build and the tests and a suite sharing a working tree
+    with other agents reports the interference as if it were a finding about the
+    plan. Two things retired that:
 
-    Reading order is preserved inside a wave, and a command-running critic never
-    shares one, so the waves are a partition of `chosen` and nothing is dropped.
+    The collision being avoided needs two critics running commands, and there is
+    only one. The other four read files and write their own report; a reader
+    reading while a suite runs costs the suite some CPU, not its correctness.
+
+    And `writ run --parallel N` already puts N implementing agents in one working
+    tree, each told by its guardrails to run the project's full verification. The
+    critics were being held to a stricter rule than the agents doing the riskier
+    thing.
+
+    What is left of the risk is a suite that flakes under concurrent load, which
+    would hand the feasibility critic a baseline that is failing for reasons the
+    repository is not — so the other four are told not to run it (`build_prompt`),
+    and feasibility is told the tree is shared. Order is preserved, so this stays
+    a partition of `chosen` and nothing is dropped.
     """
-    readers = [critic for critic in chosen if not critic.runs_commands]
-    runners = [critic for critic in chosen if critic.runs_commands]
-    grouped = ([readers] if readers else []) + [[critic] for critic in runners]
-    return grouped
+    chosen = list(chosen)
+    return [chosen] if chosen else []
 
 
 def review(
@@ -455,12 +491,11 @@ def review(
     explicitly asked to — and agents doing that concurrently interfere with each
     other in ways that show up as findings about a broken build.
 
-    With `parallel`, the critics that only read run together and each critic that
-    runs commands runs alone (see `waves`). That is the whole of the concurrency:
-    the interference writ was avoiding came from the commands, not from the
-    reading, and separating the two buys most of the wall-clock back without
-    putting two test runs in one working tree. Streamed output is serialised a
-    line at a time so the prefix naming each critic keeps meaning something.
+    With `parallel`, all of them run at once (see `waves`). The interference writ
+    was avoiding needed two critics running the test suite, and only one is asked
+    to; the other four are told not to touch it, which is what makes one wave safe.
+    Streamed output is serialised a line at a time so the prefix naming each critic
+    keeps meaning something.
 
     A critic that fails does not fail the review. Four reports and a named failure
     is worth more than nothing, and the failure is visible rather than silently

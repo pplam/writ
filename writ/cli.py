@@ -277,9 +277,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=None,
         help=(
-            "run the critics that only read the repository at once, each critic "
-            "that runs its commands alone. Most of five agent runs' wall-clock, "
-            "without two test suites in one working tree"
+            "run all the critics at once rather than one after another: five agent "
+            "runs' wall-clock for one. Only one of them runs the test suite, and "
+            "the rest are told to leave it alone"
         ),
     )
     p.add_argument(
@@ -447,9 +447,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=None,
         help=(
-            "run the critics that only read the repository at once, each critic "
-            "that runs its commands alone. Most of five agent runs' wall-clock, "
-            "without two test suites in one working tree"
+            "run all the critics at once rather than one after another: five agent "
+            "runs' wall-clock for one. Only one of them runs the test suite, and "
+            "the rest are told to leave it alone"
         ),
     )
     p.add_argument(

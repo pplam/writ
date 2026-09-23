@@ -312,10 +312,10 @@ FIELDS: dict[str, Field] = {
     "plan.parallel_critics": Field(
         kind="flag",
         flag="--parallel-critics",
-        doc="run the critics that only read the repository at once (@flag@),"
-        " each critic that runs the project's commands alone. The interference"
-        " writ avoids by running them one at a time comes from the commands,"
-        " not the reading",
+        doc="run all five critics at once rather than one after another"
+        " (@flag@). They are independent, and only one of them runs the test"
+        " suite: the rest are told to leave it alone, which is what keeps one"
+        " working tree enough for all of them",
     ),
     "critique.parallel": Field(
         kind="flag",

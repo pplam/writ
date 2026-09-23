@@ -219,7 +219,7 @@ instead of paying for another run.
 | `--critic-agent CMD` | agent for the critics (default: the planning agent) |
 | `--critic-model NAME` | model for the critics |
 | `--parallel-stages` | run requirements beside inventory (see above) |
-| `--parallel-critics` | run the critics that only read the repo at once |
+| `--parallel-critics` | run all five critics at once |
 | `--append` | plan additional work alongside an existing plan |
 | `--force` | replace the existing plan |
 | `-- <args>` | everything after `--` is passed to the agent |
@@ -340,7 +340,7 @@ agents that did not write it, each with one question:
 ```bash
 writ critique                             # all five, over the committed plan
 writ critique --critics coverage,scope    # just those
-writ critique --parallel-critics          # four at once, feasibility alone
+writ critique --parallel-critics          # all five at once
 writ plan design.md --critics             # plan and critique in one pass
 ```
 
@@ -360,17 +360,17 @@ quietly reducing to whoever succeeded. Finding nothing is a legitimate result.
 A review is tied to the plan revision it read, so `writ check` can tell you the
 critics passed a plan that has since been repaired.
 
-Critics run one at a time by default, and `--parallel-critics` overlaps the ones
-that can. The reason they were serialised is not that they interfere as readers —
-two agents reading a repository do not disturb each other — but that one of them is
-asked to run the project's build and tests, and two test runs in one working tree
-report the interference as if it were a finding about the plan. So the critics that
-only read run together and each critic that runs commands runs alone, which today
-means four in one wave and `feasibility` in its own. Which critic that is comes from
-what each declares about itself, so a sixth critic that runs commands is placed
-correctly without changing the scheduler. Reports come back in the order the critics
-were asked for whatever order they finished in, so a review reads the same either
-way.
+Critics run one at a time by default, and `--parallel-critics` runs all five at
+once. They are independent by construction — each has its own brief, none reads
+another's findings, and nothing downstream cares which finished first — so the only
+reason to serialise them was the working tree: `feasibility` is asked to run the
+project's build and tests, and two test runs in one tree report the interference as
+if it were a finding about the plan. But that needs two critics running commands and
+there is only one; the other four are told not to touch the suite, which is what
+makes one wave safe. `feasibility` is told in turn that the tree is shared, so a
+load-dependent failure is reported as unproven rather than as a broken baseline.
+Reports come back in the order the critics were asked for whatever order they
+finished in, so a review reads the same either way.
 
 ### Gates, and repair
 
@@ -854,7 +854,7 @@ operates on.
 | `writ plan <doc> --stage NAME` | run the analyses up to that stage and stop, committing nothing |
 | `writ plan <doc> --plan-id ID [--refresh]` | resume a pipeline, reusing (or redoing) the artifacts it already wrote |
 | `writ plan <doc> --parallel-stages` | run requirements beside inventory; the inventory then claims no existing coverage |
-| `writ plan <doc> --critics --parallel-critics` | overlap the critics that only read the repository, feasibility alone |
+| `writ plan <doc> --critics --parallel-critics` | run all five critics at once instead of one after another |
 | `writ plan <doc> --no-stages` | the older single-shot planner: one agent, every judgement at once |
 | `writ plan <doc> --auto-approve` | approve, once everything that reads the plan has, when nothing blocking stands against it |
 | `writ plan <doc> --repair [--max-rounds N] [--adjudicator-agent CMD]` | answer the plan's blocking findings with the bounded repair loop, before approval |
