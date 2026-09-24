@@ -13,7 +13,9 @@ Layout under a project root:
                           never be taken from a holder that is merely slow
         decisions.md      human-readable, append-only mirror of the decision log
         runs/<run-id>/    prompt.txt, stdout.log, stderr.log, meta.json
-        plans/<plan-id>/  prompt.txt, plan.json, stdout.log, stderr.log
+        plans/<plan-id>/  one plan: analysis artifacts, draft.json, the committed
+                          index (plan.json) and features/, reviews/, rounds/;
+                          see planfiles.py
 """
 from __future__ import annotations
 

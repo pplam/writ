@@ -183,7 +183,7 @@ def test_an_uncovered_must_requirement_blocks_approval(inventoried, project, wri
     assert code == 1
     # A blocking finding goes to stderr, with the rest of its list.
     assert "REQ-003" in err
-    assert "no task covers it" in err
+    assert "nothing covers it" in err
 
 
 def test_a_plan_with_no_inventory_has_nothing_to_trace(approved, project):
@@ -200,9 +200,7 @@ def test_a_plan_with_no_inventory_has_nothing_to_trace(approved, project):
 
 def test_a_finding_keeps_its_id_across_re_checks(inventoried, project):
     with state.transaction(project) as data:
-        data["tasks"]["M01-001"]["acceptances"] = [
-            {"text": "it works", "status": "pending"}
-        ]
+        data["tasks"]["M01-001"]["requirement_ids"].append("REQ-099")
         first = plans.run_check(data, root=project)
         ids = {f.id for f in first if f.severity == "error"}
         assert ids
@@ -272,25 +270,19 @@ def test_a_persons_acceptance_stands_when_the_finding_comes_back(
 
 def test_a_finding_that_goes_away_is_resolved_not_deleted(inventoried, project):
     with state.transaction(project) as data:
-        data["tasks"]["M01-001"]["acceptances"] = [
-            {"text": "it works", "status": "pending"}
-        ]
+        data["tasks"]["M01-001"]["requirement_ids"].append("REQ-099")
         plans.run_check(data, root=project)
-        vague = [
+        unknown = [
             record["id"]
             for record in plans.finding_records(data)
-            if record["category"] == "vague-acceptance"
+            if record["category"] == "unknown-requirement"
         ]
-        assert vague
+        assert unknown
         # Fix the plan and check again.
-        data["tasks"]["M01-001"]["acceptances"] = [
-            {"text": "`go test ./store` passes with appends fsync'd", "status": "pending"},
-            {"text": "a failing test in store/log_test.go reproduces a torn append",
-             "status": "pending"},
-        ]
+        data["tasks"]["M01-001"]["requirement_ids"].remove("REQ-099")
         plans.run_check(data, root=project)
         records = {record["id"]: record for record in plans.finding_records(data)}
-    for finding_id in vague:
+    for finding_id in unknown:
         # Still readable, marked resolved: the objection was real and the history
         # of it is part of the plan's record.
         assert records[finding_id]["disposition"] == "resolved"
@@ -495,9 +487,7 @@ def test_force_leaves_the_findings_readable_rather_than_deleting_them(
     inventoried, project, writ
 ):
     with state.transaction(project) as data:
-        data["tasks"]["M01-001"]["acceptances"] = [
-            {"text": "it works", "status": "pending"}
-        ]
+        data["tasks"]["M01-001"]["requirement_ids"].append("REQ-099")
         plans.run_check(data, root=project)
     writ("approve", "--force", "--reason", "known gap, shipping anyway")
     records = plans.finding_records(state.load(project))
@@ -515,9 +505,7 @@ def test_force_leaves_the_findings_readable_rather_than_deleting_them(
 def test_check_exits_nonzero_only_when_something_blocks(inventoried, writ, project):
     assert writ("check")[0] == 0
     with state.transaction(project) as data:
-        data["tasks"]["M01-001"]["acceptances"] = [
-            {"text": "it works", "status": "pending"}
-        ]
+        data["tasks"]["M01-001"]["requirement_ids"].append("REQ-099")
     assert writ("check")[0] == 1
 
 
@@ -544,13 +532,11 @@ def test_list_requirements_names_what_covers_each_one(inventoried, writ):
 
 def test_list_findings_shows_the_ledger(inventoried, writ, project):
     with state.transaction(project) as data:
-        data["tasks"]["M01-001"]["acceptances"] = [
-            {"text": "it works", "status": "pending"}
-        ]
+        data["tasks"]["M01-001"]["requirement_ids"].append("REQ-099")
         plans.run_check(data, root=project)
     code, out, _ = writ("--json", "list", "findings")
     records = json.loads(out)
-    assert any(r["category"] == "vague-acceptance" for r in records)
+    assert any(r["category"] == "unknown-requirement" for r in records)
 
 
 def test_a_gate_is_not_held_to_a_requirement_the_plan_disowns(inventoried, project):

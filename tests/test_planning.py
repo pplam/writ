@@ -55,7 +55,7 @@ def agent_writing(payload, *, exit_code=0, to_stdout=False):
         "import re,sys;"
         "p=sys.stdin.read();"
         f"body={body!r};"
-        "m=re.search(r'^  (\\S+plan\\.json)$', p, re.M);"
+        "m=re.search(r'^  (\\S+draft\\.json)$', p, re.M);"
         + (
             "sys.stdout.write('here is the plan\\n```json\\n'+body+'\\n```\\n');"
             if to_stdout
@@ -150,7 +150,7 @@ def test_load_plan_accepts_criteria_as_objects():
         ("", "empty"),
         ("not json at all", "not valid JSON"),
         ('{"milestones": []}', "non-empty list"),
-        ('{"nope": 1}', "no `milestones` list"),
+        ('{"nope": 1}', "no `features` list"),
         ('{"milestones": [{"tasks": [{"title": "T"}]}]}', "title must be"),
         ('{"milestones": [{"title": "M", "tasks": []}]}', "tasks must be a non-empty"),
         ('{"milestones": [{"title": "M", "tasks": [{"title": "T"}]}]}', "acceptances is required"),
@@ -218,15 +218,16 @@ def test_prompt_states_the_target_path_and_schema(tmp_path):
     prompt = planning.build_prompt(
         root=tmp_path,
         doc=tmp_path / "design.md",
-        plan_path=tmp_path / ".writ/plans/p/plan.json",
+        plan_path=tmp_path / ".writ/plans/p/draft.json",
         instructions="focus on the storage layer first",
         context={"design_docs": [], "milestone_offset": 0, "tasks": []},
     )
     assert "You are not implementing it" in prompt
-    assert str(tmp_path / ".writ/plans/p/plan.json") in prompt
-    assert '"acceptances"' in prompt
+    # paths are stated relative to the root, which is stated once
+    assert f"Repository root: {tmp_path.resolve()}" in prompt
+    assert "\n  .writ/plans/p/draft.json\n" in prompt
+    assert '"acceptance"' in prompt and '"provides"' in prompt
     assert "focus on the storage layer first" in prompt
-    assert "One task is one bounded agent session" in prompt
 
 
 def test_prompt_lists_existing_tasks_when_appending(planned, writ, project, design):
@@ -236,7 +237,7 @@ def test_prompt_lists_existing_tasks_when_appending(planned, writ, project, desi
     )
     assert "This project already has a plan" in prompt
     assert "M01-001" in prompt
-    assert "Number new milestones from M04 onward" in prompt
+    assert "may consume an interface an existing feature provides" in prompt
 
 
 # --------------------------------------------------------------------------
@@ -272,7 +273,8 @@ def test_plan_keeps_the_agent_transcript_and_artifact(writ, project, design):
     record = state.load(project)["plans"][-1]
     artifact = Path(record["artifact"])
     assert json.loads(artifact.read_text())["milestones"][0]["id"] == "M01"
-    directory = artifact.parent
+    assert artifact.name == "draft.json"
+    directory = artifact.parent / "synthesis"
     assert "You are planning" in (directory / "prompt.txt").read_text()
     assert "wrote the plan" in (directory / "stdout.log").read_text()
     assert record["milestones"] == ["M01", "M02"]
@@ -291,7 +293,7 @@ def test_plan_dry_run_prints_the_prompt_and_runs_no_agent(writ, project, design)
     writ("init")
     code, out, _ = writ("plan", str(design), "--no-stages", "--dry-run")
     assert code == 0
-    assert "Schema:" in out and "plan.json" in out
+    assert "Schema:" in out and "draft.json" in out
     assert state.load(project)["tasks"] == {}
     assert not state.plans_dir(project).exists() or not list(
         state.plans_dir(project).iterdir()
@@ -500,8 +502,9 @@ def test_plan_from_artifact_reuses_a_previous_plan(writ, project, design, tmp_pa
     code, out, _ = writ("plan", str(design), "--from-plan", str(artifact))
     assert code == 0 and "created 2 milestones and 3 tasks" in out
     assert len(_work(state.load(project))) == 3
-    # no agent was run
-    assert not list(state.plans_dir(project).iterdir())
+    # no agent was run: the one plan directory holds the committed plan and nothing else
+    (directory,) = state.plans_dir(project).iterdir()
+    assert sorted(p.name for p in directory.iterdir()) == ["features", "plan.json"]
 
 
 def test_plan_from_missing_artifact_is_an_error(writ, design):
@@ -545,7 +548,7 @@ def test_extra_args_after_separator_reach_the_planning_agent(writ, project, desi
     writ("init")
     printer = f"{sys.executable} -c 'import sys; sys.stdin.read(); print(sys.argv[1:])'"
     writ("plan", str(design), "--no-stages", "--agent", printer, "--", "--model", "sonnet")
-    directory = next(state.plans_dir(project).iterdir())
+    directory = next(state.plans_dir(project).iterdir()) / "synthesis"
     assert "'--model', 'sonnet'" in (directory / "stdout.log").read_text()
 
 
@@ -572,7 +575,7 @@ def test_plan_model_flag_reaches_a_known_agent(writ, project, design, monkeypatc
     def fake_run_agent(command, prompt, directory, cwd, timeout, **kwargs):
         seen["command"] = command
         (directory / "stdout.log").write_text("", encoding="utf-8")
-        (directory / "plan.json").write_text(json.dumps(PLAN), encoding="utf-8")
+        (directory.parent / "draft.json").write_text(json.dumps(PLAN), encoding="utf-8")
         return 0
 
     from writ import planning as planning_module
@@ -610,7 +613,7 @@ def chatty_agent(lines, *, stderr_lines=(), exit_code=0):
         "import re;"
         f"[ (sys.stdout.write(l+chr(10)), sys.stdout.flush()) for l in {list(lines)!r} ];"
         f"[ (sys.stderr.write(l+chr(10)), sys.stderr.flush()) for l in {list(stderr_lines)!r} ];"
-        "m=re.search(r'^  (\\S+plan\\.json)$', p, re.M);"
+        "m=re.search(r'^  (\\S+draft\\.json)$', p, re.M);"
         f"open(m.group(1),'w').write({json.dumps(PLAN)!r});"
         f"sys.exit({exit_code})"
     )
@@ -645,7 +648,7 @@ def test_streaming_still_writes_the_full_transcript(writ, project, design):
     writ("init")
     agent = chatty_agent(["line one", "line two"], stderr_lines=["a warning"])
     writ("plan", str(design), "--no-stages", "--agent", agent)
-    directory = next(state.plans_dir(project).iterdir())
+    directory = next(state.plans_dir(project).iterdir()) / "synthesis"
     stdout = (directory / "stdout.log").read_text()
     assert "line one" in stdout and "line two" in stdout
     # the mirror prefix is a display concern, never written to the transcript
@@ -660,7 +663,7 @@ def test_quiet_suppresses_the_mirror_but_keeps_the_transcript(writ, project, des
     assert code == 0
     # the mirror prefix is the marker; the word itself appears in the echoed argv
     assert "| chatter" not in out
-    directory = next(state.plans_dir(project).iterdir())
+    directory = next(state.plans_dir(project).iterdir()) / "synthesis"
     assert "chatter" in (directory / "stdout.log").read_text()
 
 

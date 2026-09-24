@@ -18,7 +18,7 @@ import sys
 
 import pytest
 
-from writ import gates, orchestrator, plans, repair, state
+from writ import gates, orchestrator, plancheck, plans, repair, state
 from writ.state import WritError
 
 
@@ -241,12 +241,29 @@ def test_a_gate_is_a_task_so_the_graph_walks_it(approved, project):
 # approval
 
 
+def _block(project):
+    """A blocking critic finding, the kind a plan cannot run past."""
+    with state.transaction(project) as data:
+        plans.record_findings(
+            data,
+            [
+                plancheck.Finding(
+                    severity="error",
+                    category="uncovered-requirement",
+                    message="nothing builds the operator view",
+                    where="M01-001",
+                    source="critic:fidelity",
+                )
+            ],
+            scope="critic:fidelity",
+        )
+        plans.run_check(data, root=project)
+
+
 def test_a_plan_with_a_blocking_finding_will_not_run(writ, project, design):
     writ("init")
     writ("plan", str(design), "--extract", "--auto-approve")
-    with state.transaction(project) as data:
-        data["tasks"]["M01-001"]["acceptances"] = [{"text": "it works", "status": "pending"}]
-        plans.run_check(data, root=project)
+    _block(project)
     data = state.load(project)
     assert plans.plan_status(data)["status"] == "needs-approval"
     code, _, err = writ("run", "--agent", agent(IMPLEMENTER))
@@ -257,9 +274,7 @@ def test_a_plan_with_a_blocking_finding_will_not_run(writ, project, design):
 def test_forced_approval_needs_a_reason_and_records_it(writ, project, design):
     writ("init")
     writ("plan", str(design), "--extract", "--auto-approve")
-    with state.transaction(project) as data:
-        data["tasks"]["M01-001"]["acceptances"] = [{"text": "it works", "status": "pending"}]
-        plans.run_check(data, root=project)
+    _block(project)
     assert writ("approve", "--force")[0] == 2
     code, out, _ = writ("approve", "--force", "--reason", "shipping the spike")
     assert code == 0

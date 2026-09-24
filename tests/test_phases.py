@@ -45,7 +45,7 @@ def test_a_declared_step_is_pending_before_anything_runs():
     assert every_key_present(declared)
     assert {entry["status"] for entry in declared} == {"pending"}
     ids = [entry["id"] for entry in declared]
-    assert ids[:3] == ["stage:requirements", "stage:inventory", "stage:verification"]
+    assert ids[:2] == ["stage:requirements", "stage:inventory"]
     assert "synthesis" in ids and "commit" in ids
     assert "repair" in ids and "approval" in ids
     assert sum(1 for entry in declared if entry["kind"] == "critic") == len(
@@ -69,16 +69,15 @@ def test_waves_are_the_columns_the_pipeline_actually_runs():
     from writ import analysis
 
     serial = phases.declare(stages=list(analysis.STAGES))
-    assert [e["wave"] for e in serial if e["kind"] == "stage"] == [0, 1, 2]
+    assert [e["wave"] for e in serial if e["kind"] == "stage"] == [0, 1]
 
     together = phases.declare(stages=list(analysis.STAGES), parallel_stages=True)
     by_wave = {e["id"]: e["wave"] for e in together if e["kind"] == "stage"}
     assert by_wave["stage:requirements"] == by_wave["stage:inventory"]
-    assert by_wave["stage:verification"] > by_wave["stage:requirements"]
 
 
 def test_the_critics_are_declared_as_one_column():
-    """Five boxes in one wave, the command-runner among them.
+    """Both boxes in one wave, the command-runner among them.
 
     The phase graph is drawn from `critics.waves`, so a critic held back into its
     own wave would be drawn as a second column of one. None is.
@@ -117,7 +116,7 @@ def test_a_plan_records_every_step_it_ran(writ, design, project):
     assert found["plan_id"]
     marks = steps(project)
     assert [marks[f"stage:{name}"]["status"] for name in
-            ("requirements", "inventory", "verification")] == ["ok", "ok", "ok"]
+            ("requirements", "inventory")] == ["ok", "ok"]
     assert marks["synthesis"]["status"] == "ok"
     assert marks["commit"]["status"] == "ok"
 
@@ -218,7 +217,6 @@ _out.write_text(_json.dumps(_prev + [{{'phase': _phase['status'], 'live': _live}
     assert [entry["live"] for entry in observed] == [
         ["stage:requirements"],
         ["stage:inventory"],
-        ["stage:verification"],
         ["synthesis"],
     ]
 
@@ -416,7 +414,7 @@ def test_an_edge_joins_a_step_to_what_it_waited_for(writ, design, project):
     payload = api.phase(state.load(project))
     pairs = {(edge["from"], edge["to"]) for edge in payload["edges"]}
     assert ("stage:requirements", "stage:inventory") in pairs
-    assert ("stage:verification", "synthesis") in pairs
+    assert ("stage:inventory", "synthesis") in pairs
     assert all(edge["satisfied"] for edge in payload["edges"])
 
 
@@ -506,27 +504,27 @@ def test_a_repair_round_and_its_re_review_are_appended_as_they_happen(
 
     writ("init")
     monkeypatch.setenv("WRIT_TEST_ONCE", str(tmp_path / "reported"))
-    monkeypatch.setenv("WRIT_TEST_PATCH", json.dumps(ADDS_THE_TASK))
+    monkeypatch.setenv("WRIT_TEST_EDIT", json.dumps(ADDS_THE_TASK))
     code, out, err = writ(
         "plan", str(design), *staged(),
-        "--critics", "coverage", "--critic-agent", sub_agent(CRITIC_ONCE),
+        "--critics", "fidelity", "--critic-agent", sub_agent(CRITIC_ONCE),
         "--repair", "--adjudicator-agent", sub_agent(ADJUDICATOR),
     )
     assert code == 0, err
     assert "repairing the plan" in out
     marks = steps(project)
     # The declared critic step is the first pass, and it stands.
-    assert marks["critic:coverage"]["status"] == "ok"
+    assert marks["critic:fidelity"]["status"] == "ok"
     # Round 1 is the declared repair step, which actually ran.
     assert marks["repair"]["status"] == "ok"
     assert marks["repair"]["note"]
     # The re-review is a step of its own, at the patched plan's revision.
     rereads = [
         entry for entry in marks.values()
-        if entry["kind"] == "critic" and entry["id"] != "critic:coverage"
+        if entry["kind"] == "critic" and entry["id"] != "critic:fidelity"
     ]
     assert rereads, sorted(marks)
-    assert rereads[0]["id"].startswith("critic:coverage@r")
+    assert rereads[0]["id"].startswith("critic:fidelity@r")
     assert rereads[0]["status"] == "ok"
     # And it is placed after the repair that caused it, not at the end.
     assert rereads[0]["wave"] > marks["repair"]["wave"]

@@ -90,72 +90,12 @@ def test_tally_counts_by_severity():
 # acceptance criteria
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        "it works",
-        "the code is clean",
-        "the feature is fully implemented",
-        "all requirements met",
-        "the complete product works",
-    ],
-)
-def test_a_vague_criterion_is_an_error(text):
-    findings = plancheck.check(snapshot(task("M01-001", acceptances=[text, "it exits 2"])))
-    assert find(findings, "vague-acceptance").blocking
-
-
-def test_the_report_s_first_example_plan_is_rejected():
-    """`{"title": "Implement the entire feature", "acceptances": ["it works"]}`."""
-    findings = plancheck.check(
-        snapshot(task("M01-001", title="Implement the entire feature", acceptances=["it works"]))
-    )
-    assert "task-too-broad" in categories(findings)
-    assert "vague-acceptance" in categories(findings)
-    assert plancheck.blocking(findings)
-
-
-def test_the_report_s_second_example_plan_is_rejected():
-    """A fenced task whose bar is the whole product."""
-    findings = plancheck.check(
-        snapshot(
-            task(
-                "M01-001",
-                title="Update backend",
-                allowed=["backend/"],
-                acceptances=["the complete product works"],
-            )
-        )
-    )
-    assert plancheck.blocking(findings)
-
-
-def test_a_suite_wide_bar_on_a_fenced_task_is_unmeetable():
-    findings = plancheck.check(
-        snapshot(
-            task(
-                "M01-001",
-                allowed=["parser/"],
-                acceptances=["the whole suite passes", "`pytest -q parser/` passes"],
-            )
-        )
-    )
-    assert find(findings, "unmeetable-acceptance").blocking
-
-
-def test_a_suite_wide_bar_on_an_unfenced_task_is_allowed():
-    findings = plancheck.check(
-        snapshot(task("M01-001", acceptances=["all tests pass", "`pytest -q` exits 0"]))
-    )
-    assert "unmeetable-acceptance" not in categories(findings)
-
-
 def test_duplicate_criteria_are_an_error():
     findings = plancheck.check(
         snapshot(
             task(
                 "M01-001",
-                acceptances=["`pytest -q` passes", "pytest -q passes."],
+                acceptances=["`pytest -q` passes", "`PYTEST -q`   passes"],
             )
         )
     )
@@ -174,199 +114,6 @@ def test_too_many_criteria_reads_as_two_tasks():
         snapshot(task("M01-001", acceptances=[f"it returns {n}" for n in range(8)]))
     )
     assert find(findings, "wide-acceptance").severity == "warning"
-
-
-def test_a_criterion_with_no_observable_is_a_warning():
-    findings = plancheck.check(
-        snapshot(
-            task(
-                "M01-001",
-                acceptances=["the design has been considered", "the module exists"],
-            )
-        )
-    )
-    assert find(findings, "unobservable-acceptance").severity == "warning"
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "`pytest -q tests/test_parser.py` passes",
-        "pytest -q tests/test_parser.py exits 0",
-        "malformed input is rejected with a stable error",
-        "writ status prints the milestone rollup",
-        "tests/test_state.py covers the replay path",
-    ],
-)
-def test_an_observable_criterion_passes(text):
-    findings = plancheck.check(
-        snapshot(task("M01-001", acceptances=[text, "it exits non-zero on a bad flag"]))
-    )
-    assert "unobservable-acceptance" not in categories(findings)
-
-
-# --------------------------------------------------------------------------
-# titles
-
-
-def test_a_whole_project_title_is_an_error():
-    findings = plancheck.check(snapshot(task("M01-001", title="Implement the design")))
-    assert find(findings, "task-too-broad").blocking
-
-
-def test_two_tasks_with_one_title_are_flagged():
-    findings = plancheck.check(
-        snapshot(task("M01-001", title="Add the parser"), task("M01-002", title="Add the parser"))
-    )
-    assert find(findings, "duplicate-task").where == "M01-002"
-
-
-# --------------------------------------------------------------------------
-# path fences
-
-
-def test_a_repo_root_fence_is_not_a_fence():
-    findings = plancheck.check(snapshot(task("M01-001", allowed=["."])))
-    assert find(findings, "broad-fence").blocking
-
-
-def test_a_path_forbidden_and_allowed_at_once_is_an_error():
-    findings = plancheck.check(
-        snapshot(task("M01-001", allowed=["writ/state.py"], forbidden=["writ/state.py"]))
-    )
-    assert find(findings, "contradictory-fence").blocking
-
-
-def test_a_forbidden_parent_of_an_allowed_path_is_an_error():
-    findings = plancheck.check(
-        snapshot(task("M01-001", allowed=["writ/state.py"], forbidden=["writ/"]))
-    )
-    assert find(findings, "contradictory-fence").blocking
-
-
-def test_a_carve_out_inside_an_allowed_directory_is_fine():
-    findings = plancheck.check(
-        snapshot(task("M01-001", allowed=["writ/"], forbidden=["writ/state.py"]))
-    )
-    assert "contradictory-fence" not in categories(findings)
-
-
-def test_two_unordered_tasks_owning_one_file_is_an_error():
-    findings = plancheck.check(
-        snapshot(
-            task("M01-001", allowed=["writ/state.py"]),
-            task("M01-002", allowed=["writ/state.py"]),
-        )
-    )
-    finding = find(findings, "shared-ownership")
-    assert finding.blocking
-    assert "M01-002" in finding.suggested_action
-
-
-def test_ordered_tasks_may_share_a_file():
-    findings = plancheck.check(
-        snapshot(
-            task("M01-001", allowed=["writ/state.py"]),
-            task("M01-002", allowed=["writ/state.py"], depends_on=["M01-001"]),
-        )
-    )
-    assert "shared-ownership" not in categories(findings)
-
-
-def test_transitively_ordered_tasks_may_share_a_file():
-    findings = plancheck.check(
-        snapshot(
-            task("M01-001", allowed=["writ/state.py"]),
-            task("M01-002", depends_on=["M01-001"]),
-            task("M01-003", allowed=["writ/state.py"], depends_on=["M01-002"]),
-        )
-    )
-    assert "shared-ownership" not in categories(findings)
-
-
-def test_a_shared_directory_is_a_warning_not_an_error():
-    findings = plancheck.check(
-        snapshot(
-            task("M01-001", allowed=["writ/"]),
-            task("M01-002", allowed=["writ/"]),
-        )
-    )
-    assert find(findings, "shared-ownership").severity == "warning"
-
-
-def test_a_nested_shared_path_is_found():
-    findings = plancheck.check(
-        snapshot(
-            task("M01-001", allowed=["writ/"]),
-            task("M01-002", allowed=["writ/state.py"]),
-        )
-    )
-    assert find(findings, "shared-ownership")
-
-
-def test_a_missing_path_is_only_a_note(tmp_path: Path):
-    (tmp_path / "writ").mkdir()
-    findings = plancheck.check(
-        snapshot(
-            task("M01-001", allowed=["writ/", "nowhere/at/all.py"]),
-            root=tmp_path,
-        )
-    )
-    finding = find(findings, "unknown-path")
-    assert finding.severity == "note"
-    assert "nowhere/at/all.py" in finding.message
-
-
-def test_a_greenfield_plan_gets_no_path_notes(tmp_path: Path):
-    """The noise that buried everything else.
-
-    A plan that builds a project from nothing fences every task to files that do
-    not exist yet. One note per path made 104 findings on a real plan and told the
-    reader nothing, because "does not exist" was true of the whole plan.
-    """
-    findings = plancheck.check(
-        snapshot(
-            task("M01-001", allowed=["mmm/__init__.py", "mmm/schema.sql"]),
-            task("M01-002", allowed=["tests/conftest.py", "pyproject.toml"]),
-            root=tmp_path,
-        )
-    )
-    assert "unknown-path" not in categories(findings)
-    assert "suspect-path" not in categories(findings)
-
-
-def test_a_path_beside_real_siblings_is_a_suspect_path(tmp_path: Path):
-    """A missing file in a directory that exists is the case worth a warning."""
-    (tmp_path / "writ").mkdir()
-    (tmp_path / "writ" / "state.py").write_text("x", encoding="utf-8")
-    findings = plancheck.check(
-        snapshot(task("M01-001", allowed=["writ/stat.py"]), root=tmp_path)
-    )
-    finding = find(findings, "suspect-path")
-    assert finding.severity == "warning"
-    assert "writ/stat.py" in finding.message
-
-
-def test_missing_paths_are_reported_once_per_task(tmp_path: Path):
-    """One finding per task, not per path, so a wide fence cannot flood the ledger."""
-    (tmp_path / "writ").mkdir()
-    findings = plancheck.check(
-        snapshot(
-            task(
-                "M01-001",
-                allowed=[f"gone/file{n}.py" for n in range(8)],
-            ),
-            root=tmp_path,
-        )
-    )
-    notes = [f for f in findings if f.category == "unknown-path"]
-    assert len(notes) == 1
-    assert "8 paths" in notes[0].message
-
-
-def test_paths_are_not_checked_without_a_root():
-    findings = plancheck.check(snapshot(task("M01-001", allowed=["nowhere/"])))
-    assert "unknown-path" not in categories(findings)
 
 
 # --------------------------------------------------------------------------
@@ -515,48 +262,69 @@ def test_an_unknown_priority_is_flagged():
 
 
 # --------------------------------------------------------------------------
-# integration
+# features and contracts
 
 
-def test_branches_that_nothing_joins_are_flagged():
+def feature(feature_id: str, **kwargs) -> Item:
+    kwargs.setdefault("title", f"Feature {feature_id}")
+    kwargs.setdefault("acceptances", ["it stores", "it replays", "it rejects a torn write"])
+    kwargs.setdefault("owns", [f"pkg/{feature_id.lower()}/"])
+    return Item(id=feature_id, feature=True, **kwargs)
+
+
+def test_a_consumed_interface_nobody_provides_is_a_contract_gap():
     findings = plancheck.check(
-        snapshot(task("M01-001"), task("M01-002"), task("M01-003"))
+        snapshot(feature("FT-001", provides=["Log: append"]), feature("FT-002", consumes=["Clock"]))
     )
-    finding = find(findings, "missing-integration")
-    assert "M01-001" in finding.message
+    gap = find(findings, "contract-gap")
+    assert gap.blocking and gap.where == "FT-002" and "clock" in gap.message
 
 
-def test_a_graph_that_converges_needs_no_warning():
+def test_an_interface_provided_twice_is_a_contract_gap():
+    findings = plancheck.check(
+        snapshot(feature("FT-001", provides=["Log"]), feature("FT-002", provides=["log: again"]))
+    )
+    assert find(findings, "contract-gap").where == "FT-002"
+
+
+def test_closed_contracts_raise_nothing():
     findings = plancheck.check(
         snapshot(
-            task("M01-001"),
-            task("M01-002"),
-            task("M01-003", depends_on=["M01-001", "M01-002"]),
+            feature("FT-001", provides=["Log: append"]),
+            feature("FT-002", consumes=["LOG"], depends_on=["FT-001"]),
         )
     )
-    assert "missing-integration" not in categories(findings)
+    assert "contract-gap" not in categories(findings)
 
 
-def test_a_gate_counts_as_the_integration():
+def test_a_feature_with_too_few_behaviours_is_thin():
+    findings = plancheck.check(snapshot(feature("FT-001", acceptances=["a", "b"])))
+    assert find(findings, "thin-acceptance").severity == "warning"
+
+
+def test_a_feature_carrying_too_much_is_oversized():
     findings = plancheck.check(
-        snapshot(
-            task("M01-001"),
-            task("M01-002"),
-            Item(
-                id="G-M01",
-                title="M01 integrates",
-                kind="gate",
-                acceptances=["`pytest -q` passes"],
-                depends_on=["M01-001", "M01-002"],
-            ),
-        )
+        snapshot(feature("FT-001", requirement_ids=[f"REQ-00{n}" for n in range(1, 8)]))
     )
-    assert "missing-integration" not in categories(findings)
+    assert find(findings, "oversized-feature").severity == "warning"
 
 
-def test_a_single_task_plan_needs_no_integration():
-    findings = plancheck.check(snapshot(task("M01-001")))
-    assert "missing-integration" not in categories(findings)
+def test_a_feature_that_owns_nothing_is_flagged():
+    findings = plancheck.check(snapshot(feature("FT-001", owns=[])))
+    assert find(findings, "unowned-feature").where == "FT-001"
+
+
+def test_too_few_features_is_advisory():
+    findings = plancheck.check(snapshot(feature("FT-001"), feature("FT-002")))
+    assert find(findings, "feature-count").severity == "warning"
+
+
+def test_file_paths_are_not_judged_before_the_code_exists(tmp_path: Path):
+    (tmp_path / "pkg").mkdir()
+    findings = plancheck.check(
+        snapshot(task("M01-001", allowed=["pkg/nothing_yet.py"]), root=tmp_path)
+    )
+    assert not {"unknown-path", "suspect-path"} & set(categories(findings))
 
 
 # --------------------------------------------------------------------------

@@ -53,7 +53,7 @@ print("I have decided not to write a report")
 
 BLOCKING_FINDING = {
     "severity": "blocking",
-    "category": "missing-coverage",
+    "category": "uncovered-requirement",
     "where": "REQ-003",
     "message": "No task implements the queue depth view",
     "suggested_action": "add a task, or mark it out of scope with a reason",
@@ -82,67 +82,108 @@ def planned_with_requirements(writ, project, design, tmp_path):
 def test_each_critic_gets_one_question():
     briefs = [critic.brief for critic in critics.CRITICS]
     assert len(set(briefs)) == len(briefs)
-    # Every critic states what it is not looking at, so five reviews are five
-    # reviews rather than five copies of the same one.
+    # Every critic states what it is not looking at, so two reviews are two
+    # reviews rather than two copies of the same one.
     assert all(critic.out_of_scope for critic in critics.CRITICS)
     assert all(critic.checks for critic in critics.CRITICS)
 
 
 def test_an_unknown_critic_is_named_against_the_ones_that_exist():
-    with pytest.raises(WritError, match="coverage"):
+    with pytest.raises(WritError, match="fidelity"):
         critics.by_name(["vibes"])
     # And a bad name among good ones fails rather than quietly running the rest.
     with pytest.raises(WritError, match="'vibes'"):
-        critics.by_name(["coverage,vibes"])
+        critics.by_name(["fidelity,vibes"])
 
 
 def test_critics_can_be_named_with_commas_or_spaces():
-    assert [c.name for c in critics.by_name(["coverage,scope"])] == [
-        "coverage",
-        "scope",
+    assert [c.name for c in critics.by_name(["fidelity,feasibility"])] == [
+        "fidelity",
+        "feasibility",
     ]
     # Declaration order, not argument order, so two runs of a set read alike.
-    assert [c.name for c in critics.by_name(["scope", "coverage"])] == [
-        "coverage",
-        "scope",
+    assert [c.name for c in critics.by_name(["feasibility", "fidelity"])] == [
+        "fidelity",
+        "feasibility",
     ]
-    assert [c.name for c in critics.by_name([" coverage , coverage "])] == ["coverage"]
+    assert [c.name for c in critics.by_name([" fidelity , fidelity "])] == ["fidelity"]
 
 
-def test_the_prompt_carries_the_plan_and_forbids_rewriting(tmp_path):
+def test_the_names_of_the_five_old_critics_still_resolve():
+    """A config written when there were five critics names who asks that now."""
+    assert [c.name for c in critics.by_name(["coverage,scope"])] == ["fidelity"]
+    assert [c.name for c in critics.by_name(["acceptance", "feasibility"])] == [
+        "fidelity",
+        "feasibility",
+    ]
+
+
+def _files(root, *, inventory=False):
+    folder = root / ".writ/plans/p"
+    return critics.PlanFiles(
+        index=folder / "plan.json",
+        features=folder / "features",
+        inventory=folder / "inventory.json" if inventory else None,
+    )
+
+
+def test_the_prompt_points_at_the_plan_and_forbids_rewriting(tmp_path):
     prompt = critics.build_prompt(
         critics.CRITICS[0],
         root=tmp_path,
         doc=tmp_path / "design.md",
-        plan_text='{"tasks": []}',
-        report_path=tmp_path / "findings.json",
+        plan=_files(tmp_path),
+        report_path=tmp_path / ".writ/plans/p/reviews/r1/fidelity/findings.json",
     )
     assert "you are not fixing it" in prompt
     assert "Do not rewrite the plan" in prompt
-    assert '{"tasks": []}' in prompt
+    # the plan is referenced by repo-relative path, not pasted
+    assert "  - .writ/plans/p/plan.json — the plan's index" in prompt
+    assert "  - .writ/plans/p/features — one file per feature" in prompt
+    assert "\n  .writ/plans/p/reviews/r1/fidelity/findings.json\n" in prompt
+    # and a path the plan proposes is not a defect for not existing yet
+    assert "Files that don't exist yet are expected" in prompt
+    # the categories a blocker may use, and the cap, travel with the prompt
+    assert "uncovered-requirement" in prompt and "needs-decision" in prompt
+    assert f"At most {critics.MAX_BLOCKING} blocking" in prompt
     # It is told its own brief and told what to leave alone.
     assert critics.CRITICS[0].brief in prompt
     assert critics.CRITICS[0].out_of_scope in prompt
 
 
-def test_the_prompt_shows_what_writ_already_found(tmp_path):
-    prompt = critics.build_prompt(
-        critics.CRITICS[0],
-        root=tmp_path,
-        doc=None,
-        plan_text="{}",
-        report_path=tmp_path / "findings.json",
-        found=[
+def test_the_prompt_points_at_what_writ_already_found(tmp_path):
+    known = critics.write_known(
+        tmp_path / "known-findings.json",
+        [
             plancheck.Finding(
                 severity="error",
                 category="vague-acceptance",
                 message="criterion 1 is not checkable",
                 where="M01-001",
-            )
+            ),
+            plancheck.Finding(
+                severity="note", category="info", message="just saying", where="plan"
+            ),
         ],
     )
+    prompt = critics.build_prompt(
+        critics.CRITICS[0],
+        root=tmp_path,
+        doc=None,
+        plan=_files(tmp_path),
+        report_path=tmp_path / "findings.json",
+        known_findings=known,
+    )
+    assert "known-findings.json — what writ's own" in prompt
     assert "do not re-report them" in prompt
-    assert "criterion 1 is not checkable" in prompt
+    # pre-filtered: the file holds only what a critic should read
+    written = json.loads(known.read_text())
+    assert [entry["message"] for entry in written] == ["criterion 1 is not checkable"]
+
+
+def test_nothing_known_writes_no_file(tmp_path):
+    assert critics.write_known(tmp_path / "k.json", []) is None
+    assert not (tmp_path / "k.json").exists()
 
 
 # --------------------------------------------------------------------------
@@ -161,8 +202,29 @@ def test_a_report_becomes_ledger_findings():
     assert finding.severity == "error"
     assert finding.where == "REQ-003"
     assert finding.requirement_ids == ["REQ-003"]
-    assert finding.source == "critic:coverage"
+    assert finding.source == "critic:fidelity"
     assert "searched the plan" in finding.message
+
+
+def test_a_blocker_outside_the_closed_categories_is_only_advisory():
+    report = critics.parse(
+        json.dumps({"findings": [{**BLOCKING_FINDING, "category": "file-naming"}]}),
+        critics.CRITICS[0],
+    )
+    assert report.blocking == 0
+    assert report.findings[0].severity == "warning"
+
+
+def test_a_report_is_cut_to_its_caps():
+    many = [
+        {**BLOCKING_FINDING, "message": f"hole {n}"} for n in range(8)
+    ] + [
+        {**BLOCKING_FINDING, "severity": "advisory", "message": f"nit {n}"}
+        for n in range(8)
+    ]
+    report = critics.parse(json.dumps({"findings": many}), critics.CRITICS[0])
+    assert report.blocking == critics.MAX_BLOCKING
+    assert len(report.findings) == critics.MAX_BLOCKING + critics.MAX_ADVISORY
 
 
 def test_an_advisory_finding_does_not_block():
@@ -175,7 +237,7 @@ def test_an_advisory_finding_does_not_block():
 
 
 def test_a_finding_that_names_nowhere_is_refused():
-    with pytest.raises(WritError, match="names no task"):
+    with pytest.raises(WritError, match="names no feature"):
         critics.parse(
             json.dumps({"findings": [{**BLOCKING_FINDING, "where": ""}]}),
             critics.CRITICS[0],
@@ -236,7 +298,7 @@ def test_critique_records_findings_in_the_same_ledger(
         if str(record.get("source", "")).startswith("critic:")
     ]
     assert len(records) == 1
-    assert records[0]["source"] == "critic:coverage"
+    assert records[0]["source"] == "critic:fidelity"
     assert records[0]["disposition"] == "open"
 
 
@@ -280,9 +342,9 @@ def test_one_critic_failing_does_not_lose_the_others(
 
 
 def test_only_the_named_critics_run(planned_with_requirements, project, writ):
-    writ("critique", "--agent", agent(SILENT), "--quiet", "--critics", "coverage")
+    writ("critique", "--agent", agent(SILENT), "--quiet", "--critics", "feasibility")
     names = [record["critic"] for record in critics.reviews(state.load(project))]
-    assert names == ["coverage"]
+    assert names == ["feasibility"]
 
 
 # --------------------------------------------------------------------------
@@ -300,13 +362,13 @@ def test_only_the_critic_that_runs_commands_says_so():
     assert runs == ["feasibility"]
     # And it is the one whose brief actually tells it to run them.
     feasibility = critics.by_name(["feasibility"])[0]
-    assert any("run them" in check.lower() for check in feasibility.checks)
+    assert any("test command works" in check.lower() for check in feasibility.checks)
 
 
 def test_only_the_baseline_critic_is_allowed_to_run_the_suite():
     """What makes one wave safe, since the schedule no longer does.
 
-    Five agents in one working tree is fine while only one of them runs the tests.
+    Two agents in one working tree is fine while only one of them runs the tests.
     The prompt is the only thing enforcing that, so it is worth a test.
     """
     from pathlib import Path
@@ -316,7 +378,7 @@ def test_only_the_baseline_critic_is_allowed_to_run_the_suite():
             critic,
             root=Path("/repo"),
             doc=None,
-            plan_text=json.dumps(PLAN),
+            plan=_files(Path("/repo")),
             report_path=Path("/repo/findings.json"),
         )
         for critic in critics.CRITICS
@@ -327,9 +389,6 @@ def test_only_the_baseline_critic_is_allowed_to_run_the_suite():
             assert "at the same time as you" in prompt
         else:
             assert "Do not run the project's build, test or lint suite" in prompt
-            # But not at the cost of its actual job: it still has to read the
-            # files that say whether a command is real.
-            assert "Read whatever you need" in prompt
 
 
 def test_the_critics_all_go_in_one_wave():
@@ -340,7 +399,7 @@ def test_the_critics_all_go_in_one_wave():
     """
     grouped = critics.waves(critics.CRITICS)
     assert [[critic.name for critic in wave] for wave in grouped] == [
-        ["coverage", "dependency", "scope", "acceptance", "feasibility"],
+        ["fidelity", "feasibility"],
     ]
     # A partition: every critic runs exactly once, whatever the grouping.
     assert [critic for wave in grouped for critic in wave] == list(critics.CRITICS)
@@ -364,7 +423,7 @@ def test_parallel_critics_all_report(planned_with_requirements, project, writ):
 def test_a_parallel_critic_report_names_whose_it_is(
     planned_with_requirements, project, writ
 ):
-    """Four headers print before any of them report, so a bare count has no owner.
+    """Both headers print before either reports, so a bare count has no owner.
 
     Run one at a time, the counts follow the header that named the critic. Run at
     once they do not, and an unattributed `0 blocking, 0 advisory` is unreadable.
@@ -372,9 +431,9 @@ def test_a_parallel_critic_report_names_whose_it_is(
     _, parallel, _ = writ(
         "critique", "--agent", agent(SILENT), "--quiet", "--parallel-critics"
     )
-    assert "coverage: 0 blocking" in parallel
+    assert "fidelity: 0 blocking" in parallel
     _, sequential, _ = writ("critique", "--agent", agent(SILENT), "--quiet")
-    assert "coverage: 0 blocking" not in sequential
+    assert "fidelity: 0 blocking" not in sequential
     assert "0 blocking" in sequential
 
 
@@ -420,7 +479,7 @@ def test_parallel_critics_findings_reach_the_same_ledger(
         for record in plans.finding_records(state.load(project))
         if str(record.get("source", "")).startswith("critic:")
     ]
-    assert [record["source"] for record in records] == ["critic:coverage"]
+    assert [record["source"] for record in records] == ["critic:fidelity"]
     assert not plans.runnable(state.load(project))
 
 
@@ -472,10 +531,10 @@ def test_plan_can_run_the_critics_in_one_pass(writ, project, design, tmp_path):
     writ("init")
     code, out, _ = writ(
         "plan", str(design), "--from-plan", str(artifact),
-        "--critics", "coverage", "--critic-agent", agent(SILENT), "--quiet",
+        "--critics", "fidelity", "--critic-agent", agent(SILENT), "--quiet",
     )
     assert code == 0
-    assert [r["critic"] for r in critics.reviews(state.load(project))] == ["coverage"]
+    assert [r["critic"] for r in critics.reviews(state.load(project))] == ["fidelity"]
 
 
 def test_auto_approve_waits_for_the_critics(writ, project, design, tmp_path, monkeypatch):
@@ -492,12 +551,12 @@ def test_auto_approve_waits_for_the_critics(writ, project, design, tmp_path, mon
     artifact = tmp_path / "plan.json"
     artifact.write_text(json.dumps(PLAN), encoding="utf-8")
     writ("init")
-    # No WRIT_TEST_CRITIC: only the coverage critic runs, so it is the one that
+    # No WRIT_TEST_CRITIC: only the fidelity critic runs, so it is the one that
     # reports, and the selector in the stub matches on brief text rather than name.
     monkeypatch.setenv("WRIT_TEST_REPORT", json.dumps({"findings": [BLOCKING_FINDING]}))
     code, out, _ = writ(
         "plan", str(design), "--from-plan", str(artifact),
-        "--critics", "coverage", "--critic-agent", agent(CRITIC),
+        "--critics", "fidelity", "--critic-agent", agent(CRITIC),
         "--auto-approve", "--quiet",
     )
     assert code == 0
@@ -520,7 +579,7 @@ def test_auto_approve_still_approves_a_plan_the_critics_pass(
     writ("init")
     code, out, _ = writ(
         "plan", str(design), "--from-plan", str(artifact),
-        "--critics", "coverage", "--critic-agent", agent(SILENT),
+        "--critics", "fidelity", "--critic-agent", agent(SILENT),
         "--auto-approve", "--quiet",
     )
     assert code == 0
@@ -545,9 +604,9 @@ def test_check_says_when_no_critic_has_read_the_plan(
 def test_check_names_the_critics_that_have_not_read_it(
     planned_with_requirements, writ
 ):
-    writ("critique", "--agent", agent(SILENT), "--quiet", "--critics", "coverage,scope")
+    writ("critique", "--agent", agent(SILENT), "--quiet", "--critics", "fidelity")
     code, out, _ = writ("check")
-    assert "not reviewed at this revision: dependency, acceptance, feasibility" in out
+    assert "not reviewed at this revision: feasibility" in out
 
 
 def test_check_is_quiet_once_every_critic_has_read_it(
@@ -560,57 +619,94 @@ def test_check_is_quiet_once_every_critic_has_read_it(
 
 
 def test_check_reports_staleness_as_json(planned_with_requirements, writ):
-    writ("critique", "--agent", agent(SILENT), "--quiet", "--critics", "coverage")
+    writ("critique", "--agent", agent(SILENT), "--quiet", "--critics", "fidelity")
     code, out, _ = writ("--json", "check")
-    assert json.loads(out)["unreviewed"] == [
-        "dependency",
-        "scope",
-        "acceptance",
-        "feasibility",
+    assert json.loads(out)["unreviewed"] == ["feasibility"]
+
+
+def test_the_repo_summary_is_offered_when_there_is_one(tmp_path):
+    prompt = critics.build_prompt(
+        critics.CRITICS[1],
+        root=tmp_path,
+        doc=None,
+        plan=_files(tmp_path, inventory=True),
+        report_path=tmp_path / "findings.json",
+    )
+    assert "inventory.json — the short repo summary" in prompt
+    assert "verification.json" not in prompt
+
+
+# --------------------------------------------------------------------------
+# verify mode: the second round re-checks, it does not re-review
+
+
+def _open_blocker(project, writ, monkeypatch):
+    monkeypatch.setenv("WRIT_TEST_REPORT", json.dumps({"findings": [BLOCKING_FINDING]}))
+    monkeypatch.setenv("WRIT_TEST_CRITIC", "builds what the design")
+    writ("critique", "--agent", agent(CRITIC), "--quiet", "--critics", "fidelity")
+    monkeypatch.delenv("WRIT_TEST_REPORT")
+    monkeypatch.delenv("WRIT_TEST_CRITIC")
+    (record,) = [
+        r
+        for r in plans.finding_records(state.load(project))
+        if r.get("source") == "critic:fidelity"
     ]
+    return record
 
 
-def test_a_critic_may_be_given_a_view_built_for_its_question(tmp_path):
-    """The plan text may be a function of the critic, not one text for all five.
+def test_a_critic_that_never_reviewed_has_nothing_to_verify(
+    planned_with_requirements, project
+):
+    assert critics.verify_context(state.load(project), critics.CRITICS[0]) is None
 
-    Only coverage is asked whether a requirement has any way of being verified, and
-    on a real inventory the verification hints are the largest thing in the plan
-    view. Sending them to the other four buys attention spent on a question they are
-    explicitly told is somebody else's.
-    """
-    seen = []
 
-    def view(critic):
-        seen.append(critic.name)
-        return f'{{"for": "{critic.name}"}}'
-
+def test_verify_mode_hands_back_its_own_blockers_and_what_changed(
+    planned_with_requirements, project, writ, monkeypatch
+):
+    record = _open_blocker(project, writ, monkeypatch)
+    with state.transaction(project) as data:
+        data["tasks"]["M01-001"]["title"] = "Renamed by a repair"
+        plans.bump(data)
+    context = critics.verify_context(state.load(project), critics.CRITICS[0])
+    assert context.open_ids == [record["id"]]
+    assert context.changed == ["M01-001"]
     prompt = critics.build_prompt(
-        critics.by_name(["scope"])[0],
-        root=tmp_path,
+        critics.CRITICS[0],
+        root=project,
         doc=None,
-        plan_text=view,
-        report_path=tmp_path / "findings.json",
+        plan=_files(project),
+        report_path=project / "findings.json",
+        verify=context,
+        verify_path=project / "verify.json",
     )
-    assert seen == ["scope"]
-    assert '{"for": "scope"}' in prompt
+    assert "This is a VERIFY pass" in prompt
+    assert "still_open" in prompt
 
 
-def test_a_plain_plan_text_still_reaches_every_critic(tmp_path):
-    """The simple case stays simple: one string, no callable."""
-    prompt = critics.build_prompt(
-        critics.by_name(["scope"])[0],
-        root=tmp_path,
-        doc=None,
-        plan_text='{"tasks": []}',
-        report_path=tmp_path / "findings.json",
+def test_a_blocker_the_verifier_still_names_stays_open(
+    planned_with_requirements, project, writ, monkeypatch
+):
+    record = _open_blocker(project, writ, monkeypatch)
+    context = critics.verify_context(state.load(project), critics.CRITICS[0])
+    report = critics.parse(
+        json.dumps({"still_open": [record["id"]]}), critics.CRITICS[0], verify=context
     )
-    assert '{"tasks": []}' in prompt
+    assert report.still_open == [record["id"]]
+    assert report.blocking == 1
+    # and one it leaves out is not re-emitted, so the ledger closes it
+    silent = critics.parse(
+        json.dumps({"still_open": []}), critics.CRITICS[0], verify=context
+    )
+    assert silent.blocking == 0
 
 
-def test_only_the_coverage_critic_asks_for_verification():
-    """The flag matches what the briefs say, so the view follows the question."""
-    wants = {c.name for c in critics.CRITICS if c.reads_verification}
-    assert wants == {"coverage"}
-    for critic in critics.CRITICS:
-        if critic.name == "coverage":
-            assert "way of being verified" in " ".join(critic.checks)
+def test_a_new_blocker_on_an_unchanged_feature_is_only_advisory(
+    planned_with_requirements, project, writ, monkeypatch
+):
+    _open_blocker(project, writ, monkeypatch)
+    context = critics.verify_context(state.load(project), critics.CRITICS[0])
+    fresh = {**BLOCKING_FINDING, "where": "M01-002", "requirement_ids": []}
+    report = critics.parse(
+        json.dumps({"findings": [fresh]}), critics.CRITICS[0], verify=context
+    )
+    assert report.blocking == 0

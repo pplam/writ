@@ -1429,7 +1429,7 @@ function findingsCard(shown, all, filter) {
 function findingRow(finding) {
     const open = finding.disposition === 'open';
     return el('article', { class: classes('finding', finding.severity, !open && 'answered') }, el('header', {}, code(finding.id), el('span', { class: classes('pill', finding.severity) }, finding.severity), finding.where ? code(finding.where) : null, el('span', { class: 'muted small' }, finding.category), 
-    // Who raised it. `writ` is a deterministic check, `critic:coverage` an
+    // Who raised it. `writ` is a deterministic check, `critic:fidelity` an
     // independent reader, `gate:G-M01` the milestone's own review — different
     // kinds of claim, and the reader weighs them differently.
     el('span', { class: 'muted small' }, finding.source), !open ? el('span', { class: classes('pill', finding.disposition) }, finding.disposition) : null), el('p', { class: 'prose' }, finding.message), finding.suggested_action ? el('p', { class: 'muted small' }, '→ ', finding.suggested_action) : null, finding.reason ? el('p', { class: 'muted small' }, `${finding.disposition}: ${finding.reason}`) : null, open && finding.severity === 'error'

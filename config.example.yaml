@@ -1,0 +1,39 @@
+# An example .writ/config.yaml. `writ init` writes one holding writ's own
+# defaults; this one shows a project that has made its choices. A flag always
+# overrides anything here, and an unknown key is an error.
+
+agents:
+  # writ plan: a strong model, with room to think
+  planner:
+    command: claude
+    model: opus
+    timeout: 1800
+  # writ critique and writ adjudicate: a different model from the planner, so
+  # the plan is read by something that did not write it
+  critic:
+    command: codex
+    model: gpt-5-codex
+    timeout: null
+  implementer:
+    command: claude
+    model: sonnet
+    timeout: null   # no limit: the honest timeout depends on the task
+  # never the implementer: a model checking its own work agrees with itself
+  reviewer:
+    command: codex
+    model: gpt-5-codex
+    timeout: 1800
+
+plan:
+  critics: true
+  repair: true
+  max_rounds: 2
+  auto_approve: false
+  instructions: "Prefer small features; every feature owns a directory."
+
+run:
+  parallel: 3
+  max_rework: 2
+
+serve:
+  port: 8731

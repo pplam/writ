@@ -16,11 +16,13 @@ from . import (
     agents,
     analysis,
     config,
+    contracts,
     critics,
     decisions,
     gates,
     orchestrator,
     phases,
+    planfiles,
     plancheck,
     planner,
     planning,
@@ -63,9 +65,14 @@ def cmd_init(args) -> None:
     print(f"initialized Writ project at {location}")
     # Written here rather than in `state.initialize` because it is not state: it
     # is a file the project owns, and the store can be reset without it.
-    path, created = config.ensure(args.root)
-    if created:
-        print(f"wrote {path.name} — writ's defaults, with a note explaining them")
+    path, outcome = config.ensure(args.root)
+    if outcome == "created":
+        print(f"wrote {path.name} — writ's defaults, with a comment on each")
+    elif outcome == "converted":
+        print(
+            f"wrote {path.name} from your {config.LEGACY_FILENAME}, which writ no"
+            " longer reads; delete it once you have checked the new file"
+        )
     else:
         print(f"kept your existing {path.name}")
     print("next: writ plan <design.md>")
@@ -127,9 +134,8 @@ def _plan(args, held: dict[str, Any]) -> int:
     and `--from-plan` re-imports a plan artifact without paying for an agent run.
     """
     root = Path(args.root)
-    doc = Path(args.design).expanduser()
-    if not doc.exists():
-        raise WritError(f"design document not found: {doc}")
+    doc = _design_docs(args.design)
+    names = planner.doc_names(doc)
 
     plan_path: Path | None = None
     #: the phase record's id, or None when there is nothing to record against.
@@ -142,19 +148,27 @@ def _plan(args, held: dict[str, Any]) -> int:
     pipeline_results: list[analysis.Result] = []
     pipeline_id: str | None = None
     pipeline_directory: Path | None = None
+    #: the plan directory an agent run wrote into, which the commit then keeps
+    plan_id: str | None = None
     if args.from_plan:
         plan_path = Path(args.from_plan).expanduser()
         document = planning.read_document(plan_path)
         source = f"plan {plan_path.name}"
     elif args.extract:
+        # Each document is parsed on its own, so a heading level means the same
+        # thing in each, and their milestones follow in the order given.
         document = planning.PlanDocument(
-            milestones=planner.parse(
-                doc.read_text(encoding="utf-8"),
-                milestone_level=args.level,
-                split_subsections=not args.flat,
-            )
+            milestones=[
+                milestone
+                for path in doc
+                for milestone in planner.parse(
+                    path.read_text(encoding="utf-8"),
+                    milestone_level=args.level,
+                    split_subsections=not args.flat,
+                )
+            ]
         )
-        source = f"{doc.name} (extracted)"
+        source = f"{names} (extracted)"
     else:
         data = state.load(root)
         # check the overwrite gate before paying for an agent run, not after
@@ -170,7 +184,7 @@ def _plan(args, held: dict[str, Any]) -> int:
                 planning.build_prompt(
                     root=root.resolve(),
                     doc=doc,
-                    plan_path=state.plan_dir(root, "<plan-id>") / "plan.json",
+                    plan_path=state.plan_dir(root, "<plan-id>") / planfiles.DRAFT_FILENAME,
                     instructions=args.instructions,
                     context=context,
                     artifacts=(
@@ -205,9 +219,9 @@ def _plan(args, held: dict[str, Any]) -> int:
             declared_critics = []
         held["id"] = phases.begin(
             root,
-            doc=str(doc),
+            doc=", ".join(str(path) for path in doc),
             plan_id=plan_id,
-            label=f"{doc.name} ({'staged' if staged else 'single-shot'})",
+            label=f"{names} ({'staged' if staged else 'single-shot'})",
             steps=phases.declare(
                 stages=chosen_stages,
                 parallel_stages=bool(getattr(args, "parallel_stages", False)),
@@ -244,7 +258,7 @@ def _plan(args, held: dict[str, Any]) -> int:
             pipeline_directory = directory
 
         print()
-        print(f"planning {doc.name} with {args.agent}...")
+        print(f"planning {names} with {args.agent}...")
 
         def announce(resolved: agents.ResolvedAgent, directory: Path) -> None:
             phases.start_step(
@@ -253,7 +267,7 @@ def _plan(args, held: dict[str, Any]) -> int:
                 "synthesis",
                 resolved=resolved,
                 directory=directory,
-                artifact=directory / "plan.json",
+                artifact=directory.parent / planfiles.DRAFT_FILENAME,
             )
             print(f"  running: {resolved.display}")
             if resolved.warning:
@@ -294,7 +308,7 @@ def _plan(args, held: dict[str, Any]) -> int:
             print("  " + "─" * 60)
         label = "synthesis agent" if artifacts is not None else "planning agent"
         print(f"{label} exited {code}; plan: {plan_path}")
-        source = f"{doc.name} (staged)" if artifacts is not None else f"{doc.name} (agent)"
+        source = f"{names} (staged)" if artifacts is not None else f"{names} (agent)"
         if artifacts is not None:
             pipeline_artifacts = artifacts
             extra_findings = analysis.reconcile(document, artifacts)
@@ -337,6 +351,7 @@ def _plan(args, held: dict[str, Any]) -> int:
             pipeline_results=pipeline_results,
             pipeline_id=pipeline_id,
             pipeline_directory=pipeline_directory,
+            plan_id=plan_id,
         )
     except WritError as exc:
         # The overwrite gate and every structural refusal come out here. Recorded
@@ -352,19 +367,26 @@ def _plan(args, held: dict[str, Any]) -> int:
         phase,
         "commit",
         status="ok",
-        note=f"{summary['milestones']} milestone(s), {created} task(s)",
+        note=(
+            f"{created} feature(s)"
+            if document.features
+            else f"{summary['milestones']} milestone(s), {created} task(s)"
+        ),
     )
-    print(
-        f"created {summary['milestones']} milestones and {created} tasks "
-        f"from {source}"
-    )
+    if document.features:
+        print(f"created {created} features from {source}")
+    else:
+        print(
+            f"created {summary['milestones']} milestones and {created} tasks "
+            f"from {source}"
+        )
     if document.requirements:
         print(
             f"requirement inventory: {len(document.requirements)} entries "
             "(writ coverage)"
         )
     for section in missing:
-        print(f"note: no section titled {section!r} in {doc.name}", file=sys.stderr)
+        print(f"note: no section titled {section!r} in {names}", file=sys.stderr)
     _print_findings(findings)
     if _critics_requested(args):
         # `--critics` absent is None and runs nothing; `--critics` with no names is
@@ -383,7 +405,7 @@ def _plan(args, held: dict[str, Any]) -> int:
     # approvable: the critics' blocking findings are exactly what `--auto-approve`
     # refuses to override, and answering them is the adjudicator's job. Opt-in for
     # the same reason as the critics — it spends agent runs — and bounded by
-    # `adjudicate.max_rounds`, so a finding that survives its own repair reaches a
+    # `plan.max_rounds`, so a finding that survives its own repair reaches a
     # human instead of looping.
     if getattr(args, "repair", False):
         _repair_plan(args, root=root, doc=doc, phase=phase)
@@ -430,7 +452,7 @@ def _run_stages(
     args,
     *,
     root: Path,
-    doc: Path,
+    doc: planner.DesignDocs,
     plan_id: str,
     context: dict[str, Any],
     stages: list[analysis.Stage] | None = None,
@@ -461,7 +483,9 @@ def _run_stages(
     directory = state.plan_dir(root, plan_id)
     parallel = bool(getattr(args, "parallel_stages", False))
     grouped = analysis.waves(stages) if parallel else [[stage] for stage in stages]
-    print(f"analysing {doc.name} in {len(stages)} stage(s) with {agent}...")
+    print(
+        f"analysing {planner.doc_names(doc)} in {len(stages)} stage(s) with {agent}..."
+    )
     print(f"  artifacts: {directory}")
     if parallel and any(len(wave) > 1 for wave in grouped):
         print(
@@ -563,7 +587,7 @@ def _run_stages(
         names = ", ".join(result.stage for result in failed)
         print(
             f"planning stopped: the {names} stage produced no usable artifact.\n"
-            f"  fix or re-run with: writ plan {doc} --plan-id {plan_id}\n"
+            f"  fix or re-run with: writ plan {_doc_args(doc)} --plan-id {plan_id}\n"
             "  (completed stages are reused; add --refresh to redo them)",
             file=sys.stderr,
         )
@@ -574,7 +598,7 @@ def _run_stages(
     if getattr(args, "stage", None):
         print(
             f"\nstages complete: {args.stage}. Nothing has been committed.\n"
-            f"  continue with: writ plan {doc} --plan-id {plan_id}"
+            f"  continue with: writ plan {_doc_args(doc)} --plan-id {plan_id}"
         )
         return artifacts, results, 0
     return artifacts, results, None
@@ -624,21 +648,11 @@ def _print_stage_summary(artifacts: analysis.Artifacts) -> None:
         already = inventory.satisfied()
         if already:
             print(f"  already satisfied by this repository: {', '.join(already)}")
-    verification = artifacts.verification
-    if verification is not None:
-        undemonstrable = [
-            str(entry.get("requirement_id", ""))
-            for entry in verification.undemonstrable
-        ]
-        print(f"  verification: {len(verification.covered)} requirements demonstrable")
-        if undemonstrable:
+        if inventory.language or inventory.test_dirs:
             print(
-                f"  warning: no way found to demonstrate {', '.join(undemonstrable)} "
-                "— any task claiming them will be judged on prose",
-                file=sys.stderr,
+                f"  repository: {inventory.language or 'language unstated'}; "
+                f"tests in {', '.join(inventory.test_dirs) or 'no stated directory'}"
             )
-        for entry in verification.missing_infrastructure:
-            print(f"  missing infrastructure: {entry.get('need')}")
 
 
 def _print_plan(
@@ -654,36 +668,84 @@ def _print_plan(
     if document.requirements:
         print()
     for milestone in document.milestones:
-        print(milestone.title)
-        if milestone.notes:
-            print(f"    {milestone.notes}")
+        if not milestone.loose:
+            print(milestone.title)
+            if milestone.notes:
+                print(f"    {milestone.notes}")
         for task in milestone.tasks:
             print(f"  - {task.title}")
+            if task.goal:
+                print(f"      {task.goal}")
             if task.notes:
                 print(f"      {task.notes}")
             if task.requirement_ids:
                 print(f"      covers: {', '.join(task.requirement_ids)}")
+            if task.owns:
+                print(f"      owns: {', '.join(task.owns)}")
+            for line in task.provides:
+                print(f"      provides: {line}")
+            for line in task.consumes:
+                print(f"      consumes: {line}")
             for item in task.acceptances:
                 print(f"      · {item}")
             if task.depends_on:
                 print(f"      after: {', '.join(task.depends_on)}")
-            if task.allowed:
+            if task.allowed and not task.feature:
                 print(f"      allowed: {', '.join(task.allowed)}")
             if task.forbidden:
                 print(f"      forbidden: {', '.join(task.forbidden)}")
-    print(
-        f"\nwould create {summary['milestones']} milestones, "
-        f"{summary['tasks']} tasks, {summary['acceptances']} acceptance criteria"
-    )
+    if document.features:
+        print(
+            f"\nwould create {summary['tasks']} features, "
+            f"{summary['acceptances']} acceptance criteria"
+        )
+    else:
+        print(
+            f"\nwould create {summary['milestones']} milestones, "
+            f"{summary['tasks']} tasks, {summary['acceptances']} acceptance criteria"
+        )
     for section in missing:
         print(f"note: design section {section!r} was not found", file=sys.stderr)
+
+
+def _design_docs(design: str | list[str]) -> list[Path]:
+    """The design documents named on the command line, each one checked."""
+    docs: list[Path] = []
+    for item in [design] if isinstance(design, str) else design:
+        path = Path(item).expanduser()
+        if not path.exists():
+            raise WritError(f"design document not found: {path}")
+        if path.resolve() not in {seen.resolve() for seen in docs}:
+            docs.append(path)
+    if not docs:
+        raise WritError("name at least one design document")
+    return docs
+
+
+def _doc_args(doc: planner.DesignDocs) -> str:
+    """The design documents as they would be typed again."""
+    return " ".join(shlex.quote(str(path)) for path in planner.doc_list(doc))
+
+
+def _section_doc(
+    doc: planner.DesignDocs, section: str, doc_paths: list[str]
+) -> str | None:
+    """The registered path of the document that holds `section`.
+
+    The first document when no heading matches: the section is then only a label,
+    and the runner still has to hand the agent some document to read.
+    """
+    found, _ = planner.find_section(doc, section) if section else (None, "")
+    if found is not None:
+        return str(found.resolve())
+    return doc_paths[0] if doc_paths else None
 
 
 def _commit_plan(
     args,
     *,
     root: Path,
-    doc: Path,
+    doc: planner.DesignDocs,
     document: planning.PlanDocument,
     plan_path: Path | None,
     source: str,
@@ -692,6 +754,7 @@ def _commit_plan(
     pipeline_results: Iterable[analysis.Result] = (),
     pipeline_id: str | None = None,
     pipeline_directory: Path | None = None,
+    plan_id: str | None = None,
 ) -> tuple[int, list[plancheck.Finding]]:
     """Write the plan to state, then check it and set the plan's status.
 
@@ -713,13 +776,19 @@ def _commit_plan(
             data["milestones"] = {}
             data["findings"] = []
         offset = len(data["milestones"])
-        doc_path = str(doc.resolve())
-        if doc_path not in data["design_docs"]:
-            data["design_docs"].append(doc_path)
+        doc_paths = [str(path.resolve()) for path in planner.doc_list(doc)]
+        for doc_path in doc_paths:
+            if doc_path not in data["design_docs"]:
+                data["design_docs"].append(doc_path)
 
         plans.set_requirements(data, document.requirements, replace=bool(args.force))
-        built = planner.build_ids(milestones, offset)
+        built = planner.build_ids(milestones, offset, _feature_offset(data))
         translate = planner.ref_map(built)
+        test_dirs = (
+            pipeline_artifacts.inventory.test_dirs
+            if pipeline_artifacts is not None and pipeline_artifacts.inventory is not None
+            else []
+        )
         previous: str | None = None
         if args.chain:
             existing = sorted(data["tasks"])
@@ -735,12 +804,15 @@ def _commit_plan(
         # finished graph and still refuses cycles and edges to nothing.
         deferred: list[tuple[str, list[str]]] = []
         for milestone_id, milestone, tasks in built:
-            add_milestone(
-                data,
-                milestone_id=milestone_id,
-                title=milestone.title,
-                design_section=milestone.section,
-            )
+            # A features plan has no milestones (docs/planning-redesign.md §4):
+            # its features commit as loose tasks that only G-FINAL gathers.
+            if not milestone.loose:
+                add_milestone(
+                    data,
+                    milestone_id=milestone_id,
+                    title=milestone.title,
+                    design_section=milestone.section,
+                )
             for task_id, task in tasks:
                 depends = _resolve_depends(
                     task, translate, data, previous, chain=args.chain
@@ -749,14 +821,28 @@ def _commit_plan(
                     data,
                     task_id=task_id,
                     title=task.title,
-                    milestone=milestone_id,
+                    milestone=milestone_id or None,
                     acceptances=task.acceptances,
-                    allowed=task.allowed,
+                    allowed=(
+                        contracts.fence(task.allowed, test_dirs)
+                        if task.feature
+                        else task.allowed
+                    ),
                     forbidden=task.forbidden,
                     design_section=task.section,
-                    design_doc=doc_path,
+                    design_doc=_section_doc(doc, task.section, doc_paths),
                     requirement_ids=task.requirement_ids,
                     notes=task.notes,
+                    feature=(
+                        {
+                            "goal": task.goal,
+                            "owns": task.owns,
+                            "provides": task.provides,
+                            "consumes": task.consumes,
+                        }
+                        if task.feature
+                        else None
+                    ),
                 )
                 if depends:
                     deferred.append((task_id, depends))
@@ -766,16 +852,26 @@ def _commit_plan(
                 previous = task_id
         for task_id, depends in deferred:
             data["tasks"][task_id]["depends_on"] = depends
+        _derive_feature_edges(data)
         check_dag(data)
         refresh_milestones(data)
         if args.gates:
-            gates.install(data, milestones=[m_id for m_id, _, _ in built])
+            gates.install(
+                data, milestones=[m_id for m_id, _, _ in built if m_id]
+            )
         data.setdefault("plans", []).append(
             {
                 "source": source,
-                "design_doc": doc_path,
+                "design_doc": doc_paths[0] if doc_paths else None,
+                "design_docs": doc_paths,
                 "artifact": str(plan_path) if plan_path else None,
-                "milestones": [milestone_id for milestone_id, _, _ in built],
+                "milestones": [milestone_id for milestone_id, _, _ in built if milestone_id],
+                "features": [
+                    task_id
+                    for milestone_id, _, tasks in built
+                    if not milestone_id
+                    for task_id, _ in tasks
+                ],
                 "requirements": [req.id for req in document.requirements],
                 "created_at": state.utcnow(),
             }
@@ -790,6 +886,18 @@ def _commit_plan(
             )
         plans.bump(data)
         plans.set_status(data, "draft")
+        # An appended plan joins the graph already on disk; anything else starts
+        # a plan directory of its own (the pipeline's, when there was one).
+        planfiles.assign_id(
+            data,
+            plan_id
+            or pipeline_id
+            or (
+                None
+                if args.append and planfiles.current_id(data)
+                else planning.new_plan_id(doc)
+            ),
+        )
         # The reconcile findings land beside writ's structural ones rather than in a
         # channel of their own: a dropped requirement holds the plan the same way a
         # cycle does, and `writ approve` should not need to know which kind it is
@@ -810,6 +918,7 @@ def _commit_plan(
                 if finding.category == "untraceable-requirement"
             ],
         )
+        planfiles.export(root, data)
     return created, findings
 
 
@@ -854,6 +963,34 @@ def _auto_approve(root: Path) -> bool:
             reason="no blocking findings stood against the plan",
         )
         return True
+
+
+def _feature_offset(data: dict[str, Any]) -> int:
+    """The highest `FT-nnn` number in use, so appended features never reuse one."""
+    highest = 0
+    for task_id in data["tasks"]:
+        if task_id.startswith("FT-") and task_id[3:].isdigit():
+            highest = max(highest, int(task_id[3:]))
+    return highest
+
+
+def _derive_feature_edges(data: dict[str, Any]) -> None:
+    """Add the edges the features' contracts imply, across the whole graph.
+
+    Derived over every feature in state, not just the ones this commit added: an
+    appended feature that provides what an existing one consumes is an edge too.
+    Stated edges are kept; the derived ones are added beside them.
+    """
+    features = {
+        task_id: task
+        for task_id, task in data["tasks"].items()
+        if contracts.is_feature(task)
+    }
+    for task_id, deps in contracts.edges(features).items():
+        stated = data["tasks"][task_id].setdefault("depends_on", [])
+        for dep in deps:
+            if dep not in stated:
+                stated.append(dep)
 
 
 def _resolve_depends(
@@ -1077,11 +1214,11 @@ def cmd_adjudicate(args) -> int:
     """Repair the plan against its own findings, bounded, before it executes.
 
     The loop writ was missing. `writ check` and `writ critique` produce findings;
-    this is what answers them. An adjudicator proposes a patch, writ validates it
-    against the invariants no agent is trusted with — a bar may not be lowered, a
-    requirement may not be dropped — applies it if it holds, then re-checks and
-    re-runs the critics so a finding closes on evidence rather than on the patch's
-    word.
+    this is what answers them. An adjudicator edits a working copy of the plan
+    files, writ validates it against the invariants no agent is trusted with — a
+    bar may not be lowered, a requirement may not be dropped — promotes it if it
+    holds, then re-checks and re-runs the critics so a finding closes on evidence
+    rather than on the adjudicator's word.
 
     Bounded on purpose, and separate from `writ approve --force`. Force is a human
     accepting an objection on the record; this is an attempt to remove it. A plan
@@ -1113,7 +1250,8 @@ def cmd_adjudicate(args) -> int:
             )
         return 0
     doc = Path(args.doc) if getattr(args, "doc", None) else None
-    directory = state.store_dir(root) / "adjudication" / f"r{plans.revision(data)}"
+    with state.transaction(root) as data:
+        directory = planfiles.rounds_dir(root, data)
     # Attach to the planning phase this plan was built by, so a round run from
     # `writ adjudicate` reaches the dashboard the same way one run by
     # `writ plan --repair` does.
@@ -1201,13 +1339,7 @@ def cmd_adjudicate(args) -> int:
         if round_.questions:
             print(f"  raised {len(round_.questions)} question(s) for a human")
             return
-        applied = round_.applied
-        added = ", ".join(applied.get("tasks") or []) or "none"
-        revised = ", ".join(applied.get("revised") or []) or "none"
-        print(
-            f"  applied: added {added}; revised {revised} "
-            f"(plan revision {applied.get('revision')})"
-        )
+        print(f"  applied: {_applied_line(round_.applied)}")
         print(f"  blocking now: {round_.blocking_after}")
 
     def recheck() -> list[str]:
@@ -1218,7 +1350,13 @@ def cmd_adjudicate(args) -> int:
         if not args.json:
             print("  re-reviewing the patched plan")
         _run_critics(
-            args, root=root, doc=doc, chosen=chosen, plan_path=None, phase=phase
+            args,
+            root=root,
+            doc=doc,
+            chosen=chosen,
+            plan_path=None,
+            phase=phase,
+            verify=True,
         )
         return []
 
@@ -1282,7 +1420,9 @@ def cmd_adjudicate(args) -> int:
     return 0 if result.clean else 1
 
 
-def _repair_plan(args, *, root: Path, doc: Path | None, phase: str | None = None) -> None:
+def _repair_plan(
+    args, *, root: Path, doc: planner.DesignDocs, phase: str | None = None
+) -> None:
     """Run the bounded repair loop over the plan `writ plan` just committed.
 
     The same loop `writ adjudicate` drives, reached from planning so that one
@@ -1316,15 +1456,19 @@ def _repair_plan(args, *, root: Path, doc: Path | None, phase: str | None = None
         return
     print()
     print(f"repairing the plan: {len(blocking)} blocking finding(s)")
-    directory = state.store_dir(root) / "adjudication" / f"r{plans.revision(data)}"
+    with state.transaction(root) as data:
+        directory = planfiles.rounds_dir(root, data)
     # The declared `repair` step becomes round 1, and every round after it is
     # appended as it opens. How many there are is not knowable here: it depends on
     # what each patch actually fixed, which is what `adjudicate.loop` is bounded
     # over. So the record grows as the loop does, which is the honest shape.
-    step_of = {1: "repair"}
+    step_of: dict[int, str] = {}
 
     def announce(number: int, resolved) -> None:
-        if number not in step_of:
+        if not step_of:
+            step_of[number] = "repair"
+        elif number not in step_of:
+            previous = step_of[max(step_of)]
             step_of[number] = f"repair:round-{number}"
             phases.add(
                 root,
@@ -1337,7 +1481,7 @@ def _repair_plan(args, *, root: Path, doc: Path | None, phase: str | None = None
                         summary="answer what the previous round left blocking",
                     )
                 ],
-                after=step_of[number - 1],
+                after=previous,
             )
         phases.start_step(
             root,
@@ -1383,10 +1527,8 @@ def _repair_plan(args, *, root: Path, doc: Path | None, phase: str | None = None
         if round_.questions:
             print(f"  raised {len(round_.questions)} question(s) for a human")
             return
-        applied = round_.applied
-        added = ", ".join(applied.get("tasks") or []) or "none"
         print(
-            f"  applied: added {added} (plan revision {applied.get('revision')}); "
+            f"  applied: {_applied_line(round_.applied)}; "
             f"blocking now {round_.blocking_after}"
         )
 
@@ -1408,6 +1550,7 @@ def _repair_plan(args, *, root: Path, doc: Path | None, phase: str | None = None
             chosen=_chosen_critics(args),
             plan_path=None,
             phase=phase,
+            verify=True,
         )
         return []
 
@@ -1448,15 +1591,21 @@ def _repair_plan(args, *, root: Path, doc: Path | None, phase: str | None = None
         print(f"  stopped: {result.stopped}")
 
 
+def _applied_line(applied: dict[str, Any]) -> str:
+    """What a promoted repair changed, in one line."""
+    parts = [
+        f"{label} {', '.join(applied.get(key) or []) or 'none'}"
+        for label, key in (("added", "tasks"), ("revised", "revised"), ("removed", "removed"))
+    ]
+    return f"{'; '.join(parts)} (plan revision {applied.get('revision')})"
+
+
 def _critics_requested(args) -> bool:
     """Whether the critics should read the plan `writ plan` just committed.
 
-    Three states reach here, because `--critics` has three and the config has the
-    same three: absent (None) runs nothing, since each critic costs an agent run
-    and writ does not spend those unasked; `--critics` with no names, or
-    `plan.critics: true`, runs the configured set; and a list runs exactly those.
-    `False` has to be distinguished from `None` by value rather than truth — a
-    config that turns critics off looks identical to an absent flag otherwise.
+    Absent (None) or `plan.critics: false` runs nothing, since each critic costs
+    an agent run and writ does not spend those unasked; `--critics` with no names,
+    or `plan.critics: true`, runs all of them; and a list runs exactly those.
     """
     requested = getattr(args, "critics", None)
     if requested is None or requested is False:
@@ -1465,42 +1614,39 @@ def _critics_requested(args) -> bool:
 
 
 def _chosen_critics(args) -> list[critics.Critic]:
-    """Which critics to run: the ones named, the ones configured, or all of them.
+    """Which critics to run: the ones named, or all of them.
 
-    `--critics coverage` names them outright. A bare `--critics`, or
-    `plan.critics: true`, defers to `critique.critics` — so a project that has
-    settled on a subset states it once rather than in both places — and with
-    neither, all of them.
+    `--critics coverage` names them outright; a bare `--critics`, or
+    `plan.critics: true`, runs every one.
     """
     named = getattr(args, "critics", None)
     if isinstance(named, list) and named:
         return critics.by_name(named)
-    configured = getattr(args, "critic_names", None)
-    if configured:
-        return critics.by_name(configured)
     return list(critics.CRITICS)
 
 
-def _run_critics(args, *, root, doc, chosen, plan_path, phase=None):
+def _run_critics(args, *, root, doc, chosen, plan_path, phase=None, verify=False):
     """Run the critics over the committed plan and merge what they found.
 
-    The plan they read is rebuilt from committed state rather than from the
-    planner's artifact, so the critics review the ids and edges that actually
+    The plan files they read are re-exported from committed state rather than
+    taken from the planner's draft, so the critics review the ids and edges that actually
     exist — which are what will be executed, and not always what the plan proposed.
+
+    `verify` is set on a re-review after repair (docs/planning-redesign.md §5):
+    each critic that read an earlier revision re-checks its own blockers and may
+    raise new ones only on features that changed since.
     """
-    data = state.load(root)
-    # Built per critic rather than once: only coverage is asked about verification,
-    # and on a real inventory those hints are most of the requirement block.
-    views = {
-        wants: _plan_json(data, verification=wants) for wants in (False, True)
-    }
-
-    def plan_text(critic):
-        return views[critic.reads_verification]
-
+    with state.transaction(root) as data:
+        files = _plan_files(root, data)
+        contexts = {}
+        if verify:
+            for critic in chosen:
+                context = critics.verify_context(data, critic)
+                if context is not None:
+                    contexts[critic.name] = context
     found = plans.findings(data, open_only=True)
     revision = plans.revision(data)
-    directory = state.store_dir(root) / "reviews" / f"r{revision}"
+    directory = planfiles.reviews_dir(root, data, revision)
     parallel = bool(getattr(args, "parallel_critics", False))
     step_id = _critic_steps(
         root, phase, chosen, revision=revision, data=data, parallel=parallel
@@ -1566,7 +1712,7 @@ def _run_critics(args, *, root, doc, chosen, plan_path, phase=None):
     reports = critics.review(
         root=root,
         doc=doc,
-        plan_text=plan_text,
+        plan=files,
         directory=directory,
         chosen=chosen,
         agent=getattr(args, "critic_agent", None) or args.agent,
@@ -1580,6 +1726,7 @@ def _run_critics(args, *, root, doc, chosen, plan_path, phase=None):
         on_finish=report_back,
         on_launch=record,
         on_close=close,
+        verify=contexts,
     )
     with state.transaction(root) as live:
         written = critics.record(live, reports, root=root.resolve())
@@ -1648,61 +1795,20 @@ def _critic_steps(root, phase, chosen, *, revision: int, data, parallel: bool):
     return lambda name: f"critic:{name}{suffix}"
 
 
-#: what a critic is shown of a requirement.
-#:
-#: Not `created_at`/`updated_at`: a critic judges a plan, not its chronology, and on
-#: a real inventory those two fields alone are 9KB of digits that say nothing about
-#: whether the plan builds the right thing. `verification` is held back too — it is
-#: the largest field by far, and four of the five critics are told in as many words
-#: that it is another critic's job. Coverage is the exception and asks for it.
-CRITIC_REQUIREMENT_FIELDS = (
-    "id",
-    "text",
-    "priority",
-    "status",
-    "source",
-    "reason",
-    "evidence",
-)
+def _plan_files(root: Path, data: dict[str, Any]) -> critics.PlanFiles:
+    """Export the plan and say where a critic finds each part of it.
 
-
-def _requirement_view(record: dict[str, Any], *, verification: bool) -> dict[str, Any]:
-    view = {
-        field: record[field] for field in CRITIC_REQUIREMENT_FIELDS if field in record
-    }
-    if verification and record.get("verification"):
-        view["verification"] = record["verification"]
-    return view
-
-
-def _plan_json(data: dict[str, Any], *, verification: bool = True) -> str:
-    """The committed plan as the critics read it: ids, edges, fences, bars."""
-    return json.dumps(
-        {
-            "requirements": [
-                _requirement_view(record, verification=verification)
-                for record in plans.requirements(data).values()
-            ],
-            "tasks": [
-                {
-                    "id": task["id"],
-                    "title": task.get("title", ""),
-                    "kind": task.get("kind", "task"),
-                    "milestone": task.get("milestone"),
-                    "notes": task.get("notes", ""),
-                    "design_section": task.get("design_section"),
-                    "requirement_ids": task.get("requirement_ids", []),
-                    "depends_on": task.get("depends_on", []),
-                    "allowed": task.get("allowed", []),
-                    "forbidden": task.get("forbidden", []),
-                    "acceptances": [
-                        item.get("text", "") for item in task.get("acceptances", [])
-                    ],
-                }
-                for task in sorted(data["tasks"].values(), key=lambda t: t["id"])
-            ],
-        },
-        indent=2,
+    The repo summary is the analysis artifact when the staged pipeline wrote one;
+    the feasibility critic reads it for the language, test command and baseline.
+    """
+    index = planfiles.ensure(root, data)
+    inventory: Path | None = index.parent / "inventory.json"
+    if not inventory.exists():
+        inventory = None
+    return critics.PlanFiles(
+        index=index,
+        features=planfiles.features_dir(root, data),
+        inventory=inventory,
     )
 
 
@@ -3194,7 +3300,6 @@ def _configured_roles(root) -> list[dict[str, Any]]:
 ROLE_FALLBACKS = {
     "planner": "pi",
     "critic": "the planning agent",
-    "stage": "the planning agent",
     "implementer": "pi",
     "reviewer": "the implementing agent",
 }
@@ -3322,6 +3427,113 @@ def cmd_cancel(args) -> None:
 
 # --------------------------------------------------------------------------
 # autonomous run
+
+
+#: `writ build` flag -> (the `writ plan` attribute, the `writ run` attribute) it sets.
+#: None where the step has no such setting. Written out rather than shared by
+#: name, because `--agent` under build is the implementer, as it is under run,
+#: while the planner is `--planner`.
+BUILD_FORWARDS: dict[str, tuple[str | None, str | None]] = {
+    "planner": ("agent", None),
+    "planner_model": ("model", None),
+    "critic": ("critic_agent", None),
+    "critic_model": ("critic_model", None),
+    "instructions": ("instructions", None),
+    "critics": ("critics", None),
+    "repair": ("repair", None),
+    "max_rounds": ("max_rounds", None),
+    "agent": (None, "agent"),
+    "model": (None, "model"),
+    "timeout": (None, "timeout"),
+    "reviewer": (None, "reviewer"),
+    "reviewer_model": (None, "reviewer_model"),
+    "reviewer_timeout": (None, "reviewer_timeout"),
+    "parallel": (None, "parallel"),
+    "max_tasks": (None, "max_tasks"),
+    "max_rework": (None, "max_rework"),
+    "order": (None, "order"),
+    "no_stream": (None, "no_stream"),
+    "cwd": ("cwd", "cwd"),
+    "quiet": ("quiet", "quiet"),
+    "json": (None, "json"),
+    "dry_run": ("dry_run", "dry_run"),
+}
+
+
+def cmd_build(args) -> int:
+    """Plan the design if it has not been planned, then run the plan.
+
+    One command from a design to finished work: `writ plan` then `writ run`, with
+    the plan approved on the way through unless `--no-auto-approve` says a human
+    should read it first. Auto-approval still refuses a plan with a blocking
+    finding standing against it, so a plan that is wrong stops here either way.
+
+    It is also how a build resumes. With a plan already in place, `writ build`
+    runs it (naming no design, or only designs the plan already covers); a design
+    it does not cover is refused unless `--append` asks for it to be planned onto
+    the graph that is there. Each step is the command itself, parsed and
+    configured the way the command line would have, so the config applies to
+    each exactly as it does to `writ plan` and `writ run`.
+    """
+    root = Path(args.root)
+    data = state.load(root)
+    docs = _design_docs(args.design) if args.design else []
+    registered = {str(Path(path).resolve()) for path in data["design_docs"]}
+    unplanned = [path for path in docs if str(path.resolve()) not in registered]
+    if not data["tasks"] and not docs:
+        raise WritError(
+            "nothing to build yet: name the design, e.g. `writ build design.md`"
+        )
+    if data["tasks"] and unplanned and not args.append:
+        raise WritError(
+            f"this project already has a plan, and {planner.doc_names(unplanned)} "
+            "is not part of it. Pass --append to plan it onto the graph there is, "
+            "or leave it off to carry on with the current plan"
+        )
+
+    if not data["tasks"] or unplanned:
+        plan_args = _step_args(
+            args, "plan", [str(path) for path in (unplanned or docs)], index=0
+        )
+        plan_args.append = bool(data["tasks"])
+        if plan_args.auto_approve is None:
+            # build's own default, not `plan.auto_approve`: a build that stops
+            # at every plan is `writ plan` followed by `writ run` again
+            plan_args.auto_approve = not args.no_auto_approve
+        config.apply(plan_args, config.load(root))
+        code = cmd_plan(plan_args)
+        if code != 0 or args.dry_run:
+            return code
+        data = state.load(root)
+        print()
+    elif not args.json:
+        print(f"the plan is in place ({len(data['tasks'])} tasks); running it")
+
+    if not args.dry_run and not plans.runnable(data):
+        print(plans.not_runnable_message(data))
+        print("then run `writ build` again to carry on from there")
+        return 1
+    run_args = _step_args(args, "run", [], index=1)
+    config.apply(run_args, config.load(root))
+    return cmd_run(run_args)
+
+
+def _step_args(args, command: str, positional: list[str], *, index: int):
+    """Parse one step of `writ build` as its own command, with build's flags on it.
+
+    Only what build was actually given is carried over; everything else is left
+    unset for the config to fill, the same as if the step had been typed alone.
+    """
+    from .cli import build_parser
+
+    step = build_parser().parse_args(["--root", str(args.root), command, *positional])
+    step.agent_args = list(getattr(args, "agent_args", []) or [])
+    for source, targets in BUILD_FORWARDS.items():
+        target = targets[index]
+        value = getattr(args, source, None)
+        if target is not None and value is not None:
+            setattr(step, target, value)
+    return step
 
 
 def cmd_run(args) -> int:

@@ -373,7 +373,11 @@ def add_task(
     kind: str = "task",
     scope: str | None = None,
     notes: str = "",
+    feature: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Insert a planned task. `feature` carries a feature's goal, owns,
+    provides and consumes (docs/planning-redesign.md §4); a plain task has none.
+    """
     if task_id in data["tasks"]:
         raise WritError(f"task {task_id} already exists")
     if milestone and milestone not in data["milestones"]:
@@ -412,6 +416,10 @@ def add_task(
         "created_at": utcnow(),
         "updated_at": utcnow(),
     }
+    if feature is not None:
+        task["goal"] = str(feature.get("goal") or "")
+        for key in ("owns", "provides", "consumes"):
+            task[key] = [str(item) for item in feature.get(key) or ()]
     data["tasks"][task_id] = task
     refresh_milestones(data)
     return task

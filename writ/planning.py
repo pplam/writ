@@ -1,10 +1,15 @@
-"""Generative planning: a coding agent turns a design doc into a task DAG.
+"""Generative planning: a coding agent turns a design doc into features.
 
 Text extraction (`planner.py`) can only repeat what a document already says in a
-shape it recognises. Planning is a judgement call: which work is one bounded
-session, what the real bar is, which components a task may touch, and what must
-land first. So `writ plan` hands the design doc and the repository to a coding
-agent and asks for a plan as JSON.
+shape it recognises. Planning is a judgement call: which subsystems the work
+splits into, what each one owns, which interfaces connect them, and what the
+real bar is. So `writ plan` hands the design doc and the repository to a coding
+agent and asks for a plan as JSON: capabilities, and the features that build
+them (docs/planning-redesign.md §4). Edges are not written by the agent; they
+are derived from the features' contracts (`contracts.py`).
+
+The older milestone/task shape still loads, for `--extract` and for drafts
+written before features existed.
 
 The agent's freedom stops at the schema. Everything it returns is validated
 before it reaches project state, the raw artifact is kept under
@@ -14,15 +19,21 @@ from __future__ import annotations
 
 import json
 import re
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import agents, plancheck, runner, state
+from . import agents, contracts, plancheck, planfiles, prompts, runner, state
 from .stream import truncated
 from .plancheck import Finding, Requirement
-from .planner import PlannedMilestone, PlannedTask, section_text
+from .planner import (
+    DesignDocs,
+    PlannedMilestone,
+    PlannedTask,
+    doc_list,
+    doc_names,
+    find_section,
+)
 from .state import WritError
 
 #: keys accepted for each field, in priority order — model output varies
@@ -57,7 +68,15 @@ REQUIREMENT_ALIASES: dict[str, tuple[str, ...]] = {
     "source": ("source", "section", "design_section", "where", "quote"),
     "evidence": ("evidence", "proof", "existing_evidence"),
     "reason": ("reason", "justification", "why"),
+    "details": ("details", "obligations", "sub_requirements"),
     "verification": ("verification", "verify", "verification_hints", "how"),
+}
+FEATURE_ALIASES: dict[str, tuple[str, ...]] = {
+    "goal": ("goal", "outcome", "summary"),
+    "owns": ("owns", "component", "components", "owned"),
+    "provides": ("provides", "exports", "provided"),
+    "consumes": ("consumes", "imports", "uses", "consumed"),
+    "notes": ("notes", "risks", "intent"),
 }
 MILESTONE_ALIASES: dict[str, tuple[str, ...]] = {
     "id": ("id", "milestone_id", "ref"),
@@ -71,282 +90,139 @@ SCHEMA = """\
   "requirements": [
     {
       "id": "REQ-001",
-      "text": "one obligation the document states, in your own words",
+      "text": "one capability the document asks for, named as a whole",
       "source": "exact heading it came from",
       "priority": "must" | "should" | "may",
       "status": "planned" | "existing" | "out-of-scope" | "deferred",
       "evidence": "status existing only: the test or code that satisfies it",
       "reason": "status out-of-scope or deferred only: why it is not this plan's",
-      "verification": ["how this can be demonstrated"]
+      "details": ["a finer obligation this capability contains", "another"]
     }
   ],
-  "milestones": [
+  "features": [
     {
-      "id": "M01",
-      "title": "short outcome, not a restatement of the heading",
-      "notes": "what this milestone establishes, one or two sentences",
-      "tasks": [
-        {
-          "id": "M01-001",
-          "title": "imperative, specific: 'Add append-only event log writer'",
-          "notes": "approach, key files, pitfalls found while reading the repo",
-          "design_section": "exact heading from the design document",
-          "requirement_ids": ["REQ-001", "REQ-004"],
-          "acceptances": [
-            "a criterion a person or command can check",
-            "another one"
-          ],
-          "depends_on": ["M01-002"],
-          "allowed": ["internal/store/"],
-          "forbidden": ["api/"]
-        }
-      ]
+      "id": "store",
+      "title": "Event store",
+      "goal": "one paragraph: what exists when this feature is done",
+      "design_section": "exact heading from the design document",
+      "requirement_ids": ["REQ-003", "REQ-004"],
+      "owns": ["pkg/store/"],
+      "provides": ["EventLog: append(event) -> offset; read(from) -> events"],
+      "consumes": ["Config: typed settings loaded from the project file"],
+      "acceptance": [
+        "an observable behaviour a reviewer can check",
+        "another one"
+      ],
+      "notes": "ambiguities, risks, conventions to follow"
     }
   ]
 }"""
 
 RULES = """\
 Rules:
-- Start with `requirements`, before any task. Read the document and write down
-  every obligation it states: behaviour, constraint, interface, non-functional
-  bar. One obligation per entry, in your own words, with the heading it came from.
-  This inventory is what the plan is checked against, so an obligation you leave
-  out is one nothing will ever verify — and one you invent becomes work with no
-  mandate. Do not fold two requirements into one entry to make the list shorter.
-- Every requirement must end somewhere. Either one or more tasks name it in
-  `requirement_ids`, or it is `existing` with evidence naming the test or code
-  that already satisfies it, or it is `out-of-scope`/`deferred` with a reason.
-  Silently dropping one is the failure this inventory exists to prevent.
-- Every task should name the requirements it covers. A task that covers none is
-  either infrastructure — say so in its notes — or work nothing asked for.
-- One task is one bounded agent session: a single coherent change with a stated
-  bar. Split anything that spans unrelated components or that you could not
-  review in one sitting. Do not emit a task called "implement the design".
-- Each task states 2 to 6 acceptance criteria. Every criterion must be checkable:
-  name the command, the observable behavior, or the artifact it produces.
-  "Works correctly" and "code is clean" are not criteria.
-- A criterion must be meetable by this task alone. Do not set a bar that depends
-  on work outside its `allowed` list: on a fenced task, "the whole suite passes"
-  is not such a bar, because tasks run in parallel and a sibling's half-finished
-  module fails it for reasons this agent may not touch. Scope it to what the task
-  owns — name the test file or the command that exercises this change.
-- Prefer bars the document already states, in its own wording. Add your own only
-  where the document is silent, and keep them consistent with it. Do not invent
-  requirements the document does not support.
-- depends_on holds task ids from this plan, or ids of the existing tasks listed
-  above. It must form a DAG: no cycles, no self-references. Order milestones so
-  earlier work unblocks later work, and leave independent tasks independent
-  instead of chaining everything into one line.
-- State every edge the work actually needs. A task with no `depends_on` is run as
-  soon as the graph allows, possibly first and possibly beside any other — the
-  plan's order is not an ordering. If B reads an interface A creates, B must say
-  so; nothing else will notice.
-- allowed and forbidden are repo-relative paths or packages that fence a task to
-  the components it should touch. Omit them when a task is genuinely global.
-- Two tasks that nothing orders must not list the same path in `allowed`. They
-  can run at the same time, in the same working tree, and whichever finishes
-  second loses its work. Give the file one owner and have the other depend on it.
-- Where branches of the graph have to compose, say what checks that they do: a
-  task depending on both, whose criteria exercise the combined behaviour. A plan
-  that ends in several independent leaves has verified each of them alone.
-- design_section must be a heading that appears verbatim in the design document,
-  so a task can be traced back to what asked for it. Use "Parent / Child" for a
-  nested heading.
-- Where the document is ambiguous, or contradicts what the repository already
-  does, record it in that task's notes. Do not silently pick a reading.
-- Skip work the repository has already done, and say so in the milestone notes.
+- Start with `requirements`. Write down the capabilities the document asks for:
+  roughly one per major section, 10 to 25 for a full design and fewer for a
+  short one, never more than 25. A capability is something a user of the system
+  could name ("durable event store"), not one sentence of the document. Put the
+  finer obligations it contains — each behaviour, constraint, limit — in its
+  `details`, so nothing the document states is lost, but do not give them ids.
+- Every requirement must end somewhere: a feature names it in `requirement_ids`,
+  or it is `existing` with evidence naming the code that already satisfies it, or
+  it is `out-of-scope`/`deferred` with a reason.
+- A feature is a subsystem one agent can build on its own, from an empty
+  directory to working, tested behaviour. Aim for 4 to 12 of them. Do not split a
+  subsystem into steps; the agent that builds it decides its own steps.
+- `owns` names the component or directory the feature builds, never a list of
+  files. File names are decided when the feature runs, not now. Two features
+  must not own the same directory.
+- `provides` and `consumes` name the interfaces between features, one line each,
+  as `Name: what it is`. The name before the colon is what connects them: a
+  feature that consumes `EventLog` depends on the feature that provides
+  `EventLog`. Every interface a feature consumes must be provided by exactly one
+  feature in this plan, unless it already exists in the repository — then leave
+  it out of `consumes` and say so in `notes`. Keep the graph acyclic.
+- Do not write `depends_on` between features. Writ derives the edges from
+  `provides` and `consumes`. An edge onto an existing task (listed below, if
+  any) may be written in `depends_on`.
+- `acceptance` states 3 to 6 behaviours a reviewer can observe when the feature
+  is done: what a caller can do, what it refuses, what survives a restart. Do not
+  name test files, test functions, or source files.
+- Prefer bars the document already states. Where the document is ambiguous, or
+  contradicts what the repository already does, record it in the feature's
+  notes rather than silently picking a reading.
+- design_section must be a heading that appears verbatim in the design document.
+  Use "Parent / Child" for a nested heading.
+- Skip work the repository has already done.
 
 Write no code and change no file other than the plan JSON. You are planning."""
 
 #: what changes when the plan is synthesized from analyses rather than written cold.
 #:
 #: Almost all of it is about the requirement inventory being *fixed*. A single-shot
-#: planner writes the inventory and the tasks together, so the two cannot disagree
-#: — it simply never records an obligation it was not going to cover. Splitting the
-#: stages makes that disagreement possible and therefore detectable, and these
-#: rules are what the synthesizer is held to. `reconcile` checks them afterwards.
+#: planner writes the inventory and the features together, so the two cannot
+#: disagree. Splitting the stages makes that disagreement possible and therefore
+#: detectable, and these rules are what the synthesizer is held to. `reconcile`
+#: checks them afterwards.
 SYNTHESIS_RULES = """\
 Because the analyses above are established, this plan is held to them:
 - Copy the requirement inventory into your `requirements` array exactly: every id
-  that was given to you, with the same text, priority and source. You may change
-  a `status` — to `existing` if the repository inventory shows it is already done,
-  or to `out-of-scope`/`deferred` with a reason — but you may not drop an entry or
-  add one. A requirement missing from your plan is reported as dropped, and an id
-  that was not given to you is reported as invented; both hold the plan.
-- Where the inventory found a requirement already satisfied with evidence, mark it
-  `existing` and carry that evidence across rather than planning the work again.
-- Build acceptance criteria out of the verification analysis. Where it named a
-  command or a test path for a requirement, the task covering that requirement
-  should state that command or path as its bar. Do not invent a different way to
-  check something that was already worked out.
-- Where the verification analysis said a method does not exist yet (`exists`:
-  false), the test or harness it describes is itself work: give it a task, or
-  fold it into the task whose bar needs it. A criterion citing a command nobody
-  has written is not checkable.
-- Where verification listed missing infrastructure, plan it before the tasks that
-  need it, and say so with an edge.
-- Where a requirement was listed as undemonstrable, do not paper over it with a
-  plausible-sounding criterion. Cover it with the closest real check and record
-  the gap in the task's notes.
+  that was given to you, with the same text, priority, source and details. You
+  may change a `status` — to `existing` if the repository summary shows it is
+  already done, or to `out-of-scope`/`deferred` with a reason — but you may not
+  drop an entry or add one. A requirement missing from your plan is reported as
+  dropped, and an id that was not given to you is reported as invented; both hold
+  the plan.
+- Where the repository summary found a requirement already satisfied with
+  evidence, mark it `existing` and carry that evidence across rather than
+  planning the work again.
+- Match the repository summary's language, components and conventions: a
+  feature's `owns` should sit where this repository puts that kind of code.
 - Where the requirements analysis recorded an unresolved ambiguity, note it in the
-  notes of the task it affects. Do not silently pick a reading."""
+  notes of the feature it affects. Do not silently pick a reading."""
 
 
-def _artifact_lines(artifacts: Any) -> list[str]:
-    """Render the analyses into the synthesis prompt.
-
-    Rendered rather than pasted as JSON. The synthesizer has to *use* this, and
-    three schemas of raw JSON is a worse read than the same content as a briefing
-    — but the requirement inventory is rendered id-first and in full, because that
-    is the one part it will be checked against verbatim.
-    """
-    lines: list[str] = []
-    requirements = getattr(artifacts, "requirements", None)
-    if requirements is not None:
-        lines.append(
-            "REQUIREMENTS — the fixed inventory. Reproduce every one of these ids "
-            "in your `requirements` array. Do not add, drop, or renumber."
+def _artifact_refs(folder: Path, artifacts: Any) -> list[prompts.Ref]:
+    """The analyses, as files to read, each with what it is binding for."""
+    refs: list[prompts.Ref] = []
+    if getattr(artifacts, "requirements", None) is not None:
+        refs.append(
+            prompts.Ref(
+                folder / "requirements.json",
+                "REQUIREMENTS, the fixed inventory. Reproduce every id in your "
+                "`requirements` array; do not add, drop, or renumber. Its "
+                "unresolved `ambiguities` go in the affected feature's notes",
+            )
         )
-        for requirement in requirements.requirements:
-            lines.append(
-                f"- {requirement.id} [{requirement.priority}] {requirement.text}"
+    if getattr(artifacts, "inventory", None) is not None:
+        refs.append(
+            prompts.Ref(
+                folder / "inventory.json",
+                "REPOSITORY, the short summary of what is already here: "
+                "language, test command, test directories, baseline, and the "
+                "components new work attaches to",
             )
-            if requirement.source:
-                lines.append(f"    source: {requirement.source}")
-        lines.append("")
-        unresolved = requirements.open_questions
-        if unresolved:
-            lines.append(
-                "Unresolved ambiguities. Note these in the affected task's notes; "
-                "do not decide them silently:"
-            )
-            for entry in unresolved:
-                affected = ", ".join(entry.get("requirement_ids", []) or [])
-                lines.append(
-                    f"- {entry.get('id', 'AMB')}: {entry.get('question', '')}"
-                    + (f" (affects {affected})" if affected else "")
-                )
-            lines.append("")
-
-    inventory = getattr(artifacts, "inventory", None)
-    if inventory is not None:
-        lines.append("REPOSITORY — what is already here.")
-        for component in inventory.components:
-            paths = ", ".join(str(path) for path in component.get("paths", []))
-            lines.append(f"- {component.get('name')}: {paths or 'no paths given'}")
-            behavior = str(component.get("existing_behavior", "")).strip()
-            if behavior:
-                lines.append(f"    today: {behavior}")
-            tests = ", ".join(str(path) for path in component.get("test_locations", []))
-            if tests:
-                lines.append(f"    tests: {tests}")
-            for risk in component.get("risks", []) or []:
-                lines.append(f"    risk: {risk}")
-        if inventory.conventions:
-            lines.append("  conventions to match:")
-            lines.extend(f"    - {item}" for item in inventory.conventions)
-        if inventory.baseline_commands:
-            lines.append(
-                f"  baseline: {', '.join(inventory.baseline_commands)} "
-                f"→ {inventory.baseline_status}"
-            )
-        if inventory.known_failures:
-            lines.append(
-                "  already failing before this plan starts (do not plan around "
-                f"these as if your work caused them): {', '.join(inventory.known_failures)}"
-            )
-        already = [
-            entry
-            for entry in inventory.existing_coverage
-            if entry.get("status") in ("full", "partial")
-        ]
-        if already:
-            lines.append("  requirements the repository already covers:")
-            for entry in already:
-                lines.append(
-                    f"    - {entry.get('requirement_id')} [{entry.get('status')}] "
-                    f"{entry.get('evidence', 'no evidence given')}"
-                )
-        lines.append("")
-
-    verification = getattr(artifacts, "verification", None)
-    if verification is not None:
-        lines.append(
-            "VERIFICATION — how each requirement can be demonstrated. Build your "
-            "acceptance criteria from these."
         )
-        entries = verification.verification
-        methods = [
-            method for entry in entries for method in (entry.get("methods") or [])
-        ]
-        # When nothing exists yet, say it once. On a greenfield plan every one of 177
-        # methods carried `(DOES NOT EXIST YET)` and a `needs first:` line repeating
-        # "build the package and install pytest" — 45KB of the 82KB prompt, saying
-        # the same thing 177 times. The per-method mark only carries information when
-        # some methods exist and others do not.
-        absent = [m for m in methods if m.get("exists") is False]
-        greenfield = bool(methods) and len(absent) == len(methods)
-        if greenfield:
-            lines.append(
-                "  None of the verification below exists in the repository yet, so "
-                "every test named here is itself work: give it a task, or fold it "
-                "into the task whose bar cites it."
-            )
-        for entry in entries:
-            req_id = entry.get("requirement_id")
-            for method in entry.get("methods", []) or []:
-                detail = (
-                    str(method.get("command", "")).strip()
-                    or str(method.get("location", "")).strip()
-                    or str(method.get("observable", "")).strip()
-                )
-                mark = (
-                    ""
-                    if greenfield or method.get("exists") is not False
-                    else "  (DOES NOT EXIST YET)"
-                )
-                lines.append(f"- {req_id}: {method.get('kind', 'check')} — {detail}{mark}")
-                # `needs` is suppressed under greenfield for the same reason as the
-                # mark: it is 163 near-identical restatements of "this project does
-                # not exist yet", which the one line above already said.
-                needs = str(method.get("needs", "")).strip()
-                if needs and not greenfield:
-                    lines.append(f"    needs first: {needs}")
-        for entry in verification.missing_infrastructure:
-            blocks = ", ".join(entry.get("blocks", []) or [])
-            lines.append(
-                f"- MISSING INFRASTRUCTURE: {entry.get('need')}"
-                + (f" (blocks {blocks})" if blocks else "")
-            )
-            suggestion = str(entry.get("suggestion", "")).strip()
-            if suggestion:
-                lines.append(f"    suggested: {suggestion}")
-        for entry in verification.undemonstrable:
-            lines.append(
-                f"- NOT DEMONSTRABLE: {entry.get('requirement_id')} — "
-                f"{entry.get('why', '')}"
-            )
-            closest = str(entry.get("closest", "")).strip()
-            if closest:
-                lines.append(f"    closest real check: {closest}")
-        lines.append("")
-    return lines
-
+    return refs
 
 
 # --------------------------------------------------------------------------
 # prompt
 
 
-def new_plan_id(doc: Path) -> str:
-    stem = re.sub(r"[^A-Za-z0-9]+", "-", doc.stem).strip("-").lower() or "plan"
-    return f"{stem}-{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}"
+def new_plan_id(doc: DesignDocs) -> str:
+    docs = doc_list(doc)
+    return planfiles.new_id(docs[0] if docs else None)
+
+
+def synthesis_dir(root: Path, plan_id: str) -> Path:
+    """Where the synthesizer's (or single-shot planner's) transcript goes."""
+    return state.plan_dir(root, plan_id) / "synthesis"
 
 
 def build_prompt(
     *,
     root: Path,
-    doc: Path,
+    doc: DesignDocs,
     plan_path: Path,
     instructions: str | None = None,
     context: dict[str, Any] | None = None,
@@ -357,8 +233,7 @@ def build_prompt(
     With `artifacts` — the analyses from `writ/analysis.py` — this becomes the
     synthesis stage instead, and the prompt changes shape accordingly: the agent
     is no longer asked to work out what the document requires, what the repository
-    holds, or how any of it could be proved. Those are given, and its one job is
-    the decomposition. The requirement inventory in particular arrives as a fixed
+    holds. Those are given, and its one job is the decomposition. The requirement inventory in particular arrives as a fixed
     list it must account for, rather than one it writes for itself.
     """
     context = context or {}
@@ -376,56 +251,48 @@ def build_prompt(
             "You are not implementing it."
         )
     lines.append("")
-    lines.append(f"Repository root: {root}")
-    lines.append(f"Design document: {doc}")
+    lines.append(prompts.root_line(root))
     lines.append("")
+    first = prompts.design_refs(doc, "the design document")
+    if synthesizing:
+        first.extend(_artifact_refs(plan_path.parent, artifacts))
+    as_needed = [
+        prompts.Ref(path, "another document already registered for this project")
+        for path in prompts.other_docs(context.get("design_docs", []), doc)
+    ]
+    lines.extend(prompts.references(root, first=first, as_needed=as_needed))
+    lines.extend(prompts.design_note(doc))
     if synthesizing:
         lines.append(
-            "Three analyses have already been done for you, below: what the "
-            "document requires, what the repository already is, and how each "
-            "requirement could be demonstrated. Read them as established. Read "
-            "the design document too — the analyses are a reading of it, not a "
-            "replacement for it — and read enough of the repository to ground "
-            "each task in real paths."
+            "Two analyses have already been done for you: what the document "
+            "requires, and a short summary of what the repository already is. "
+            "Read them as established. Read the design document too — the "
+            "analyses are a reading of it, not a replacement for it."
         )
     else:
         lines.append(
             "Read the design document in full, then read enough of the repository to "
-            "ground the plan in real paths, existing conventions, and work that is "
-            "already done."
+            "ground the plan in existing conventions and work that is already done."
         )
     lines.append("")
-    if synthesizing:
-        lines.extend(_artifact_lines(artifacts))
-    existing_docs = [
-        path for path in context.get("design_docs", []) if path != str(doc)
-    ]
-    if existing_docs:
-        lines.append("Other documents already registered for this project:")
-        lines.extend(f"- {path}" for path in existing_docs)
-        lines.append("")
     existing_tasks = context.get("tasks", [])
     if existing_tasks:
         lines.append(
-            "This project already has a plan. Plan only the work that is missing, "
-            "and depend on these existing tasks where the new work needs them:"
+            "This project already has a plan. Plan only the work that is missing. "
+            "A new feature may consume an interface an existing feature provides, "
+            "or name an existing task in `depends_on`:"
         )
         for entry in existing_tasks:
-            lines.append(
-                f"- {entry['id']} [{entry['status']}] {entry['title']}"
-            )
-        offset = int(context.get("milestone_offset", 0))
-        lines.append("")
-        lines.append(
-            f"Number new milestones from M{offset + 1:02d} onward so ids do not collide."
-        )
+            line = f"- {entry['id']} [{entry['status']}] {entry['title']}"
+            if entry.get("provides"):
+                line += f" (provides: {'; '.join(entry['provides'])})"
+            lines.append(line)
         lines.append("")
     if instructions:
         lines.append("Additional instructions from the operator (these win):")
         lines.append(instructions)
         lines.append("")
-    lines.append("Write the plan as JSON to this exact path:")
-    lines.append(f"  {plan_path}")
+    lines.extend(prompts.output(root, "plan", plan_path))
     lines.append("")
     lines.append("The file must contain JSON only — no prose, no code fence.")
     lines.append("")
@@ -443,9 +310,9 @@ def build_prompt(
     )
     lines.append("")
     lines.append(
-        "When the file is written, summarise in a few lines: how many milestones "
-        "and tasks, the ordering you chose and why, and anything in the document "
-        "you could not turn into a checkable bar."
+        "When the file is written, summarise in a few lines: how many features, "
+        "the interfaces that connect them, and anything in the document you could "
+        "not turn into a checkable behaviour."
     )
     return "\n".join(lines)
 
@@ -460,6 +327,7 @@ def plan_context(data: dict[str, Any]) -> dict[str, Any]:
                 "id": task_id,
                 "status": data["tasks"][task_id]["status"],
                 "title": data["tasks"][task_id]["title"],
+                "provides": list(data["tasks"][task_id].get("provides") or []),
             }
             for task_id in sorted(data.get("tasks", {}))
         ],
@@ -473,7 +341,7 @@ def plan_context(data: dict[str, Any]) -> dict[str, Any]:
 def generate(
     *,
     root: Path,
-    doc: Path,
+    doc: DesignDocs,
     agent: str,
     agent_args: list[str],
     model: str | None,
@@ -494,9 +362,12 @@ def generate(
     """
     resolved = agents.resolve(agent, agent_args, model, events=True)
     plan_id = plan_id or new_plan_id(doc)
-    directory = state.plan_dir(root, plan_id)
+    # The draft sits beside the analyses it was built from; the synthesizer's
+    # transcript gets its own folder, as each analysis stage's does. `plan.json`
+    # is not this: it is the committed index, which speaks writ's ids.
+    plan_path = state.plan_dir(root, plan_id) / planfiles.DRAFT_FILENAME
+    directory = synthesis_dir(root, plan_id)
     directory.mkdir(parents=True, exist_ok=True)
-    plan_path = directory / "plan.json"
     prompt = build_prompt(
         root=root.resolve(),
         doc=doc,
@@ -660,6 +531,11 @@ class PlanDocument:
     requirements: list[Requirement] = field(default_factory=list)
 
     @property
+    def features(self) -> bool:
+        """Whether this is a features plan rather than milestones and tasks."""
+        return any(milestone.loose for milestone in self.milestones)
+
+    @property
     def requirement_ids(self) -> set[str]:
         return {requirement.id for requirement in self.requirements}
 
@@ -698,9 +574,14 @@ def load_document(text: str) -> PlanDocument:
     requirements: list[Requirement] = []
     if isinstance(payload, dict):
         requirements = _requirements(payload.get("requirements"))
+        if payload.get("features") is not None:
+            return PlanDocument(
+                milestones=[_features(payload["features"])],
+                requirements=requirements,
+            )
         raw_milestones = _pick(payload, MILESTONE_ALIASES["tasks"] + ("milestones",))
         if raw_milestones is None:
-            raise WritError("the plan has no `milestones` list")
+            raise WritError("the plan has no `features` list")
     if not isinstance(raw_milestones, list) or not raw_milestones:
         raise WritError("`milestones` must be a non-empty list")
 
@@ -730,6 +611,54 @@ def load_document(text: str) -> PlanDocument:
         milestones.append(milestone)
     _check_refs(milestones)
     return PlanDocument(milestones=milestones, requirements=requirements)
+
+
+def _features(value: Any) -> PlannedMilestone:
+    """Validate a features list into one loose group, with derived edges.
+
+    Each feature needs a title and a bar. A feature the author left unnamed gets
+    a positional ref, because edges are keyed by ref and a derived edge onto a
+    nameless feature would otherwise have nothing to point at.
+    """
+    if not isinstance(value, list) or not value:
+        raise WritError("`features` must be a non-empty list")
+    group = PlannedMilestone(title="Features", section="", loose=True)
+    seen: set[str] = set()
+    for index, raw in enumerate(value):
+        where = f"features[{index}]"
+        task = _task(raw, where, "")
+        if not task.ref:
+            task.ref = f"feature-{index + 1}"
+        if task.ref in seen:
+            raise WritError(f"duplicate feature id in the plan: {task.ref}")
+        seen.add(task.ref)
+        task.feature = True
+        task.goal = _optional_text(_pick(raw, FEATURE_ALIASES["goal"])) or ""
+        task.owns = _strings(_pick(raw, FEATURE_ALIASES["owns"]), f"{where}.owns")
+        task.provides = _strings(
+            _pick(raw, FEATURE_ALIASES["provides"]), f"{where}.provides"
+        )
+        task.consumes = _strings(
+            _pick(raw, FEATURE_ALIASES["consumes"]), f"{where}.consumes"
+        )
+        task.notes = _optional_text(_pick(raw, FEATURE_ALIASES["notes"])) or ""
+        if not task.stated_section:
+            task.section = task.title
+        # The fence until commit adds the repository's test directories.
+        task.allowed = contracts.fence(task.owns, task.allowed)
+        group.tasks.append(task)
+    derived = contracts.edges(
+        {
+            task.ref: {"provides": task.provides, "consumes": task.consumes}
+            for task in group.tasks
+        }
+    )
+    for task in group.tasks:
+        for dep in derived.get(task.ref, []):
+            if dep not in task.depends_on:
+                task.depends_on.append(dep)
+    _check_refs([group])
+    return group
 
 
 def load_requirement_inventory(value: Any) -> list[Requirement]:
@@ -783,6 +712,9 @@ def _requirements(value: Any) -> list[Requirement]:
                 source=_optional_text(_pick(raw, REQUIREMENT_ALIASES["source"])) or "",
                 evidence=_optional_text(_pick(raw, REQUIREMENT_ALIASES["evidence"])) or "",
                 reason=_optional_text(_pick(raw, REQUIREMENT_ALIASES["reason"])) or "",
+                details=_strings(
+                    _pick(raw, REQUIREMENT_ALIASES["details"]), f"{where}.details"
+                ),
                 verification=_strings(
                     _pick(raw, REQUIREMENT_ALIASES["verification"]),
                     f"{where}.verification",
@@ -874,25 +806,27 @@ def _check_refs(milestones: list[PlannedMilestone]) -> None:
                 raise WritError(f"task {task.ref} depends on itself")
 
 
-def unresolved_sections(milestones: list[PlannedMilestone], doc: Path) -> list[str]:
+def unresolved_sections(
+    milestones: list[PlannedMilestone], doc: DesignDocs
+) -> list[str]:
     """Design sections the plan claims but the document does not contain."""
     missing = []
     for milestone in milestones:
         for task in milestone.tasks:
             if not task.stated_section:
                 continue
-            if not section_text(doc, task.section):
+            if not find_section(doc, task.section)[1]:
                 missing.append(task.section)
     return sorted(set(missing))
 
 
 def untraceable_requirements(
-    requirements: list[Requirement], doc: Path
+    requirements: list[Requirement], doc: DesignDocs
 ) -> list[Finding]:
     """Requirements citing a heading the design document does not have.
 
     The same check `unresolved_sections` makes for tasks, pointed at the inventory.
-    It is worth making deterministically rather than leaving to the coverage critic,
+    It is worth making deterministically rather than leaving to the fidelity critic,
     because it is the cheapest available evidence that a requirement was *read*
     rather than assumed: an obligation traced to a heading that does not exist is
     one the stage may have supplied from its own expectations of what a document
@@ -907,7 +841,7 @@ def untraceable_requirements(
         source = (requirement.source or "").strip()
         if not source:
             continue
-        if section_text(doc, source):
+        if find_section(doc, source)[1]:
             continue
         findings.append(
             Finding(
@@ -917,7 +851,7 @@ def untraceable_requirements(
                 requirement_ids=[requirement.id],
                 message=(
                     f"{requirement.id} cites {source!r}, which is not a heading in "
-                    f"{doc.name}"
+                    f"{doc_names(doc)}"
                 ),
                 suggested_action=(
                     "Cite the heading the obligation actually came from, or check "
