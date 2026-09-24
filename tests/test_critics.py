@@ -568,3 +568,49 @@ def test_check_reports_staleness_as_json(planned_with_requirements, writ):
         "acceptance",
         "feasibility",
     ]
+
+
+def test_a_critic_may_be_given_a_view_built_for_its_question(tmp_path):
+    """The plan text may be a function of the critic, not one text for all five.
+
+    Only coverage is asked whether a requirement has any way of being verified, and
+    on a real inventory the verification hints are the largest thing in the plan
+    view. Sending them to the other four buys attention spent on a question they are
+    explicitly told is somebody else's.
+    """
+    seen = []
+
+    def view(critic):
+        seen.append(critic.name)
+        return f'{{"for": "{critic.name}"}}'
+
+    prompt = critics.build_prompt(
+        critics.by_name(["scope"])[0],
+        root=tmp_path,
+        doc=None,
+        plan_text=view,
+        report_path=tmp_path / "findings.json",
+    )
+    assert seen == ["scope"]
+    assert '{"for": "scope"}' in prompt
+
+
+def test_a_plain_plan_text_still_reaches_every_critic(tmp_path):
+    """The simple case stays simple: one string, no callable."""
+    prompt = critics.build_prompt(
+        critics.by_name(["scope"])[0],
+        root=tmp_path,
+        doc=None,
+        plan_text='{"tasks": []}',
+        report_path=tmp_path / "findings.json",
+    )
+    assert '{"tasks": []}' in prompt
+
+
+def test_only_the_coverage_critic_asks_for_verification():
+    """The flag matches what the briefs say, so the view follows the question."""
+    wants = {c.name for c in critics.CRITICS if c.reads_verification}
+    assert wants == {"coverage"}
+    for critic in critics.CRITICS:
+        if critic.name == "coverage":
+            assert "way of being verified" in " ".join(critic.checks)

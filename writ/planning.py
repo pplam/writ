@@ -275,7 +275,24 @@ def _artifact_lines(artifacts: Any) -> list[str]:
             "VERIFICATION — how each requirement can be demonstrated. Build your "
             "acceptance criteria from these."
         )
-        for entry in verification.verification:
+        entries = verification.verification
+        methods = [
+            method for entry in entries for method in (entry.get("methods") or [])
+        ]
+        # When nothing exists yet, say it once. On a greenfield plan every one of 177
+        # methods carried `(DOES NOT EXIST YET)` and a `needs first:` line repeating
+        # "build the package and install pytest" — 45KB of the 82KB prompt, saying
+        # the same thing 177 times. The per-method mark only carries information when
+        # some methods exist and others do not.
+        absent = [m for m in methods if m.get("exists") is False]
+        greenfield = bool(methods) and len(absent) == len(methods)
+        if greenfield:
+            lines.append(
+                "  None of the verification below exists in the repository yet, so "
+                "every test named here is itself work: give it a task, or fold it "
+                "into the task whose bar cites it."
+            )
+        for entry in entries:
             req_id = entry.get("requirement_id")
             for method in entry.get("methods", []) or []:
                 detail = (
@@ -283,11 +300,17 @@ def _artifact_lines(artifacts: Any) -> list[str]:
                     or str(method.get("location", "")).strip()
                     or str(method.get("observable", "")).strip()
                 )
-                exists = method.get("exists")
-                mark = "" if exists is not False else "  (DOES NOT EXIST YET)"
+                mark = (
+                    ""
+                    if greenfield or method.get("exists") is not False
+                    else "  (DOES NOT EXIST YET)"
+                )
                 lines.append(f"- {req_id}: {method.get('kind', 'check')} — {detail}{mark}")
+                # `needs` is suppressed under greenfield for the same reason as the
+                # mark: it is 163 near-identical restatements of "this project does
+                # not exist yet", which the one line above already said.
                 needs = str(method.get("needs", "")).strip()
-                if needs:
+                if needs and not greenfield:
                     lines.append(f"    needs first: {needs}")
         for entry in verification.missing_infrastructure:
             blocks = ", ".join(entry.get("blocks", []) or [])

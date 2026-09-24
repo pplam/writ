@@ -159,6 +159,38 @@ OBSERVABLE_HINTS = (
     "validates",
     "blocks",
     "holds",
+    # A criterion that names a test and says what it does is the *most* checkable
+    # shape there is, and the list missed it: `fails` was here and `passes` was not,
+    # so "test_x passes: no row is written" was reported as naming no observable
+    # behaviour. On a real plan that one omission produced 81 of 294 findings.
+    "passes",
+    "passing",
+    "succeeds",
+    "asserts",
+    "no row",
+    "no record",
+    "exists",
+    "stored",
+    "recorded",
+    "returned",
+    "created",
+    "updated",
+    "deleted",
+    "set to",
+    "equal to",
+    "non-empty",
+    "must match",
+    "conforms",
+)
+
+#: a test function or node id, which names something a second party can run.
+#:
+#: `test_foo`, `TestFoo`, `it("...")`, `describe(`, and a pytest node id. A
+#: criterion naming one of these is checkable by construction — you run it — and
+#: treating it as unobservable because it lacks a verb from a fixed list is the
+#: heuristic failing on its best input.
+TEST_NAME_PATTERN = re.compile(
+    r"\b(?:test_\w+|\w+_test\b|Test[A-Z]\w+|it\(|describe\(|::\w+)"
 )
 
 #: file extensions that make a path token recognisable as a path
@@ -335,6 +367,40 @@ class Snapshot:
     def gates(self) -> list[Item]:
         return [item for item in self.items if item.kind == "gate"]
 
+    @property
+    def populated(self) -> bool:
+        """Whether this repository has a source tree for a fence to be wrong about.
+
+        A greenfield project is planned entirely out of files that do not exist, so
+        "this path does not exist" is true of every fence in the plan and evidence
+        of nothing. Reporting it there produced a note per fenced file and buried
+        the findings that mattered underneath them.
+
+        Only a *source* tree counts. A repository holding nothing but the design
+        documents the plan is derived from is greenfield in every way that matters
+        here, and `docs/` is not a fence being right about anything.
+        """
+        if self.root is None or not self.root.is_dir():
+            return False
+        ignore = {
+            ".git",
+            ".writ",
+            ".venv",
+            "node_modules",
+            "__pycache__",
+            "docs",
+            "doc",
+            "design",
+            "designs",
+            "spec",
+            "specs",
+        }
+        for entry in self.root.iterdir():
+            if entry.name in ignore or entry.name.startswith("."):
+                continue
+            if entry.is_dir():
+                return True
+        return False
 
 # --------------------------------------------------------------------------
 # adapters
@@ -611,18 +677,47 @@ def _normalize_criterion(text: str) -> str:
 
 
 def _observable(text: str) -> bool:
-    """Whether a criterion names something a second party could go and check."""
+    """Whether a criterion names something a second party could go and check.
+
+    Deliberately generous. This gates a *warning*, and the cost of the two errors
+    is not symmetric: a missed vague criterion is one finding a critic will also
+    read the plan for, while a false positive on a well-written criterion is noise
+    that buries every real finding beside it. Judging whether a criterion truly
+    demonstrates its requirement is the acceptance critic's job, not a word list's.
+    """
     lowered = text.lower()
     if BACKTICK_PATTERN.search(text) or PATH_PATTERN.search(text):
         return True
+    if TEST_NAME_PATTERN.search(text):
+        return True
     if any(hint in lowered for hint in COMMAND_HINTS):
         return True
+    if _has_measurable_shape(text):
+        return True
     return any(hint in lowered for hint in OBSERVABLE_HINTS)
+
+
+def _has_measurable_shape(text: str) -> bool:
+    """A regex, a number with a unit, a comparison, or a quoted literal.
+
+    "Timestamps match ^\\d{4}-..." states exactly what a reader checks, and names
+    none of the verbs in `OBSERVABLE_HINTS`. So does "within 200ms" and
+    "status is 'rejected'".
+    """
+    if re.search(r"[\^$]|\\d\{|\[\^|\.\*|\+\?", text):
+        return True
+    if re.search(r"\b\d+\s?(?:ms|s|kb|mb|gb|rows?|items?|%)\b", text, re.I):
+        return True
+    if re.search(r"[<>=]=?\s*\d|\bat (?:most|least)\b|\bno more than\b", text, re.I):
+        return True
+    return bool(re.search(r"'[^']{2,}'|\"[^\"]{2,}\"", text))
 
 
 def check_fences(snapshot: Snapshot) -> list[Finding]:
     """Ownership has to be real, self-consistent, and not shared with a sibling."""
     findings: list[Finding] = []
+    #: task id -> the fenced paths that do not exist, reported together below
+    missing: dict[str, list[str]] = {}
     for item in snapshot.items:
         for path in item.allowed:
             if _is_broad(path):
@@ -642,21 +737,88 @@ def check_fences(snapshot: Snapshot) -> list[Finding]:
                     )
                 )
             elif snapshot.root is not None and not _path_exists(snapshot.root, path):
-                findings.append(
-                    Finding(
-                        severity="note",
-                        category="unknown-path",
-                        message=(
-                            f"allowed path {path!r} does not exist yet; fine for a "
-                            "file this task creates, wrong if it is a typo"
-                        ),
-                        where=item.id,
-                        suggested_action="confirm the path, or that the task creates it",
-                    )
-                )
+                missing.setdefault(item.id, []).append(path)
         findings.extend(_contradictory_fence(item))
+    findings.extend(_unknown_paths(snapshot, missing))
     findings.extend(_shared_ownership(snapshot))
     return findings
+
+
+def _unknown_paths(
+    snapshot: Snapshot, missing: dict[str, list[str]]
+) -> list[Finding]:
+    """One finding per task for fences naming paths that do not exist yet.
+
+    A note per path was the single largest source of noise writ produced: on a
+    greenfield plan every file is new, so it fired 104 times on one plan and 221
+    of 294 findings were writ's own checks rather than anything a critic said. The
+    signal is not "this file does not exist" — for a plan that builds the project,
+    that is the normal case and says nothing. It is "this looks like a *typo*",
+    which only shows up in the shape of the path, so that is what is reported.
+
+    Whether the project is greenfield decides the severity of the rest. A path
+    under a directory that exists is worth a note, because its siblings are there
+    and this one is not. A path in a repository that has no source tree at all is
+    not worth reporting: nothing exists, so nothing is evidence.
+    """
+    findings: list[Finding] = []
+    for item_id, paths in missing.items():
+        suspect = [path for path in paths if _looks_like_typo(snapshot.root, path)]
+        if suspect:
+            findings.append(
+                Finding(
+                    severity="warning",
+                    category="suspect-path",
+                    message=(
+                        f"fence names {_count(len(suspect), 'path')} whose parent "
+                        f"directory exists but which do not: "
+                        f"{', '.join(sorted(suspect)[:6])}"
+                        + (" …" if len(suspect) > 6 else "")
+                        + " — a new file here is fine, a misspelt one is not"
+                    ),
+                    where=item_id,
+                    suggested_action=(
+                        "check the spelling against the directory, or confirm the "
+                        "task creates these"
+                    ),
+                )
+            )
+        rest = [path for path in paths if path not in set(suspect)]
+        if rest and snapshot.populated:
+            findings.append(
+                Finding(
+                    severity="note",
+                    category="unknown-path",
+                    message=(
+                        f"fence names {_count(len(rest), 'path')} that do not exist "
+                        f"yet: {', '.join(sorted(rest)[:6])}"
+                        + (" …" if len(rest) > 6 else "")
+                    ),
+                    where=item_id,
+                    suggested_action="confirm the task creates them",
+                )
+            )
+    return findings
+
+
+def _count(n: int, noun: str) -> str:
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
+def _looks_like_typo(root: Path | None, path: str) -> bool:
+    """Whether a missing path sits in a directory that already exists.
+
+    That is the only cheap evidence of a misspelling. `writ/stat.py` next to a real
+    `writ/` is worth a look; `mmm/schema.sql` in a repository with no `mmm/` is just
+    a file the plan is about to create.
+    """
+    if root is None:
+        return False
+    cleaned = _normalize_path(path).strip("/")
+    if not cleaned or "/" not in cleaned:
+        return False
+    parent = root / cleaned.rsplit("/", 1)[0]
+    return parent.is_dir()
 
 
 def _contradictory_fence(item: Item) -> list[Finding]:

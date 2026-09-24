@@ -26,6 +26,8 @@ coverage matrix is derived from them rather than stored twice.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable
 
 from . import plancheck
@@ -45,6 +47,13 @@ RUNNABLE_STATUSES = ("approved", "executing")
 
 #: what a finding's disposition can be once something has answered it
 DISPOSITIONS = ("open", "accepted", "declined", "resolved")
+
+#: how much of a finding's message takes part in its identity.
+#:
+#: Two reports of the same category, in the same place, from the same source, whose
+#: messages start the same way, are the same finding. `_compact_resolved` may not
+#: shorten a message below this.
+_KEY_PREFIX = 120
 
 #: the dispositions a human may set directly.
 #:
@@ -376,7 +385,7 @@ def record_findings(
     for key, payload in by_key.items():
         if key in seen_keys or payload.get("scope") != scope:
             continue
-        if payload.get("source") not in (reporter, None):
+        if not _speaks_for(reporter, payload.get("source")):
             # Somebody else's objection. A pass by this reporter is not evidence
             # about a finding it never looked for.
             continue
@@ -386,7 +395,69 @@ def record_findings(
         payload["resolved_at"] = utcnow()
         payload["resolved_by"] = reporter
         payload["resolved_revision"] = current
+    _compact_resolved(data, current)
     return written
+
+
+#: how many revisions a resolved finding keeps its full text for.
+#:
+#: The ledger never forgets, which is deliberate — `writ show F-0031` has to answer,
+#: and the repeat-finding bound reads history. But it kept every word of every
+#: objection it had ever closed, and on a plan of any size that is most of the file:
+#: prose describing defects that no longer exist. Every agent that loads state pays
+#: for it and none of them reads it. So a finding writ closed, and kept closed across
+#: a revision, is shortened to its first line — enough to say what it was, without
+#: carrying the paragraph that argued it.
+RESOLVED_TEXT_REVISIONS = 1
+
+#: how much of a shortened message is kept.
+#:
+#: At least `_KEY_PREFIX` characters, always. A finding's identity is its category,
+#: place, source and the head of its message, so shortening the message below that
+#: prefix would give the same objection a different key: when it came back it would
+#: file as a new finding, with `seen_count` reset, and the repeat bound that stops a
+#: repair loop retrying the same failed fix would never see the repeat. Truncating
+#: *after* the prefix is invisible to the key.
+RESOLVED_TEXT_CHARS = 160
+
+
+def _compact_resolved(data: dict[str, Any], current: int) -> None:
+    """Shorten the text of findings writ closed a revision or more ago.
+
+    Only `resolved`, which is writ's own mechanical close — a check stopped
+    reporting something. A person's `accepted` or `declined` keeps every word: the
+    text sitting next to a human reason is the record of what they overruled, and
+    that is the one thing in this ledger nobody may summarise.
+
+    What survives is what is still asked of a closed finding: its identity, its
+    history, its resolution, and a first line to read. `suggested_action` goes —
+    advice for fixing a defect that is gone is the largest thing here and the least
+    useful. A finding that returns is rewritten from the fresh report anyway.
+    """
+    for payload in finding_records(data):
+        if payload.get("disposition") != "resolved":
+            continue
+        if payload.get("compacted"):
+            continue
+        resolved_at = payload.get("resolved_revision")
+        if resolved_at is None:
+            continue
+        if current - int(resolved_at) < RESOLVED_TEXT_REVISIONS:
+            continue
+        message = str(payload.get("message", ""))
+        if len(message) > RESOLVED_TEXT_CHARS:
+            payload["message"] = _shorten(message, RESOLVED_TEXT_CHARS)
+        payload.pop("suggested_action", None)
+        payload["compacted"] = True
+
+
+def _shorten(text: str, limit: int) -> str:
+    """Cut `text` to `limit`, on a word boundary, never inside the identity prefix."""
+    head = text[:limit]
+    space = head.rfind(" ")
+    if space > _KEY_PREFIX:
+        head = head[:space]
+    return head.rstrip() + "\u2026"
 
 
 #: actors whose disposition a later check may overturn.
@@ -447,7 +518,7 @@ def _finding_key(payload: dict[str, Any]) -> str:
             str(payload.get("source", "writ")),
             str(payload.get("category", "")),
             str(payload.get("where", "")),
-            str(payload.get("message", ""))[:120],
+            str(payload.get("message", ""))[:_KEY_PREFIX],
         )
     )
 
@@ -514,6 +585,130 @@ def accept_all(data: dict[str, Any], *, actor: str, reason: str) -> list[str]:
 # checking and approving
 
 
+#: the finding sources a reporter's silence is evidence about.
+#:
+#: `writ` covers the staged-planning findings as well as its own, because
+#: `run_check` re-derives them from the artifacts on every check (see
+#: `_stage_findings`). Before it did, a reconcile finding could never close: it was
+#: produced once at plan time, no later check reported it, and no reporter claimed
+#: authority over it — so a `dropped-requirement` the very next patch fixed stayed
+#: open for the life of the plan and counted toward the bound that ends the repair
+#: loop.
+REPORTER_SOURCES: dict[str, tuple[str, ...]] = {
+    "writ": ("writ", "stage:synthesis", "stage:requirements"),
+}
+
+
+def _speaks_for(reporter: str, source: Any) -> bool:
+    """Whether this reporter's silence may close a finding from `source`."""
+    if source in (reporter, None):
+        return True
+    return str(source) in REPORTER_SOURCES.get(reporter, ())
+
+
+def _stage_findings(
+    data: dict[str, Any], *, seen: Iterable[Finding] = ()
+) -> list[Finding]:
+    """Re-derive the staged-planning findings against the graph as it now stands.
+
+    These are `analysis.reconcile`'s — a requirement dropped, invented, replanned, or
+    verified by a method no task cites. They used to be produced once, at plan time,
+    and passed in as `extra`; every later check omitted them, so `record_findings`
+    saw a plan-scoped finding this reporter had not reported and should have closed.
+    It did not, because they carry `source="stage:synthesis"` and only the reporter
+    that raised a finding may close it — so 32 of them sat open at revision 1 while
+    the graph moved to 4, surviving the repair that answered them and counting toward
+    the repeat-finding bound that stops the loop.
+
+    Re-deriving is the fix rather than special-casing the close: a dropped
+    requirement is a fact about the current graph, so the check that reads the graph
+    should be the one that decides. Returns nothing when the artifacts are gone,
+    which leaves the old findings to be closed by the same silence.
+    """
+    from . import analysis
+
+    pipeline = plan_status(data).get("pipeline") or {}
+    directory = str(pipeline.get("directory") or "")
+    if not directory:
+        return []
+    where = Path(directory)
+    if not where.is_dir():
+        return []
+    already = {(f.category, f.where) for f in seen}
+    try:
+        artifacts = analysis.read_all(where)
+    except WritError:
+        # A malformed artifact is not a reason to fail a check. The structural
+        # findings still stand, and the stage's own error surfaces where it is run.
+        return []
+    if artifacts.requirements is None:
+        return []
+    document = _as_document(data)
+    return [
+        finding
+        for finding in analysis.reconcile(document, artifacts)
+        if (finding.category, finding.where) not in already
+    ]
+
+
+@dataclass
+class _PlannedTaskView:
+    """What `analysis.reconcile` reads of a task, from the committed graph."""
+
+    ref: str
+    title: str
+    acceptances: list[str]
+    requirement_ids: list[str]
+
+
+@dataclass
+class _MilestoneView:
+    tasks: list[_PlannedTaskView]
+
+
+@dataclass
+class _DocumentView:
+    """The committed graph shaped as the plan document `reconcile` expects.
+
+    `reconcile` was written against a freshly parsed plan document, and the same
+    questions are askable of the graph — which requirements it states, which tasks
+    claim each one, what their criteria say. Gates are left out: they judge
+    requirements rather than covering them, so counting them would make every
+    obligation look covered.
+    """
+
+    requirements: list[Any]
+    milestones: list[_MilestoneView]
+
+
+def _as_document(data: dict[str, Any]) -> _DocumentView:
+    tasks = [
+        _PlannedTaskView(
+            ref=task["id"],
+            title=task.get("title", ""),
+            acceptances=[
+                str(item.get("text", item)) if isinstance(item, dict) else str(item)
+                for item in (task.get("acceptances") or [])
+            ],
+            requirement_ids=list(task.get("requirement_ids") or []),
+        )
+        for task in sorted(
+            (data.get("tasks") or {}).values(), key=lambda t: t["id"]
+        )
+        if task.get("kind") != "gate"
+    ]
+    return _DocumentView(
+        requirements=[
+            plancheck.Requirement.from_dict(payload)
+            for payload in sorted(
+                (data.get("requirements") or {}).values(),
+                key=lambda r: r.get("id", ""),
+            )
+        ],
+        milestones=[_MilestoneView(tasks=tasks)],
+    )
+
+
 def run_check(
     data: dict[str, Any], *, root: Any = None, extra: Iterable[Finding] = ()
 ) -> list[Finding]:
@@ -535,7 +730,11 @@ def run_check(
     is no longer what is there.
     """
     snapshot = plancheck.from_state(data, root=root)
-    found = plancheck.sort_findings(list(plancheck.check(snapshot)) + list(extra))
+    found = plancheck.sort_findings(
+        list(plancheck.check(snapshot))
+        + list(extra)
+        + _stage_findings(data, seen=extra)
+    )
     record_findings(data, found, scope="plan")
     record = plan_status(data)
     record["checked_at"] = utcnow()

@@ -45,6 +45,7 @@ failed at synthesis does not pay for three analyses again.
 from __future__ import annotations
 
 import json
+import re
 import threading
 from concurrent import futures
 from contextlib import nullcontext
@@ -1249,7 +1250,7 @@ def reconcile(document: Any, artifacts: Artifacts) -> list[Finding]:
                 for task in tasks
                 for criterion in task.acceptances
             )
-            if any(token.lower() in text for token in cited):
+            if _cites_verification(text, cited):
                 continue
             findings.append(
                 Finding(
@@ -1306,6 +1307,56 @@ def reconcile(document: Any, artifacts: Artifacts) -> list[Finding]:
                 )
             )
     return findings
+
+
+def _cites_verification(text: str, cited: Iterable[str]) -> bool:
+    """Whether a task's criteria reference the verification that was worked out.
+
+    A whole-string substring match was too literal to be useful. The verification
+    stage writes `python3 -m pytest -q tests/test_fts.py::test_bm25_lexical_search`
+    and the task states "`pytest tests/test_fts.py::test_bm25_lexical_search`
+    passes" — the same bar, reported as ignored, 32 times on one plan. What actually
+    identifies a method is its *target*: the test node id, or the file path. So the
+    runner prefix, its flags, and the interpreter are stripped and the target is what
+    is compared.
+    """
+    lowered = text.lower()
+    for token in cited:
+        candidate = token.lower().strip()
+        if not candidate:
+            continue
+        if candidate in lowered:
+            return True
+        for target in _verification_targets(candidate):
+            if target and target in lowered:
+                return True
+    return False
+
+
+#: a pytest node id, or a path with a test-ish extension, inside a longer command
+_TARGET_PATTERN = re.compile(
+    r"[\w./-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|kt|rb|sql|sh)(?:::[\w:\[\]-]+)?"
+)
+
+
+def _verification_targets(command: str) -> list[str]:
+    """The parts of a verification method that identify what it checks.
+
+    The node id if there is one, then the path, then the bare test name — each is
+    something a criterion could reasonably cite on its own. Flags and the runner
+    itself are not: every pytest command shares them, so matching on those would
+    pass any criterion that mentioned pytest at all.
+    """
+    targets: list[str] = []
+    for match in _TARGET_PATTERN.findall(command):
+        targets.append(match)
+        if "::" in match:
+            path, _, node = match.partition("::")
+            targets.append(path)
+            leaf = node.rsplit("::", 1)[-1]
+            if leaf:
+                targets.append(leaf)
+    return targets
 
 
 def _covered_requirements(document: Any) -> dict[str, list[Any]]:

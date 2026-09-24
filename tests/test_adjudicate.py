@@ -391,6 +391,115 @@ def test_a_revision_still_may_not_depend_on_nothing(objected, project, monkeypat
     assert "unknown-dependency" in reasons
 
 
+def _big_graph(task_count: int) -> dict:
+    """A committed-shaped graph with one gate and `task_count` ordinary tasks."""
+    tasks = {}
+    for n in range(1, task_count + 1):
+        tasks[f"M01-{n:03d}"] = {
+            "id": f"M01-{n:03d}",
+            "title": f"Task {n}",
+            "kind": "task",
+            "status": "planned",
+            "milestone": "M01",
+            "requirement_ids": [f"REQ-{n:03d}"],
+            "depends_on": [f"M01-{n - 1:03d}"] if n > 1 else [],
+            "allowed": [f"pkg/mod{n}.py"],
+            "acceptances": [{"text": f"`pytest -q tests/test_{n}.py` passes",
+                             "status": "pending"}],
+        }
+    tasks["G-M01"] = {
+        "id": "G-M01",
+        "title": "Storage gate",
+        "kind": "gate",
+        "status": "planned",
+        "milestone": "M01",
+        "requirement_ids": [f"REQ-{n:03d}" for n in range(1, task_count + 1)],
+        "depends_on": [f"M01-{n:03d}" for n in range(1, task_count + 1)],
+        "acceptances": [{"text": "`pytest -q` passes", "status": "pending"}],
+    }
+    return {
+        "tasks": tasks,
+        "milestones": {"M01": {"id": "M01", "title": "Storage"}},
+        "requirements": {
+            f"REQ-{n:03d}": {
+                "id": f"REQ-{n:03d}",
+                "text": f"Obligation {n}",
+                "priority": "must",
+                "status": "planned",
+                "source": "Storage",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "updated_at": "2026-01-01T00:00:00+00:00",
+                "verification": ["x" * 400],
+            }
+            for n in range(1, task_count + 1)
+        },
+        "plan": {"revision": 3},
+    }
+
+
+def test_a_large_plan_is_narrowed_to_what_the_findings_touch():
+    """The adjudicator reads the objection's neighbourhood, not the whole graph.
+
+    A 240KB prompt whose five findings touched six tasks is the shape this bounds.
+    Everything else stays listed by id so the ids remain citable and nothing the
+    patch might depend on is invisible.
+    """
+    data = _big_graph(40)
+    finding = plancheck.Finding(
+        severity="error",
+        category="task-too-broad",
+        message="M01-020 bundles four mechanisms",
+        where="M01-020",
+        requirement_ids=["REQ-020"],
+        source="critic:scope",
+    )
+    narrowed = json.loads(adjudicate._plan_json(data, [finding]))
+    shown = {task["id"] for task in narrowed["tasks"]}
+    assert "M01-020" in shown
+    assert "M01-019" in shown  # what it depends on
+    assert "M01-021" in shown  # what depends on it
+    assert "G-M01" in shown  # the gate that judges it
+    assert "M01-001" not in shown  # the far end of the graph
+    assert len(shown) < 10
+    listed = {task["id"] for task in narrowed["tasks_not_shown"]}
+    assert "M01-001" in listed
+    assert shown | listed == set(data["tasks"])
+    # Smaller, but the index of what is not shown is not free — that is the point of
+    # it. On a real 58-task plan this was 90KB against 223KB.
+    full = adjudicate._plan_json(data, [finding], full=True)
+    assert len(adjudicate._plan_json(data, [finding])) < len(full) * 0.6
+
+
+def test_a_small_plan_is_still_sent_whole():
+    """Below the bound the whole graph is cheaper to send than to explain."""
+    data = _big_graph(4)
+    finding = plancheck.Finding(
+        severity="error",
+        category="task-too-broad",
+        message="M01-002 is too broad",
+        where="M01-002",
+        source="critic:scope",
+    )
+    view = json.loads(adjudicate._plan_json(data, [finding]))
+    assert {task["id"] for task in view["tasks"]} == set(data["tasks"])
+    assert "tasks_not_shown" not in view
+
+
+def test_the_adjudicator_view_drops_verification_hints_and_timestamps():
+    """Requirement rows are sent as the obligation, not as the whole stored record.
+
+    `verification` was the largest field in the inventory and says how a requirement
+    could be demonstrated — which the synthesizer already used. An adjudicator is
+    judged on which ids it covers and whether it weakened a `must`.
+    """
+    view = json.loads(adjudicate._plan_json(_big_graph(3), []))
+    row = view["requirements"][0]
+    assert "verification" not in row
+    assert "created_at" not in row
+    assert row["priority"] == "must"
+    assert row["text"]
+
+
 def test_a_revision_may_not_drop_a_criterion(objected, project, monkeypatch):
     """The failure the review warned about: closing a finding by lowering the bar."""
     patched(
@@ -418,6 +527,112 @@ def test_a_revision_may_not_drop_a_requirement(objected, project, monkeypatch):
     objected("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics")
     task = state.load(project)["tasks"]["M01-001"]
     assert task["requirement_ids"] == ["REQ-001"]
+
+
+def test_a_refusal_says_which_entries_were_sound(objected, project, monkeypatch):
+    """A patch is atomic, so one bad entry costs all of it — say what was fine.
+
+    On the plan this was written for, eleven sound revisions were discarded over one
+    objection to a twelfth, three rounds running, and the adjudicator was told only
+    what broke. The retry should be an edit, not a fresh attempt.
+    """
+    patched(
+        monkeypatch,
+        {
+            "revise_tasks": [
+                {"id": "M01-001", "acceptances": ["it works"]},
+                {
+                    "id": "M01-002",
+                    "notes": "a perfectly sound change to a different task",
+                },
+            ]
+        },
+    )
+    objected("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics")
+    request = repair.plan_request(state.load(project))
+    refusal = (request.get("refusals") or [])[-1]
+    assert refusal["accepted_entries"] == ["revise_tasks: M01-002"]
+    prompt = adjudicate.build_prompt(
+        root=project,
+        doc=None,
+        plan_text="{}",
+        patch_path=project / "patch.json",
+        findings=[],
+        prior_refusals=[plancheck.Finding.from_dict(r) for r in refusal["reasons"]],
+        accepted_entries=refusal["accepted_entries"],
+    )
+    assert "Nothing was wrong with the rest of that patch" in prompt
+    assert "revise_tasks: M01-002" in prompt
+
+
+def test_a_revision_may_move_a_requirement_to_a_task_the_patch_adds(
+    objected, project, monkeypatch
+):
+    """Splitting an overloaded task is not dropping a requirement.
+
+    The deadlock this closes: `task-too-broad` can only be repaired by splitting,
+    splitting means the requirement moves off the task, and the drop check compared
+    the revision against its own before-state alone — so the only valid patch was
+    refused, every round, until the loop ran out. The refusal even suggested
+    "move it to a task this patch adds", which was the one thing it would not allow.
+    """
+    patched(
+        monkeypatch,
+        {
+            "add_tasks": [
+                {
+                    "id": "split-off",
+                    "title": "Fsync the log on append",
+                    "milestone": "M01",
+                    "requirement_ids": ["REQ-001"],
+                    "acceptances": [
+                        "`go test ./store -run Fsync` passes",
+                        "store/fsync.go calls fsync before returning",
+                    ],
+                    "allowed": ["store/fsync.go"],
+                }
+            ],
+            "revise_tasks": [
+                {
+                    "id": "M01-001",
+                    "requirement_ids": [],
+                    "acceptances": [
+                        "a failing test in store/log_test.go reproduces a torn append",
+                        "`go test ./store` passes with appends fsync'd in order",
+                        "store/log.go exposes the writer the split task calls",
+                    ],
+                }
+            ],
+        },
+    )
+    objected("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics")
+    data = state.load(project)
+    assert data["tasks"]["M01-001"]["requirement_ids"] == []
+    moved = [
+        task
+        for task in data["tasks"].values()
+        if task.get("title") == "Fsync the log on append"
+    ]
+    assert len(moved) == 1
+    assert moved[0]["requirement_ids"] == ["REQ-001"]
+
+
+def test_a_gate_does_not_vouch_for_a_requirement_a_revision_drops(
+    objected, project, monkeypatch
+):
+    """A gate judges requirements; it does not implement them.
+
+    Gates carry the union of their milestone's requirement ids, so counting them as
+    coverage would let a revision delete the only task implementing an obligation
+    and have the gate that merely checks it stand in.
+    """
+    patched(
+        monkeypatch,
+        {"revise_tasks": [{"id": "M01-002", "requirement_ids": []}]},
+    )
+    objected("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics")
+    task = state.load(project)["tasks"]["M01-002"]
+    assert task["requirement_ids"] == ["REQ-002"]
 
 
 def test_a_revision_may_not_invent_a_requirement(objected, project, monkeypatch):
