@@ -68,14 +68,13 @@ ids are resolved by shape, so one command serves every kind of thing:
 
 every command accepts --root <project> and --json.
 
-defaults come from <root>/.writ/config.json, so a project's planner, reviewer,
-parallelism — and whether the staged pipeline runs, and which critics read a plan —
-are chosen once rather than retyped. Every flag that is a standing decision is in
-there, under a section named for its command; what is not is anything naming one
-piece of work, the filters on list and coverage, and every --force. A flag always
-overrides it, both ways for a boolean; `writ agents` prints what is in effect.
-`writ init` writes that file holding writ's own defaults, with a line explaining
-each setting, so changing one is an edit rather than a lookup.
+defaults come from <root>/.writ/config.yaml, which holds the choices a project
+makes once: the agent, model and timeout for each role (planner, critic,
+implementer, reviewer), whether `writ plan` runs the critics, repairs and
+auto-approves, how wide `writ run` goes, and the port `writ serve` binds.
+Everything else is a flag. A flag always overrides the file, both ways for a
+boolean; `writ agents` prints what is in effect. `writ init` writes the file
+holding writ's own defaults, with a comment on each setting.
 """
 
 
@@ -107,7 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         default=None,
-        help="machine-readable output where supported (common.json)",
+        help="machine-readable output where supported",
     )
     sub = parser.add_subparsers(
         dest="command", required=True, metavar="<command>", parser_class=_Parser
@@ -115,12 +114,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ---------------------------------------------------------------- setup
     p = sub.add_parser(
-        "init", help="create a Writ project, and a default config.json, in --root"
+        "init", help="create a Writ project, and a default config.yaml, in --root"
     )
     p.add_argument(
         "--force",
         action="store_true",
-        help="reset existing state; your config.json is kept either way",
+        help="reset existing state; your config.yaml is kept either way",
     )
     p.set_defaults(func=commands.cmd_init)
 
@@ -128,7 +127,11 @@ def build_parser() -> argparse.ArgumentParser:
         "plan",
         help="have a coding agent derive milestones and tasks from a design doc",
     )
-    p.add_argument("design", help="path to a markdown design document")
+    p.add_argument(
+        "design",
+        nargs="+",
+        help="markdown design document(s); several are read as one design",
+    )
     p.add_argument(
         "--agent", help="planning agent command (default: agents.planner, else pi)"
     )
@@ -277,7 +280,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=None,
         help=(
-            "run all the critics at once rather than one after another: five agent "
+            "run all the critics at once rather than one after another: two agent "
             "runs' wall-clock for one. Only one of them runs the test suite, and "
             "the rest are told to leave it alone"
         ),
@@ -334,10 +337,121 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="print the planning prompt, or a previewed plan, without writing state",
     )
-    # Not a flag: a slot only the config fills, so `plan.critics: true` can run the
-    # set `critique.critics` names without that set being restated under `plan`.
-    # `--critics coverage` still names them outright and still wins.
-    p.set_defaults(func=commands.cmd_plan, critic_names=None)
+    p.set_defaults(func=commands.cmd_plan)
+
+    p = sub.add_parser(
+        "build",
+        help="plan the design if it is not planned yet, then run the plan",
+        description=(
+            "`writ plan` then `writ run`, in one command. The plan is approved on "
+            "the way through when no blocking finding stands against it; one that "
+            "does stops the build for `writ approve` or a fix, and `writ build` "
+            "again carries on. With a plan already in place, build runs it: name "
+            "no design, or only designs it already covers. A new design is planned "
+            "onto the existing graph only with --append.\n\n"
+            "Each step reads the config as it would alone. The flags below are "
+            "the ones worth setting for a whole build; anything after `--` goes "
+            "to every agent."
+        ),
+    )
+    p.add_argument(
+        "design",
+        nargs="*",
+        help="markdown design document(s); optional once a plan exists",
+    )
+    group = p.add_argument_group("planning")
+    group.add_argument(
+        "--planner", metavar="CMD", help="planning agent (default: agents.planner)"
+    )
+    group.add_argument("--planner-model", metavar="NAME", help="model for the planner")
+    group.add_argument(
+        "--instructions", help="extra guidance for the planner (wins over the doc)"
+    )
+    group.add_argument(
+        "--critics",
+        nargs="*",
+        metavar="NAME",
+        help="have critics read the plan before it is approved (default: plan.critics)",
+    )
+    group.add_argument(
+        "--no-critics", dest="critics", action="store_false", help="skip the critics"
+    )
+    group.add_argument(
+        "--critic", metavar="CMD", help="agent for the critics and repairs"
+    )
+    group.add_argument("--critic-model", metavar="NAME", help="model for the critics")
+    group.add_argument(
+        "--repair",
+        action="store_true",
+        default=None,
+        help="repair blocking findings before approval (default: plan.repair)",
+    )
+    group.add_argument(
+        "--no-repair", dest="repair", action="store_false", help="do not repair"
+    )
+    group.add_argument(
+        "--max-rounds", type=int, metavar="N", help="repairs before stopping (--repair)"
+    )
+    group.add_argument(
+        "--no-auto-approve",
+        action="store_true",
+        help="stop after planning for a human to `writ approve`",
+    )
+    group.add_argument(
+        "--append",
+        action="store_true",
+        help="plan a design the existing plan does not cover onto its graph",
+    )
+    group = p.add_argument_group("running")
+    group.add_argument(
+        "--agent", help="implementing agent (default: agents.implementer, else pi)"
+    )
+    group.add_argument("--model", help="model for the implementing agent")
+    group.add_argument(
+        "--timeout", type=int, help="seconds before killing an implementing agent"
+    )
+    group.add_argument(
+        "--reviewer", help="reviewer command (default: agents.reviewer, else --agent)"
+    )
+    group.add_argument("--reviewer-model", help="model for the reviewer")
+    group.add_argument(
+        "--reviewer-timeout",
+        type=int,
+        metavar="S",
+        help="seconds before killing a reviewer",
+    )
+    group.add_argument(
+        "--parallel", "-p", type=int, metavar="N", help="agents to run at once"
+    )
+    group.add_argument(
+        "--max-tasks", type=int, metavar="N", help="stop after starting N tasks"
+    )
+    group.add_argument(
+        "--max-rework", type=int, metavar="N", help="re-dispatches of a rejected task"
+    )
+    group.add_argument(
+        "--order", choices=ORDERS, help="which ready task to start first"
+    )
+    group.add_argument(
+        "--no-stream",
+        action="store_true",
+        default=None,
+        help="do not mirror the agents' own output; report transitions only",
+    )
+    p.add_argument("--cwd", help="working directory for the agents (default: --root)")
+    p.add_argument(
+        "--quiet", "-q", action="store_true", default=None, help="print less"
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=None,
+        help=(
+            "print the planning prompt when there is a design to plan, else the "
+            "intended walk; change nothing"
+        ),
+    )
+    p.set_defaults(func=commands.cmd_build)
 
     p = sub.add_parser(
         "check",
@@ -447,7 +561,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=None,
         help=(
-            "run all the critics at once rather than one after another: five agent "
+            "run all the critics at once rather than one after another: two agent "
             "runs' wall-clock for one. Only one of them runs the test suite, and "
             "the rest are told to leave it alone"
         ),
@@ -514,14 +628,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-clear",
         action="store_true",
         default=None,
-        help="with --watch, do not clear the screen (status.clear)",
+        help="with --watch, do not clear the screen",
     )
     p.add_argument(
         "--clear",
         dest="no_clear",
         action="store_false",
         default=None,
-        help="with --watch, clear the screen even if status.clear is false",
+        help="with --watch, clear the screen (the default)",
     )
     p.set_defaults(func=commands.cmd_status)
 
@@ -651,7 +765,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--host",
         help=(
-            f"interface to bind (default {DEFAULT_HOST}, or serve.host; this "
+            f"interface to bind (default {DEFAULT_HOST}; this "
             "machine only)"
         ),
     )
@@ -659,18 +773,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-open",
         action="store_true",
         default=None,
-        help="print the url instead of opening a browser (serve.open)",
+        help="print the url instead of opening a browser",
     )
-    # The positive of the flag above, so `serve.open: false` in a config is still
-    # overridable for one run. Without it the config could only be argued with in
-    # one direction, and "a flag always wins" would be true of every setting but
-    # the two spelled negatively.
     p.add_argument(
         "--open",
         dest="no_open",
         action="store_false",
         default=None,
-        help="open a browser even if serve.open is false",
+        help="open a browser (the default)",
     )
     p.set_defaults(func=commands.cmd_serve)
 
@@ -1013,8 +1123,10 @@ def main(argv: list[str] | None = None) -> int:
         # Between parsing and running: the flags say what this invocation wants,
         # and anything they left unset comes from the project's own defaults. A
         # malformed config fails here, before an agent is started, rather than
-        # three tasks into a run.
-        args.resolved_from = config.apply(args, config.load(args.root))
+        # three tasks into a run. Except under `init`, which is how an old or
+        # broken config gets replaced, so it cannot be the thing that stops it.
+        loaded = {} if args.command == "init" else config.load(args.root)
+        args.resolved_from = config.apply(args, loaded)
         result = args.func(args)
     except WritError as exc:
         print(f"writ: {exc}", file=sys.stderr)

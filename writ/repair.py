@@ -8,9 +8,12 @@ the work the plan had missed.
 There are two occasions for it, and they share everything but their trigger. A
 **gate** asks for repair when a milestone's work did not compose. A **plan** asks
 before anything has run, when the deterministic checks and the critics have found
-something and there is no agent whose job is to fix it. Both produce a request,
-both are adjudicated by a planner that proposes a patch, and both are bounded so a
-finding that survives repair reaches a human instead of another round.
+something and there is no agent whose job is to fix it. Both produce a request
+and both are bounded, so a finding that survives repair reaches a human instead
+of another round. They differ in how the change is expressed: a gate's planner
+proposes an add-only patch, validated and applied here, because work around it
+has already run; a plan's adjudicator edits a working copy of the plan files,
+which `adjudicate.py` validates and promotes, because nothing has.
 
 Its shape is set by one rule from the review:
 
@@ -107,51 +110,6 @@ PATCH_SCHEMA = """\
   ]
 }"""
 
-#: what a pre-execution adjudicator may propose, on top of `PATCH_SCHEMA`.
-#:
-#: `revise_tasks` exists only here, and the reason is the whole difference between
-#: the two occasions. A gate repair happens mid-run: tasks are completed or in
-#: flight, their contracts have been reviewed against, and rewriting one would
-#: change a bar somebody already met. Before execution nothing has run, so a task
-#: whose criteria are too vague can simply be *fixed* — which is what most critic
-#: findings actually call for. Adding a task to compensate for a weak criterion on
-#: another task would be a worse plan, not a repaired one.
-REVISE_SCHEMA = """\
-{
-  "revise_tasks": [
-    {
-      "id": "M01-002",
-      "resolves_findings": ["F-0007"],
-      "title": "optional: a clearer title",
-      "notes": "optional: why this task exists",
-      "acceptances": [
-        "every criterion the task should be held to, including the ones it already had",
-        "`pytest -q tests/test_parser.py` passes"
-      ],
-      "allowed": ["writ/parser.py", "tests/test_parser.py"],
-      "forbidden": [],
-      "requirement_ids": ["REQ-001"],
-      "depends_on": ["M01-001"]
-    }
-  ]
-}"""
-
-PLAN_PATCH_RULES = """\
-This plan has not run yet, so you may also revise the tasks that are in it:
-
-8. `revise_tasks` replaces the fields you name on an existing task. Every field is
-   optional except `id`. Omit a field to leave it alone.
-9. `acceptances`, `allowed`, `forbidden`, `requirement_ids` and `depends_on` are
-   replacements, not additions: list the whole set you want the task to end with,
-   including what it already has. Writ refuses a revision that drops a requirement
-   the task covered or that leaves it with fewer criteria than it had, because that
-   lowers the bar instead of fixing it.
-10. Prefer revising the task a finding is about over adding a new one. A vague
-    criterion is fixed by writing a better criterion on that task, not by adding a
-    task to check up on it.
-11. You may not revise a task that is running, reviewing, completed or failed. If
-    one needs to change, raise a question."""
-
 PATCH_RULES = """\
 Rules for the patch:
 1. Repair the findings you were given. Do not re-plan the project, do not tidy
@@ -190,13 +148,12 @@ class Patch:
     analysis: str = ""
     add_tasks: list[dict[str, Any]] = field(default_factory=list)
     add_dependencies: list[dict[str, Any]] = field(default_factory=list)
-    revise_tasks: list[dict[str, Any]] = field(default_factory=list)
     dispositions: list[dict[str, Any]] = field(default_factory=list)
     questions: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def empty(self) -> bool:
-        return not self.add_tasks and not self.add_dependencies and not self.revise_tasks
+        return not self.add_tasks and not self.add_dependencies
 
 
 def requests(data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -498,7 +455,6 @@ def load_patch(text: str) -> Patch:
         add_dependencies=_list_of_objects(
             payload.get("add_dependencies"), "add_dependencies"
         ),
-        revise_tasks=_list_of_objects(payload.get("revise_tasks"), "revise_tasks"),
         dispositions=_list_of_objects(payload.get("dispositions"), "dispositions"),
         questions=_list_of_objects(payload.get("questions"), "questions"),
     )
@@ -562,285 +518,8 @@ def validate(
         )
     found.extend(_validate_new_tasks(data, patch, request))
     found.extend(_validate_edges(data, patch, request))
-    found.extend(_validate_revisions(data, patch, request))
     found.extend(_validate_dispositions(data, patch, request))
     return plancheck.sort_findings(found)
-
-
-def _validate_revisions(
-    data: dict[str, Any], patch: Patch, request: dict[str, Any]
-) -> list[Finding]:
-    """A revision may raise a task's bar or sharpen it. It may not lower it.
-
-    Writ cannot judge whether a rewritten criterion is *better* — that is what the
-    acceptance critic is for, and it reads the plan again after this lands. What it
-    can prove is that the revision did not quietly drop an obligation: a
-    requirement the task covered, or a criterion it no longer has. Both are the
-    failure the review warned about, where a repair closes a finding by deleting
-    what could not be satisfied.
-    """
-    found: list[Finding] = []
-    existing = data.get("tasks", {})
-    known_requirements = set(data.get("requirements", {}))
-    # The ids this same patch is adding. A revision may depend on one of them: the
-    # commonest plan repair is "the work this task needs does not exist yet", whose
-    # answer is one new task plus an edge to it from the task that needs it. Judging
-    # the revision against the *committed* graph alone refuses that patch for naming
-    # a task the patch itself is introducing, and the adjudicator's only way out is
-    # to drop the edge — which is the finding, unrepaired.
-    proposed_ids = {
-        str(entry.get("id", "")).strip()
-        for entry in patch.add_tasks
-        if str(entry.get("id", "")).strip()
-    }
-    # Every requirement this patch leaves covered, anywhere. A revision that stops
-    # covering an obligation is only dropping it if *nothing else in the same patch*
-    # picks it up — and splitting one overloaded task into two is exactly a patch
-    # where something else does. Judging each revision against its own before-state
-    # alone refused the only valid repair for `task-too-broad`: the adjudicator
-    # moved the requirement to a task the same patch added, was told it had dropped
-    # it, and had no move left that would not be refused for the same reason.
-    covered_by_patch = _patch_coverage(data, patch)
-    for index, entry in enumerate(patch.revise_tasks):
-        where = f"{request['id']}.revise_tasks[{index}]"
-        ref = str(entry.get("id", "")).strip()
-        if not ref:
-            found.append(
-                Finding(
-                    severity="error",
-                    category="patch-shape",
-                    message="a revision names no task",
-                    where=where,
-                    suggested_action="state the `id` of the task to revise",
-                    source="writ",
-                )
-            )
-            continue
-        task = existing.get(ref)
-        if task is None:
-            found.append(
-                Finding(
-                    severity="error",
-                    category="unknown-task",
-                    message=f"revises {ref}, which is not a task in this plan",
-                    where=where,
-                    suggested_action="name a task that exists, or add a new one",
-                    source="writ",
-                )
-            )
-            continue
-        if not is_plan_request(request):
-            found.append(
-                Finding(
-                    severity="error",
-                    category="revision-after-start",
-                    message=(
-                        f"revises {ref}, but this is a gate repair: the plan is "
-                        "already executing and a task's contract does not change "
-                        "underneath it"
-                    ),
-                    where=where,
-                    suggested_action="add a task that fixes the problem instead",
-                    source="writ",
-                )
-            )
-            continue
-        status = task.get("status")
-        if status != "planned":
-            found.append(
-                Finding(
-                    severity="error",
-                    category="revision-after-start",
-                    message=(
-                        f"revises {ref}, which is {status}; only a task that has "
-                        "not started can be rewritten"
-                    ),
-                    where=where,
-                    suggested_action=(
-                        "add a task that fixes the problem, or raise a question"
-                    ),
-                    source="writ",
-                )
-            )
-            continue
-        if task.get("kind") == "gate":
-            found.append(
-                Finding(
-                    severity="error",
-                    category="revision-of-gate",
-                    message=(
-                        f"revises {ref}, which is a gate; a gate's criteria are the "
-                        "plan's own bar and are not an adjudicator's to rewrite"
-                    ),
-                    where=where,
-                    suggested_action="revise the tasks the gate judges instead",
-                    source="writ",
-                )
-            )
-            continue
-        found.extend(
-            _validate_revision_fields(
-                data,
-                entry,
-                task,
-                where,
-                known_requirements,
-                proposed_ids=proposed_ids,
-                covered_by_patch=covered_by_patch,
-            )
-        )
-    return found
-
-
-def _patch_coverage(data: dict[str, Any], patch: Patch) -> set[str]:
-    """Every requirement still covered once this whole patch has been applied.
-
-    The graph as it would be *after* the patch, not before: tasks the patch adds
-    contribute their requirements, a revised task contributes what its revision
-    states rather than what it holds now, and every task the patch does not mention
-    contributes what it already has. That is the set a "dropped" requirement has to
-    be missing from, because a requirement moved from an overloaded task to a new
-    one has not been dropped by the plan — only by that task.
-    """
-    revised = {
-        str(entry.get("id", "")).strip(): entry
-        for entry in patch.revise_tasks
-        if str(entry.get("id", "")).strip()
-    }
-    covered: set[str] = set()
-    for task_id, task in (data.get("tasks") or {}).items():
-        # Gates are skipped. A gate carries the union of the requirements its
-        # milestone's tasks claim, so counting it would make every requirement look
-        # covered by something and this check could never fire: a revision could
-        # drop the one task that implements an obligation and the gate that merely
-        # judges it would vouch for it.
-        if task.get("kind") == "gate":
-            continue
-        entry = revised.get(str(task_id))
-        if entry is not None and "requirement_ids" in entry:
-            source: Iterable[Any] = entry.get("requirement_ids") or ()
-        else:
-            source = task.get("requirement_ids") or ()
-        covered.update(str(req) for req in source)
-    for entry in patch.add_tasks:
-        covered.update(str(req) for req in (entry.get("requirement_ids") or ()))
-    return covered
-
-
-def _validate_revision_fields(
-    data: dict[str, Any],
-    entry: dict[str, Any],
-    task: dict[str, Any],
-    where: str,
-    known_requirements: set[str],
-    *,
-    proposed_ids: frozenset[str] | set[str] = frozenset(),
-    covered_by_patch: set[str] | None = None,
-) -> list[Finding]:
-    found: list[Finding] = []
-    ref = task["id"]
-    if "acceptances" in entry:
-        proposed = entry.get("acceptances")
-        if not isinstance(proposed, list) or not proposed:
-            found.append(
-                Finding(
-                    severity="error",
-                    category="weakened-acceptance",
-                    message=f"revision of {ref} leaves it with no acceptance criteria",
-                    where=where,
-                    suggested_action="state the whole set the task should be held to",
-                    source="writ",
-                )
-            )
-        elif len(proposed) < len(task.get("acceptances") or []):
-            found.append(
-                Finding(
-                    severity="error",
-                    category="weakened-acceptance",
-                    message=(
-                        f"revision of {ref} states {len(proposed)} criteria where it "
-                        f"had {len(task.get('acceptances') or [])}; `acceptances` "
-                        "replaces the set, so this drops a bar"
-                    ),
-                    where=where,
-                    suggested_action=(
-                        "include every criterion the task should keep, or raise a "
-                        "question if one is genuinely wrong"
-                    ),
-                    source="writ",
-                )
-            )
-    if "requirement_ids" in entry:
-        proposed = {str(req) for req in (entry.get("requirement_ids") or [])}
-        held = {str(req) for req in (task.get("requirement_ids") or [])}
-        # What this task stops covering, minus whatever the rest of the patch
-        # takes on. The message already told the adjudicator it could "move it to
-        # a task this patch adds"; this is the check finally agreeing with it.
-        elsewhere = set() if covered_by_patch is None else set(covered_by_patch)
-        dropped = sorted(held - proposed - elsewhere)
-        if dropped:
-            found.append(
-                Finding(
-                    severity="error",
-                    category="dropped-requirement",
-                    message=(
-                        f"revision of {ref} stops covering {', '.join(dropped)}, "
-                        "which nothing else in the patch takes on"
-                    ),
-                    where=where,
-                    suggested_action=(
-                        "keep the requirement on this task, or move it to a task "
-                        "this patch adds"
-                    ),
-                    source="writ",
-                )
-            )
-        for req_id in sorted(proposed - held):
-            if req_id not in known_requirements:
-                found.append(
-                    Finding(
-                        severity="error",
-                        category="unknown-requirement",
-                        message=(
-                            f"revision of {ref} claims requirement {req_id}, which "
-                            "is not in the inventory"
-                        ),
-                        where=where,
-                        suggested_action=(
-                            "reference a real requirement; a repair may not invent "
-                            "obligations"
-                        ),
-                        source="writ",
-                    )
-                )
-    if "depends_on" in entry:
-        tasks = data.get("tasks", {})
-        for dep in entry.get("depends_on") or []:
-            if str(dep) == ref:
-                found.append(
-                    Finding(
-                        severity="error",
-                        category="self-dependency",
-                        message=f"revision of {ref} makes it depend on itself",
-                        where=where,
-                        suggested_action="depend on the work it actually needs",
-                        source="writ",
-                    )
-                )
-            elif str(dep) not in tasks and str(dep) not in proposed_ids:
-                found.append(
-                    Finding(
-                        severity="error",
-                        category="unknown-dependency",
-                        message=f"revision of {ref} depends on unknown {dep}",
-                        where=where,
-                        suggested_action=(
-                            "depend on a task that exists, or on one this patch adds"
-                        ),
-                        source="writ",
-                    )
-                )
-    return found
 
 
 def _validate_new_tasks(
@@ -1116,15 +795,10 @@ def _validate_dispositions(
 
 
 def _closes(patch: Patch, finding_id: str) -> bool:
-    """Whether some proposed change claims to close this finding.
-
-    A revision counts. Before execution most findings are closed by fixing the task
-    the finding is about, so requiring a *new* task to claim every accepted finding
-    would push the adjudicator into adding tasks it does not need.
-    """
+    """Whether some proposed task claims to close this finding."""
     return any(
         finding_id in (entry.get("resolves_findings") or [])
-        for entry in (*patch.add_tasks, *patch.revise_tasks)
+        for entry in patch.add_tasks
     )
 
 
@@ -1152,8 +826,8 @@ def apply_patch(
 
     A plan-scoped request has no gate, so none of the gate half applies: nothing is
     held, nothing needs re-arming, and the new tasks are numbered into the milestone
-    the patch names. What it can do instead is revise the tasks already there, which
-    is safe precisely because none of them has started.
+    the patch names. A plan that has not run is repaired by editing a working copy
+    instead (see `adjudicate.py`); this path remains for a caller that only adds.
     """
     from . import gates
 
@@ -1216,7 +890,6 @@ def apply_patch(
         if target not in task["depends_on"]:
             task["depends_on"].append(target)
             task["updated_at"] = utcnow()
-    revised = _apply_revisions(data, patch, request, translate=translate)
     if gate is not None:
         # The gate waits for its repair. Without this the gate is ready the moment
         # it is un-held and would re-review the identical tree.
@@ -1246,7 +919,6 @@ def apply_patch(
     request["status"] = "applied"
     request["applied_at"] = utcnow()
     request["applied_tasks"] = added
-    request["revised_tasks"] = revised
     request["analysis"] = patch.analysis
     request["questions"] = list(patch.questions)
     check_dag(data)
@@ -1254,96 +926,10 @@ def apply_patch(
     plans.bump(data)
     return {
         "tasks": added,
-        "revised": revised,
         "gate": gate["id"] if gate is not None else "",
         "scope": scope_of(request),
         "revision": plans.revision(data),
     }
-
-
-def _apply_revisions(
-    data: dict[str, Any],
-    patch: Patch,
-    request: dict[str, Any],
-    *,
-    translate: dict[str, str] | None = None,
-) -> list[str]:
-    """Replace the named fields on each revised task.
-
-    Only the fields the patch states. A revision that mentions `acceptances` and
-    nothing else leaves the fence, the requirements and the edges exactly as they
-    were — which is what makes a narrow fix narrow, and keeps the diff a reader has
-    to check small.
-
-    `translate` maps the ids a patch used for the tasks it adds onto the ids writ
-    minted for them. A revision may depend on a task the same patch adds, and the
-    patch calls it by the name it proposed; without the mapping that edge names
-    nothing and is dropped, so the patch would apply having silently left out the
-    ordering it was written to add.
-    """
-    revised: list[str] = []
-    for entry in patch.revise_tasks:
-        ref = str(entry.get("id", "")).strip()
-        task = data.get("tasks", {}).get(ref)
-        if task is None:
-            continue
-        if "title" in entry and str(entry.get("title", "")).strip():
-            task["title"] = str(entry["title"]).strip()
-        if "notes" in entry:
-            task["notes"] = str(entry.get("notes", "")).strip()
-        if "acceptances" in entry:
-            # A criterion is a record, not a string: it carries the status a
-            # reviewer will set. A revision states the text, so the status of a
-            # criterion whose wording is unchanged is carried over and a new one
-            # starts `pending` — otherwise re-stating a task's existing criteria
-            # would silently reset whatever had been signed off.
-            held = {
-                str(item.get("text", "")): item
-                for item in (task.get("acceptances") or [])
-                if isinstance(item, dict)
-            }
-            revised_criteria = []
-            for item in entry.get("acceptances") or []:
-                text = str(item.get("text", item)) if isinstance(item, dict) else str(item)
-                existing = held.get(text)
-                revised_criteria.append(
-                    dict(existing) if existing else {"text": text, "status": "pending"}
-                )
-            task["acceptances"] = revised_criteria
-        for key in ("allowed", "forbidden"):
-            if key in entry:
-                task[key] = [str(path) for path in (entry.get(key) or [])]
-        if "requirement_ids" in entry:
-            task["requirement_ids"] = [
-                str(req) for req in (entry.get("requirement_ids") or [])
-            ]
-        if "depends_on" in entry:
-            mapped = translate or {}
-            wanted = [
-                mapped.get(str(dep), str(dep))
-                for dep in (entry.get("depends_on") or [])
-            ]
-            task["depends_on"] = [
-                dep for dep in wanted if dep in data["tasks"] and dep != ref
-            ]
-        history = task.setdefault("revisions", [])
-        history.append(
-            {
-                "request": request["id"],
-                "at": utcnow(),
-                "resolves": [
-                    str(item) for item in (entry.get("resolves_findings") or [])
-                ],
-                "fields": sorted(
-                    key
-                    for key in entry
-                    if key not in ("id", "resolves_findings")
-                ),
-            }
-        )
-        task["updated_at"] = utcnow()
-        revised.append(ref)
-    return revised
 
 
 def _next_repair_id(

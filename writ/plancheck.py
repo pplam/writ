@@ -1,23 +1,24 @@
 """Deterministic plan review: what Writ can prove about a plan by itself.
 
-A plan can be perfectly well-formed and still be a bad plan. `planning.load_plan`
-checks that the JSON has the fields it needs and `model.check_dag` checks that the
-graph is legal, and neither of them can tell you that a task's only acceptance
-criterion is "it works", that two tasks meant to run side by side both own
-`writ/state.py`, or that a requirement the design states has no task at all.
+`planning.load_document` checks that the JSON has the fields it needs and
+`model.check_dag` checks that the graph is legal. This module checks the rest of
+what is mechanical, and only that: the shape of each feature, whether every
+requirement ends somewhere, whether every interface a feature consumes has a
+provider, and whether the graph is acyclic. Anything that needs reading — is
+this the right split, will this approach work here — belongs to the critics in
+`critics.py`.
 
-Those are the failures that survive validation and surface hours later as an agent
-stuck on a bar it cannot meet. Judging a plan is mostly a judgement call — that is
-what the critics in `critics.py` are for — but a useful share of it is mechanical,
-and anything mechanical should be settled before tokens are spent on it. This
-module is that share: it reads a plan, or the committed graph, and returns
-`Finding` records.
+What used to be here besides, and is not any more: heuristics about acceptance
+wording, paths that do not exist yet, and two tasks naming the same file. On a
+plan for code that is not written yet, every one of them fired on work the plan
+was proposing rather than on a defect, and the repair loop spent its rounds
+answering them. File and test names are the executing agent's call now (see
+`contracts.py` and docs/planning-redesign.md §4).
 
 Findings are not exceptions. A plan with errors is still written down, because a
 human reading the whole plan next to the objections is in a far better position
 than one reading a single raised error with no plan attached. What errors do block
-is *execution*: they hold the plan at `needs-approval` (see `plans.py`), so the
-gate is explicit and a human can overrule it on the record.
+is *execution*: they hold the plan at `needs-approval` (see `plans.py`).
 
 Two entry points, one check set: `from_plan` reads a plan document before its ids
 exist, `from_state` reads the committed graph. Same checks either way, so
@@ -25,199 +26,31 @@ exist, `from_state` reads the committed graph. Same checks either way, so
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from . import contracts
+
 #: severity ordering, worst first. Only `error` blocks approval.
 SEVERITIES = ("error", "warning", "note")
 
-#: acceptance wording that is never checkable, whatever the task is. Each entry
-#: is matched as a substring of the lowercased criterion.
-VAGUE_PHRASES = (
-    "works correctly",
-    "works as expected",
-    "works as intended",
-    "it works",
-    "code is clean",
-    "clean code",
-    "fully implemented",
-    "implementation is complete",
-    "implemented correctly",
-    "all requirements met",
-    "all requirements are met",
-    "meets all requirements",
-    "the complete product works",
-    "no bugs",
-    "bug free",
-    "bug-free",
-    "production ready",
-    "production-ready",
-    "properly implemented",
-    "is correct",
-    "looks good",
-    "makes sense",
-    "well tested",
-    "well-tested",
-    "good test coverage",
-    "as appropriate",
-    "where appropriate",
-    "if necessary",
-)
-
-#: bars that are only unmeetable when the task is fenced. A task allowed to touch
-#: the whole repository may legitimately be asked to leave the suite green; one
-#: fenced to `parser/` cannot be, because a sibling's half-finished module fails
-#: it for reasons this agent may not touch.
-SUITE_WIDE_PHRASES = (
-    "whole suite",
-    "all tests pass",
-    "all the tests pass",
-    "entire test suite",
-    "full test suite",
-    "every test passes",
-    "whole test suite",
-    "complete test suite",
-    "all existing tests",
-)
-
-#: titles that describe the project rather than one bounded session
-WHOLE_PROJECT_TITLES = (
-    "implement the design",
-    "implement the entire",
-    "implement everything",
-    "implement the whole",
-    "build the entire",
-    "build the whole",
-    "build everything",
-    "complete the design",
-    "the entire feature",
-    "the whole feature",
-    "do the rest",
-    "finish the project",
-)
-
-#: tokens that make a criterion something a second party can re-run or re-read
-COMMAND_HINTS = (
-    "pytest",
-    "npm ",
-    "npx ",
-    "yarn ",
-    "make ",
-    "go test",
-    "go build",
-    "go vet",
-    "cargo ",
-    "mvn ",
-    "gradle",
-    "tox",
-    "ruff",
-    "mypy",
-    "eslint",
-    "tsc",
-    "writ ",
-    "curl ",
-    "docker ",
-    "python -m",
-    "bash ",
-    "./",
-    "$ ",
-)
-
-#: verbs that name an observable outcome rather than an internal state of mind
-OBSERVABLE_HINTS = (
-    "returns",
-    "rejects",
-    "accepts",
-    "prints",
-    "exits",
-    "fails",
-    "raises",
-    "logs",
-    "persists",
-    "appends",
-    "writes",
-    "reads",
-    "matches",
-    "produces",
-    "responds",
-    "emits",
-    "renders",
-    "contains",
-    "reports",
-    "refuses",
-    "round-trips",
-    "round trips",
-    "is rejected",
-    "is recorded",
-    "is written",
-    "replays",
-    "surfaces",
-    "shows",
-    "lists",
-    "validates",
-    "blocks",
-    "holds",
-    # A criterion that names a test and says what it does is the *most* checkable
-    # shape there is, and the list missed it: `fails` was here and `passes` was not,
-    # so "test_x passes: no row is written" was reported as naming no observable
-    # behaviour. On a real plan that one omission produced 81 of 294 findings.
-    "passes",
-    "passing",
-    "succeeds",
-    "asserts",
-    "no row",
-    "no record",
-    "exists",
-    "stored",
-    "recorded",
-    "returned",
-    "created",
-    "updated",
-    "deleted",
-    "set to",
-    "equal to",
-    "non-empty",
-    "must match",
-    "conforms",
-)
-
-#: a test function or node id, which names something a second party can run.
-#:
-#: `test_foo`, `TestFoo`, `it("...")`, `describe(`, and a pytest node id. A
-#: criterion naming one of these is checkable by construction — you run it — and
-#: treating it as unobservable because it lacks a verb from a fixed list is the
-#: heuristic failing on its best input.
-TEST_NAME_PATTERN = re.compile(
-    r"\b(?:test_\w+|\w+_test\b|Test[A-Z]\w+|it\(|describe\(|::\w+)"
-)
-
-#: file extensions that make a path token recognisable as a path
-PATH_PATTERN = re.compile(
-    r"[\w./-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|kt|rb|sql|md|json|yaml|yml|toml|sh|c|h|cpp|cs)\b"
-)
-BACKTICK_PATTERN = re.compile(r"`[^`]+`")
-
-#: how many acceptance criteria a generated task should state
-#: the criteria writ writes itself when a design section states none.
-#:
-#: Checked against so the per-criterion checks do not fault the plan's author for
-#: words writ supplied. They are unobservable by construction — they have to be,
-#: to fit any task — and twelve warnings about writ's own boilerplate bury the
-#: one finding that matters, which is that this task has no bar of its own.
-GENERIC_ACCEPTANCES = (
-    "behavior specified by this section is implemented",
-    "a failing test preceded the implementation and now passes",
-    "project build tests and lint pass",
-    "agent reported assumptions deviations and remaining risks",
-)
-
+#: how many acceptance criteria a milestone task should state
 MIN_ACCEPTANCES = 2
 MAX_ACCEPTANCES = 6
 
-#: `allowed` entries that fence a task to nothing in particular
-BROAD_PATHS = ("", ".", "./", "/", "*", "**", "all", "everything", "repo", "root")
+#: a feature's behaviours: fewer is a feature nobody can judge done, more is two
+#: features
+MIN_BEHAVIOURS = 3
+MAX_BEHAVIOURS = 6
+
+#: past this many requirements, one agent is not building one subsystem
+MAX_FEATURE_REQUIREMENTS = 6
+
+#: how many features a plan should have. Advisory: a small document may need
+#: three, and that is a judgement for the critics rather than a rule.
+MIN_FEATURES = 4
+MAX_FEATURES = 12
 
 REQUIREMENT_PRIORITIES = ("must", "should", "may")
 REQUIREMENT_STATUSES = ("planned", "existing", "out-of-scope", "deferred")
@@ -304,10 +137,11 @@ class Item:
     kind: str = "task"
     milestone: str = ""
     status: str = "planned"
-
-    @property
-    def fenced(self) -> bool:
-        return bool(self.allowed)
+    #: set on a feature (see `contracts.py`); empty on a milestone task
+    owns: list[str] = field(default_factory=list)
+    provides: list[str] = field(default_factory=list)
+    consumes: list[str] = field(default_factory=list)
+    feature: bool = False
 
 
 @dataclass
@@ -321,6 +155,11 @@ class Requirement:
     source: str = ""
     evidence: str = ""
     reason: str = ""
+    #: the finer obligations this capability contains. Traceable, not numbered:
+    #: the final gate checks them, and nothing earlier has to.
+    details: list[str] = field(default_factory=list)
+    #: how it could be demonstrated, from plans written before acceptance moved
+    #: onto features. Carried, never asked for.
     verification: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -332,6 +171,7 @@ class Requirement:
             "source": self.source,
             "evidence": self.evidence,
             "reason": self.reason,
+            "details": list(self.details),
             "verification": list(self.verification),
         }
 
@@ -345,7 +185,8 @@ class Requirement:
             source=str(payload.get("source", "")),
             evidence=str(payload.get("evidence", "")),
             reason=str(payload.get("reason", "")),
-            verification=list(payload.get("verification", [])),
+            details=[str(item) for item in payload.get("details") or []],
+            verification=list(payload.get("verification") or []),
         )
 
 
@@ -367,40 +208,6 @@ class Snapshot:
     def gates(self) -> list[Item]:
         return [item for item in self.items if item.kind == "gate"]
 
-    @property
-    def populated(self) -> bool:
-        """Whether this repository has a source tree for a fence to be wrong about.
-
-        A greenfield project is planned entirely out of files that do not exist, so
-        "this path does not exist" is true of every fence in the plan and evidence
-        of nothing. Reporting it there produced a note per fenced file and buried
-        the findings that mattered underneath them.
-
-        Only a *source* tree counts. A repository holding nothing but the design
-        documents the plan is derived from is greenfield in every way that matters
-        here, and `docs/` is not a fence being right about anything.
-        """
-        if self.root is None or not self.root.is_dir():
-            return False
-        ignore = {
-            ".git",
-            ".writ",
-            ".venv",
-            "node_modules",
-            "__pycache__",
-            "docs",
-            "doc",
-            "design",
-            "designs",
-            "spec",
-            "specs",
-        }
-        for entry in self.root.iterdir():
-            if entry.name in ignore or entry.name.startswith("."):
-                continue
-            if entry.is_dir():
-                return True
-        return False
 
 # --------------------------------------------------------------------------
 # adapters
@@ -429,7 +236,11 @@ def from_plan(
                     allowed=list(task.allowed),
                     forbidden=list(task.forbidden),
                     requirement_ids=list(getattr(task, "requirement_ids", []) or []),
-                    milestone=milestone.title,
+                    milestone="" if getattr(milestone, "loose", False) else milestone.title,
+                    owns=list(getattr(task, "owns", []) or []),
+                    provides=list(getattr(task, "provides", []) or []),
+                    consumes=list(getattr(task, "consumes", []) or []),
+                    feature=bool(getattr(task, "feature", False)),
                 )
             )
     return Snapshot(
@@ -451,6 +262,10 @@ def from_state(data: dict[str, Any], *, root: Path | None = None) -> Snapshot:
             kind=task.get("kind", "task"),
             milestone=task.get("milestone") or "",
             status=task.get("status", "planned"),
+            owns=list(task.get("owns") or []),
+            provides=list(task.get("provides") or []),
+            consumes=list(task.get("consumes") or []),
+            feature=contracts.is_feature(task),
         )
         for task in sorted(data.get("tasks", {}).values(), key=lambda t: t["id"])
     ]
@@ -463,6 +278,8 @@ def from_state(data: dict[str, Any], *, root: Path | None = None) -> Snapshot:
     return Snapshot(items=items, requirements=requirements, root=root, committed=True)
 
 
+
+
 # --------------------------------------------------------------------------
 # the checks
 
@@ -470,12 +287,10 @@ def from_state(data: dict[str, Any], *, root: Path | None = None) -> Snapshot:
 def check(snapshot: Snapshot) -> list[Finding]:
     """Every deterministic objection to this plan, worst first."""
     findings: list[Finding] = []
-    findings.extend(check_titles(snapshot))
-    findings.extend(check_acceptances(snapshot))
-    findings.extend(check_fences(snapshot))
+    findings.extend(check_shape(snapshot))
     findings.extend(check_dependencies(snapshot))
+    findings.extend(check_contracts(snapshot))
     findings.extend(check_coverage(snapshot))
-    findings.extend(check_integration(snapshot))
     return sort_findings(findings)
 
 
@@ -500,82 +315,32 @@ def tally(findings: Iterable[Finding]) -> dict[str, int]:
     return counts
 
 
-def check_titles(snapshot: Snapshot) -> list[Finding]:
-    """A task named after the whole project is not one bounded session."""
+def check_shape(snapshot: Snapshot) -> list[Finding]:
+    """The schema a loader cannot enforce: counts, repeats and size."""
     findings: list[Finding] = []
-    seen: dict[str, str] = {}
+    features = [item for item in snapshot.tasks if item.feature]
+    if features and not (MIN_FEATURES <= len(features) <= MAX_FEATURES):
+        findings.append(
+            Finding(
+                severity="warning",
+                category="feature-count",
+                message=(
+                    f"the plan has {len(features)} features; {MIN_FEATURES}-"
+                    f"{MAX_FEATURES} subsystems is the target"
+                ),
+                suggested_action=(
+                    "merge features one agent could build together, or split one "
+                    "that is several subsystems"
+                ),
+            )
+        )
     for item in snapshot.tasks:
-        lowered = item.title.lower()
-        for phrase in WHOLE_PROJECT_TITLES:
-            if phrase in lowered:
-                findings.append(
-                    Finding(
-                        severity="error",
-                        category="task-too-broad",
-                        message=(
-                            f"{item.title!r} describes the whole project, not one "
-                            "bounded agent session"
-                        ),
-                        where=item.id,
-                        suggested_action=(
-                            "split it into tasks that each own a component and "
-                            "state their own bar"
-                        ),
-                    )
-                )
-                break
-        key = lowered.strip()
-        if key in seen:
-            findings.append(
-                Finding(
-                    severity="warning",
-                    category="duplicate-task",
-                    message=f"same title as {seen[key]}: {item.title!r}",
-                    where=item.id,
-                    suggested_action="say what differs, or merge them",
-                )
-            )
-        else:
-            seen[key] = item.id
-    return findings
-
-
-def check_acceptances(snapshot: Snapshot) -> list[Finding]:
-    """The bar has to be checkable, task-local, and actually stated."""
-    findings: list[Finding] = []
-    for item in snapshot.tasks:
-        count = len(item.acceptances)
-        if count < MIN_ACCEPTANCES:
-            findings.append(
-                Finding(
-                    severity="warning",
-                    category="thin-acceptance",
-                    message=(
-                        f"states {count} acceptance criterion; "
-                        f"{MIN_ACCEPTANCES}-{MAX_ACCEPTANCES} is the bar for a "
-                        "task a reviewer has to judge"
-                    ),
-                    where=item.id,
-                    suggested_action="add the verification the task owns",
-                )
-            )
-        elif count > MAX_ACCEPTANCES:
-            findings.append(
-                Finding(
-                    severity="warning",
-                    category="wide-acceptance",
-                    message=(
-                        f"states {count} acceptance criteria, more than "
-                        f"{MAX_ACCEPTANCES}; a task with this many bars is "
-                        "usually two tasks"
-                    ),
-                    where=item.id,
-                    suggested_action="split the task, or fold related bars together",
-                )
-            )
+        findings.extend(
+            _feature_shape(item) if item.feature else _task_shape(item)
+        )
         seen: dict[str, int] = {}
         for number, text in enumerate(item.acceptances, start=1):
-            key = _normalize_criterion(text)
+            key = " ".join(text.lower().split())
             if key in seen:
                 findings.append(
                     Finding(
@@ -590,323 +355,90 @@ def check_acceptances(snapshot: Snapshot) -> list[Finding]:
                 )
             else:
                 seen[key] = number
-            if key in GENERIC_ACCEPTANCES:
-                continue
-            findings.extend(_criterion_findings(item, number, text))
-        if item.acceptances and all(
-            _normalize_criterion(text) in GENERIC_ACCEPTANCES
-            for text in item.acceptances
-        ):
-            findings.append(
-                Finding(
-                    severity="warning",
-                    category="generic-acceptance",
-                    message=(
-                        "every acceptance criterion is writ's fallback; the design "
-                        "section states no bar of its own"
-                    ),
-                    where=item.id,
-                    suggested_action=(
-                        "name what this task specifically has to demonstrate, or "
-                        "say in the design what would count as done"
-                    ),
-                )
-            )
     return findings
 
 
-def _criterion_findings(item: Item, number: int, text: str) -> list[Finding]:
-    findings: list[Finding] = []
-    lowered = text.lower()
-    for phrase in VAGUE_PHRASES:
-        if phrase in lowered:
-            findings.append(
-                Finding(
-                    severity="error",
-                    category="vague-acceptance",
-                    message=(
-                        f"criterion {number} is not checkable ({phrase!r}): {text!r}"
-                    ),
-                    where=item.id,
-                    suggested_action=(
-                        "name the command, the observable behaviour, or the "
-                        "artifact that demonstrates it"
-                    ),
-                )
+def _task_shape(item: Item) -> list[Finding]:
+    count = len(item.acceptances)
+    if count < MIN_ACCEPTANCES:
+        return [
+            Finding(
+                severity="warning",
+                category="thin-acceptance",
+                message=(
+                    f"states {count} acceptance criterion; {MIN_ACCEPTANCES}-"
+                    f"{MAX_ACCEPTANCES} is the bar for a task a reviewer has to judge"
+                ),
+                where=item.id,
+                suggested_action="add the verification the task owns",
             )
-            return findings
-    if item.fenced:
-        for phrase in SUITE_WIDE_PHRASES:
-            if phrase in lowered:
-                findings.append(
-                    Finding(
-                        severity="error",
-                        category="unmeetable-acceptance",
-                        message=(
-                            f"criterion {number} sets a project-wide bar on a task "
-                            f"fenced to {', '.join(item.allowed)}: {text!r}"
-                        ),
-                        where=item.id,
-                        suggested_action=(
-                            "scope it to the tests this task owns, or move it to a "
-                            "milestone gate"
-                        ),
-                    )
-                )
-                return findings
-    if not _observable(text):
+        ]
+    if count > MAX_ACCEPTANCES:
+        return [
+            Finding(
+                severity="warning",
+                category="wide-acceptance",
+                message=(
+                    f"states {count} acceptance criteria, more than "
+                    f"{MAX_ACCEPTANCES}; a task with this many bars is usually two"
+                ),
+                where=item.id,
+                suggested_action="split the task, or fold related bars together",
+            )
+        ]
+    return []
+
+
+def _feature_shape(item: Item) -> list[Finding]:
+    findings: list[Finding] = []
+    count = len(item.acceptances)
+    if count < MIN_BEHAVIOURS:
         findings.append(
             Finding(
                 severity="warning",
-                category="unobservable-acceptance",
+                category="thin-acceptance",
                 message=(
-                    f"criterion {number} names no command, path, or observable "
-                    f"behaviour: {text!r}"
+                    f"states {count} behaviour(s); {MIN_BEHAVIOURS}-{MAX_BEHAVIOURS} "
+                    "is the bar for a feature a reviewer has to judge"
                 ),
                 where=item.id,
-                suggested_action=(
-                    "say what a second party would run or read to confirm it"
+                suggested_action="state what a user of this subsystem can observe",
+            )
+        )
+    oversized = []
+    if count > MAX_BEHAVIOURS:
+        oversized.append(f"{count} behaviours")
+    if len(item.requirement_ids) > MAX_FEATURE_REQUIREMENTS:
+        oversized.append(f"{len(item.requirement_ids)} requirements")
+    if oversized:
+        findings.append(
+            Finding(
+                severity="warning",
+                category="oversized-feature",
+                message=(
+                    f"carries {' and '.join(oversized)}; that is more than one "
+                    "agent builds as one subsystem"
                 ),
+                where=item.id,
+                requirement_ids=list(item.requirement_ids),
+                suggested_action="split it along an interface it would provide",
+            )
+        )
+    if not item.owns:
+        findings.append(
+            Finding(
+                severity="warning",
+                category="unowned-feature",
+                message="owns no component, so nothing fences it",
+                where=item.id,
+                suggested_action="name the directory or package this feature builds",
             )
         )
     return findings
 
 
-def _normalize_criterion(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
-
-
-def _observable(text: str) -> bool:
-    """Whether a criterion names something a second party could go and check.
-
-    Deliberately generous. This gates a *warning*, and the cost of the two errors
-    is not symmetric: a missed vague criterion is one finding a critic will also
-    read the plan for, while a false positive on a well-written criterion is noise
-    that buries every real finding beside it. Judging whether a criterion truly
-    demonstrates its requirement is the acceptance critic's job, not a word list's.
-    """
-    lowered = text.lower()
-    if BACKTICK_PATTERN.search(text) or PATH_PATTERN.search(text):
-        return True
-    if TEST_NAME_PATTERN.search(text):
-        return True
-    if any(hint in lowered for hint in COMMAND_HINTS):
-        return True
-    if _has_measurable_shape(text):
-        return True
-    return any(hint in lowered for hint in OBSERVABLE_HINTS)
-
-
-def _has_measurable_shape(text: str) -> bool:
-    """A regex, a number with a unit, a comparison, or a quoted literal.
-
-    "Timestamps match ^\\d{4}-..." states exactly what a reader checks, and names
-    none of the verbs in `OBSERVABLE_HINTS`. So does "within 200ms" and
-    "status is 'rejected'".
-    """
-    if re.search(r"[\^$]|\\d\{|\[\^|\.\*|\+\?", text):
-        return True
-    if re.search(r"\b\d+\s?(?:ms|s|kb|mb|gb|rows?|items?|%)\b", text, re.I):
-        return True
-    if re.search(r"[<>=]=?\s*\d|\bat (?:most|least)\b|\bno more than\b", text, re.I):
-        return True
-    return bool(re.search(r"'[^']{2,}'|\"[^\"]{2,}\"", text))
-
-
-def check_fences(snapshot: Snapshot) -> list[Finding]:
-    """Ownership has to be real, self-consistent, and not shared with a sibling."""
-    findings: list[Finding] = []
-    #: task id -> the fenced paths that do not exist, reported together below
-    missing: dict[str, list[str]] = {}
-    for item in snapshot.items:
-        for path in item.allowed:
-            if _is_broad(path):
-                findings.append(
-                    Finding(
-                        severity="error",
-                        category="broad-fence",
-                        message=(
-                            f"allowed path {path!r} fences the task to the whole "
-                            "repository, which is not a fence"
-                        ),
-                        where=item.id,
-                        suggested_action=(
-                            "name the components this task owns, or omit `allowed` "
-                            "and say in notes why it is global"
-                        ),
-                    )
-                )
-            elif snapshot.root is not None and not _path_exists(snapshot.root, path):
-                missing.setdefault(item.id, []).append(path)
-        findings.extend(_contradictory_fence(item))
-    findings.extend(_unknown_paths(snapshot, missing))
-    findings.extend(_shared_ownership(snapshot))
-    return findings
-
-
-def _unknown_paths(
-    snapshot: Snapshot, missing: dict[str, list[str]]
-) -> list[Finding]:
-    """One finding per task for fences naming paths that do not exist yet.
-
-    A note per path was the single largest source of noise writ produced: on a
-    greenfield plan every file is new, so it fired 104 times on one plan and 221
-    of 294 findings were writ's own checks rather than anything a critic said. The
-    signal is not "this file does not exist" — for a plan that builds the project,
-    that is the normal case and says nothing. It is "this looks like a *typo*",
-    which only shows up in the shape of the path, so that is what is reported.
-
-    Whether the project is greenfield decides the severity of the rest. A path
-    under a directory that exists is worth a note, because its siblings are there
-    and this one is not. A path in a repository that has no source tree at all is
-    not worth reporting: nothing exists, so nothing is evidence.
-    """
-    findings: list[Finding] = []
-    for item_id, paths in missing.items():
-        suspect = [path for path in paths if _looks_like_typo(snapshot.root, path)]
-        if suspect:
-            findings.append(
-                Finding(
-                    severity="warning",
-                    category="suspect-path",
-                    message=(
-                        f"fence names {_count(len(suspect), 'path')} whose parent "
-                        f"directory exists but which do not: "
-                        f"{', '.join(sorted(suspect)[:6])}"
-                        + (" …" if len(suspect) > 6 else "")
-                        + " — a new file here is fine, a misspelt one is not"
-                    ),
-                    where=item_id,
-                    suggested_action=(
-                        "check the spelling against the directory, or confirm the "
-                        "task creates these"
-                    ),
-                )
-            )
-        rest = [path for path in paths if path not in set(suspect)]
-        if rest and snapshot.populated:
-            findings.append(
-                Finding(
-                    severity="note",
-                    category="unknown-path",
-                    message=(
-                        f"fence names {_count(len(rest), 'path')} that do not exist "
-                        f"yet: {', '.join(sorted(rest)[:6])}"
-                        + (" …" if len(rest) > 6 else "")
-                    ),
-                    where=item_id,
-                    suggested_action="confirm the task creates them",
-                )
-            )
-    return findings
-
-
-def _count(n: int, noun: str) -> str:
-    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
-
-
-def _looks_like_typo(root: Path | None, path: str) -> bool:
-    """Whether a missing path sits in a directory that already exists.
-
-    That is the only cheap evidence of a misspelling. `writ/stat.py` next to a real
-    `writ/` is worth a look; `mmm/schema.sql` in a repository with no `mmm/` is just
-    a file the plan is about to create.
-    """
-    if root is None:
-        return False
-    cleaned = _normalize_path(path).strip("/")
-    if not cleaned or "/" not in cleaned:
-        return False
-    parent = root / cleaned.rsplit("/", 1)[0]
-    return parent.is_dir()
-
-
-def _contradictory_fence(item: Item) -> list[Finding]:
-    """A fence that forbids what it allows leaves the agent nothing legal to do.
-
-    Only a contradiction counts. `allowed: writ/` with `forbidden: writ/state.py`
-    is a carve-out — touch the package but not that file — and is exactly what the
-    two fields are for, so it passes. The reverse does not: `allowed:
-    writ/state.py` under `forbidden: writ/` permits one file inside a directory
-    the task may not touch.
-    """
-    findings: list[Finding] = []
-    allowed = [_normalize_path(path) for path in item.allowed]
-    for raw in item.forbidden:
-        forbidden = _normalize_path(raw)
-        for permitted in allowed:
-            if forbidden == permitted:
-                findings.append(
-                    Finding(
-                        severity="error",
-                        category="contradictory-fence",
-                        message=f"{raw!r} is both allowed and forbidden",
-                        where=item.id,
-                        suggested_action="decide which one it is",
-                    )
-                )
-            elif _contains(forbidden, permitted):
-                findings.append(
-                    Finding(
-                        severity="error",
-                        category="contradictory-fence",
-                        message=(
-                            f"forbidden {raw!r} contains allowed {permitted!r}, so "
-                            "the task may not touch what it is scoped to"
-                        ),
-                        where=item.id,
-                        suggested_action=(
-                            "forbid the siblings instead, or widen `allowed`"
-                        ),
-                    )
-                )
-    return findings
-
-
-def _shared_ownership(snapshot: Snapshot) -> list[Finding]:
-    """Two tasks that can run at once must not own the same files.
-
-    This is the parallel-execution failure the graph cannot see: nothing orders
-    the two tasks, both agents edit the same file, and whichever finishes second
-    either loses its work or fails a bar for reasons it did not cause.
-
-    Ordered tasks are fine — one finishes before the other starts — so this only
-    looks at pairs with no path between them.
-    """
-    findings: list[Finding] = []
-    ancestors = _ancestors(snapshot)
-    items = [item for item in snapshot.items if item.allowed]
-    for index, first in enumerate(items):
-        for second in items[index + 1 :]:
-            if second.id in ancestors.get(first.id, set()):
-                continue
-            if first.id in ancestors.get(second.id, set()):
-                continue
-            shared = _overlaps(first.allowed, second.allowed)
-            if not shared:
-                continue
-            path = shared[0]
-            precise = _looks_like_file(path)
-            findings.append(
-                Finding(
-                    severity="error" if precise else "warning",
-                    category="shared-ownership",
-                    message=(
-                        f"{first.id} and {second.id} both own {path!r} and nothing "
-                        "orders them, so they can run at the same time"
-                    ),
-                    where=first.id,
-                    suggested_action=(
-                        f"give one of them the file and depend on it, or order "
-                        f"{second.id} after {first.id}"
-                    ),
-                )
-            )
-    return findings
-
-
 def check_dependencies(snapshot: Snapshot) -> list[Finding]:
-    """What the DAG check cannot see: repeats, and edges pointing nowhere."""
+    """What the DAG check reports as an exception, reported as findings."""
     findings: list[Finding] = []
     known = {item.id for item in snapshot.items}
     for item in snapshot.items:
@@ -943,6 +475,70 @@ def check_dependencies(snapshot: Snapshot) -> list[Finding]:
                         suggested_action="point it at a real task, or drop the edge",
                     )
                 )
+    ancestors = _ancestors(snapshot)
+    for item in snapshot.items:
+        if item.id in ancestors.get(item.id, set()) and item.id not in item.depends_on:
+            findings.append(
+                Finding(
+                    severity="error",
+                    category="cycle",
+                    message="is its own transitive dependency",
+                    where=item.id,
+                    suggested_action=(
+                        "break the cycle: one side of it should provide an "
+                        "interface the other consumes, not both"
+                    ),
+                )
+            )
+    return findings
+
+
+def check_contracts(snapshot: Snapshot) -> list[Finding]:
+    """Every interface a feature consumes has exactly one provider.
+
+    This is the whole of what used to be the missing-edge and shared-ownership
+    arguments: edges are derived from these contracts (`contracts.edges`), so a
+    consumed interface with a provider *is* an edge, and one without is a gap.
+    """
+    findings: list[Finding] = []
+    features = {
+        item.id: {"provides": item.provides, "consumes": item.consumes}
+        for item in snapshot.tasks
+        if item.feature
+    }
+    if not features:
+        return findings
+    by_name = contracts.providers(features)
+    for key, owners in sorted(by_name.items()):
+        if len(owners) > 1:
+            findings.append(
+                Finding(
+                    severity="error",
+                    category="contract-gap",
+                    message=(
+                        f"interface {key!r} is provided by {', '.join(owners)}; "
+                        "a consumer cannot tell which one it depends on"
+                    ),
+                    where=owners[1],
+                    suggested_action="give the interface one provider, or name them apart",
+                )
+            )
+    for feature_id, record in sorted(features.items()):
+        for line in record["consumes"]:
+            key = contracts.name(line)
+            if key and key not in by_name:
+                findings.append(
+                    Finding(
+                        severity="error",
+                        category="contract-gap",
+                        message=f"consumes {key!r}, which no feature provides",
+                        where=feature_id,
+                        suggested_action=(
+                            "add it to the `provides` of the feature that builds it, "
+                            "or drop it if it already exists in the repository"
+                        ),
+                    )
+                )
     return findings
 
 
@@ -974,8 +570,7 @@ def check_coverage(snapshot: Snapshot) -> list[Finding]:
                 continue
             # Only implementation work counts as coverage. A gate that names a
             # requirement is saying it will *check* it, and a requirement checked
-            # by a gate with no task behind it is one nothing implements — which
-            # is precisely the hole this check exists to find.
+            # by a gate with no task behind it is one nothing implements.
             if item.kind == "task":
                 covered[req_id].append(item.id)
         if item.kind == "task" and not item.requirement_ids:
@@ -1046,13 +641,11 @@ def _requirement_findings(requirement: Requirement, tasks: list[str]) -> list[Fi
         Finding(
             severity="error" if requirement.priority == "must" else "warning",
             category="missing-coverage",
-            message=(
-                f"no task covers it: {_shorten(requirement.text)}"
-            ),
+            message=f"nothing covers it: {_shorten(requirement.text)}",
             where=requirement.id,
             requirement_ids=[requirement.id],
             suggested_action=(
-                "add a task that covers it, or mark it existing with evidence or "
+                "have a feature cover it, or mark it existing with evidence or "
                 "out-of-scope with a reason"
             ),
         )
@@ -1060,104 +653,15 @@ def _requirement_findings(requirement: Requirement, tasks: list[str]) -> list[Fi
     return findings
 
 
-def check_integration(snapshot: Snapshot) -> list[Finding]:
-    """Parallel branches that nothing joins are work nobody verifies together.
-
-    A graph can be acyclic, fully covered, and still end in four independent
-    leaves with no task or gate that checks they compose. Task-local review cannot
-    catch that by construction: each leaf satisfied its own criteria.
-    """
-    findings: list[Finding] = []
-    tasks = snapshot.tasks
-    if len(tasks) < 2:
-        return findings
-    if any(gate.kind == "gate" for gate in snapshot.gates):
-        return findings
-    depended_on = {dep for item in snapshot.items for dep in item.depends_on}
-    sinks = [item.id for item in tasks if item.id not in depended_on]
-    if len(sinks) < 2:
-        return findings
-    findings.append(
-        Finding(
-            severity="warning",
-            category="missing-integration",
-            message=(
-                f"{len(sinks)} tasks end the graph with nothing verifying them "
-                f"together: {', '.join(sinks[:6])}"
-                + (" …" if len(sinks) > 6 else "")
-            ),
-            where="",
-            suggested_action=(
-                "add a gate or an integration task that depends on them and checks "
-                "the combined behaviour"
-            ),
-        )
-    )
-    return findings
-
-
 # --------------------------------------------------------------------------
-# path and graph helpers
-
-
-def _normalize_path(path: str) -> str:
-    cleaned = path.strip().replace("\\", "/")
-    while cleaned.startswith("./"):
-        cleaned = cleaned[2:]
-    return cleaned.strip("/")
-
-
-def _is_broad(path: str) -> bool:
-    return _normalize_path(path).lower() in BROAD_PATHS
-
-
-def _contains(parent: str, child: str) -> bool:
-    """Whether `parent` is a directory prefix of `child`, at a path boundary."""
-    if not parent or parent == child:
-        return False
-    return child.startswith(parent + "/")
-
-
-def _overlaps(first: Iterable[str], second: Iterable[str]) -> list[str]:
-    """The paths two fences share, either equal or one inside the other."""
-    shared: list[str] = []
-    left = [_normalize_path(path) for path in first if _normalize_path(path)]
-    right = [_normalize_path(path) for path in second if _normalize_path(path)]
-    for one in left:
-        for other in right:
-            if one == other:
-                shared.append(one)
-            elif _contains(one, other):
-                shared.append(other)
-            elif _contains(other, one):
-                shared.append(one)
-    seen: set[str] = set()
-    unique = []
-    for path in shared:
-        if path not in seen:
-            seen.add(path)
-            unique.append(path)
-    return unique
-
-
-def _looks_like_file(path: str) -> bool:
-    tail = _normalize_path(path).rsplit("/", 1)[-1]
-    return "." in tail
-
-
-def _path_exists(root: Path, path: str) -> bool:
-    candidate = _normalize_path(path)
-    if not candidate:
-        return False
-    return (root / candidate).exists()
+# graph helpers
 
 
 def _ancestors(snapshot: Snapshot) -> dict[str, set[str]]:
     """Every item each item transitively depends on.
 
-    Tolerates a cycle rather than raising: `check_dag` is the place that rejects
-    one, and a checker that crashed on a bad graph would withhold every other
-    finding about it.
+    Tolerates a cycle rather than raising: a checker that crashed on a bad graph
+    would withhold every other finding about it.
     """
     edges = {item.id: list(item.depends_on) for item in snapshot.items}
     resolved: dict[str, set[str]] = {}
@@ -1170,9 +674,9 @@ def _ancestors(snapshot: Snapshot) -> dict[str, set[str]]:
         found: set[str] = set()
         for dep in edges.get(node, ()):
             found.add(dep)
-            found |= walk(dep, trail | {node})
-        if node not in trail:
-            resolved[node] = found
+            if dep not in trail:
+                found |= walk(dep, trail | {node})
+        resolved[node] = found
         return found
 
     for item_id in edges:

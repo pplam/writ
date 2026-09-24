@@ -13,10 +13,11 @@ produce the same shapes. Both paths share `PlannedMilestone`/`PlannedTask` and
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence, Union
 
 from .state import WritError
 
@@ -55,6 +56,13 @@ class PlannedTask:
     requirement_ids: list[str] = field(default_factory=list)
     #: whether `section` was claimed by the author or synthesized from titles
     stated_section: bool = False
+    #: set on a feature (docs/planning-redesign.md §4): what exists when it is
+    #: done, the component it owns, and the interfaces it provides and consumes
+    feature: bool = False
+    goal: str = ""
+    owns: list[str] = field(default_factory=list)
+    provides: list[str] = field(default_factory=list)
+    consumes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -64,6 +72,9 @@ class PlannedMilestone:
     tasks: list[PlannedTask] = field(default_factory=list)
     ref: str | None = None
     notes: str = ""
+    #: a features plan has no milestones: its features sit in one loose group
+    #: that commits as tasks with no milestone and no milestone gate
+    loose: bool = False
 
 
 def clean(text: str) -> str:
@@ -212,17 +223,65 @@ def section_text(doc: Path, section: str) -> str:
     return ""
 
 
+#: One design document, or a design split across several. Every function that
+#: reads "the design" takes either, so a single path keeps working unchanged.
+DesignDocs = Union[str, os.PathLike, Sequence[Union[str, os.PathLike]], None]
+
+
+def doc_list(doc: DesignDocs) -> list[Path]:
+    """The design as a list of paths, in the order they were given."""
+    if doc is None:
+        return []
+    if isinstance(doc, (str, os.PathLike)):
+        return [Path(doc)]
+    return [Path(item) for item in doc]
+
+
+def doc_names(doc: DesignDocs) -> str:
+    """How to name the design in a message: `a.md`, or `a.md, b.md`."""
+    return ", ".join(path.name for path in doc_list(doc)) or "the design document"
+
+
+def find_section(doc: DesignDocs, section: str) -> tuple[Path | None, str]:
+    """Which design document holds `section`, and its text.
+
+    With several documents a heading is looked for in each, in order. A section
+    may name its document first (`api.md / Storage`), which is how two documents
+    that share a heading are told apart; the rest of the path is matched as
+    `section_text` always has, by its last part.
+    """
+    docs = doc_list(doc)
+    head = section.split(" / ", 1)[0].strip()
+    named = [path for path in docs if path.name == head]
+    for path in named or docs:
+        text = section_text(path, section)
+        if text:
+            return path, text
+    return None, ""
+
+
 def build_ids(
-    milestones: list[PlannedMilestone], offset: int = 0
+    milestones: list[PlannedMilestone], offset: int = 0, feature_offset: int = 0
 ) -> list[tuple[str, PlannedMilestone, list[tuple[str, PlannedTask]]]]:
-    """Assign stable `M01` / `M01-001` identifiers.
+    """Assign stable `M01` / `M01-001` identifiers, or `FT-001` for features.
 
     Writ owns identity, not the plan's author: whatever ids a generated plan
     proposed are kept only as a translation table (see `ref_map`) so its stated
-    dependencies can be rewritten onto the ids we actually assign.
+    dependencies can be rewritten onto the ids we actually assign. A loose group
+    gets the milestone id `""`, and does not use up a milestone number.
     """
     result = []
-    for position, milestone in enumerate(milestones, start=offset + 1):
+    position = offset
+    features = feature_offset
+    for milestone in milestones:
+        if milestone.loose:
+            tasks = []
+            for task in milestone.tasks:
+                features += 1
+                tasks.append((f"FT-{features:03d}", task))
+            result.append(("", milestone, tasks))
+            continue
+        position += 1
         milestone_id = f"M{position:02d}"
         tasks = [
             (f"{milestone_id}-{index:03d}", task)
@@ -246,7 +305,7 @@ def ref_map(
 
 def summarize(milestones: list[PlannedMilestone]) -> dict[str, Any]:
     return {
-        "milestones": len(milestones),
+        "milestones": sum(1 for milestone in milestones if not milestone.loose),
         "tasks": sum(len(milestone.tasks) for milestone in milestones),
         "acceptances": sum(
             len(task.acceptances)

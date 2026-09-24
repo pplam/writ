@@ -9,39 +9,178 @@ executed was the plan the critics objected to, with the objection accepted.
 
 This is the middle:
 
-    check + critics → findings → adjudicator proposes a patch → writ validates it
-    → apply → re-check → re-run the critics → repeat, bounded
+    check + critics → findings → adjudicator edits a working copy of the plan
+    → writ validates the copy → promote → re-check → re-run the critics → repeat
 
-Everything structural is `repair.py`'s, which is the point. A patch is validated by
-the same `repair.validate`, applied by the same `repair.apply_patch`, and bounded by
-the same idea of a round. What is different is only what a request is *about*: a
-gate that failed, or a plan that has not run. The one operation this occasion adds
-is `revise_tasks`, safe here and nowhere else, because before execution no task's
-contract has been met by anybody.
+A round is a directory (`rounds/r<rev>/round-<n>/` under the plan directory):
+`to-fix.json` holds the blocking findings, `plan/` holds a copy of the plan
+files, and the adjudicator edits `plan/features/` in place — revising a feature
+by editing its file, adding one by creating a file, removing one by deleting
+it — then answers each finding in `response.json`. Writ reads the copy back,
+writes what it thinks of it to `validation.json`, and promotes a valid copy into
+`state.json` in one transaction. A refused copy is where the next attempt
+starts, so the sound edits in it are not redone.
+
+This is not the gate repair of `repair.py`, and on purpose. A gate repair
+happens mid-run, around work that is done, so it may only add. Before execution
+nothing has run, and the natural fix for most findings — a vaguer criterion
+made checkable, two overlapping features merged, a task split in two — is an
+edit to the plan, which a patch language expressed badly or not at all.
 
 Two invariants are worth stating plainly, because they are what stops the loop from
 being a way to make a bad plan pass:
 
-1. A repair may change the strategy, never the bar. `repair.validate` refuses a
-   patch that drops a requirement or leaves a task with fewer criteria.
-2. A finding closes when a *check* says so, not when a patch claims it. The loop
-   re-runs the deterministic checks and the critics after every applied patch, and
+1. A repair may change the strategy, never the bar. Validation refuses a copy
+   that drops a requirement's coverage, invents or edits requirements, or leaves
+   a surviving feature with fewer criteria.
+2. A finding closes when a *check* says so, not when a response claims it. The loop
+   re-runs the deterministic checks and the critics after every promoted copy, and
    a finding that comes back is reopened with its history intact.
 """
 from __future__ import annotations
 
+import hashlib
 import json
-import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from . import agents, critics, plancheck, plans, repair, runner, state
-from .plancheck import Finding
+from . import agents, contracts, gates, planfiles, plans, prompts, repair, runner, state
+from .model import add_task, check_dag, refresh_milestones
+from .plancheck import Finding, sort_findings
+from .planner import DesignDocs
+from .prompts import Ref
 from .state import WritError, utcnow
 
-#: where an adjudicator writes its patch, under the round's own directory
-PATCH_FILENAME = "patch.json"
+TO_FIX_FILENAME = "to-fix.json"
+RESPONSE_FILENAME = "response.json"
+VALIDATION_FILENAME = "validation.json"
+#: the working copy inside a round directory: `plan.json` and `features/`
+WORKING_DIRNAME = "plan"
+
+#: the words a round's error starts with when writ, not the agent, failed it
+PROMOTION_FAILED = "the working copy could not be promoted"
+
+RESPONSE_SCHEMA = """\
+{
+  "analysis": "what was actually wrong, in a few lines",
+  "dispositions": [
+    {
+      "finding_id": "F-0007",
+      "disposition": "accepted",
+      "change": "M01-002: replaced the vague criterion with a runnable check"
+    },
+    {
+      "finding_id": "F-0009",
+      "disposition": "declined",
+      "reason": "the design says the cache is optional (section 3), so ..."
+    }
+  ],
+  "questions": [
+    {
+      "finding_id": "F-0011",
+      "question": "only when a finding cannot be closed without a human ruling",
+      "context": "what the two readings are and what each would change"
+    }
+  ]
+}"""
+
+#: a blocking category no repair can close: the plan needs a ruling, so the
+#: loop hands these to a human instead of to the adjudicator
+DECISION_CATEGORY = "needs-decision"
+
+CONTRACT_EXAMPLE = """\
+{
+  "id": "new-retention",
+  "title": "Retention and compaction",
+  "goal": "one paragraph: what exists when this is done",
+  "requirement_ids": ["REQ-014"],
+  "owns": ["mmm/retention/"],
+  "provides": ["Compactor: compact(before) -> removed count"],
+  "consumes": ["EventLog: append(event) -> offset; read(from) -> events"],
+  "acceptances": [
+    "events older than the retention window are gone after a compaction",
+    "a read that spans a compaction returns every surviving event in order",
+    "compaction never removes an event a reader has not acknowledged"
+  ],
+  "notes": "ambiguities, risks"
+}"""
+
+CONTRACT_RULES = """\
+Rules:
+1. Repair the findings in to-fix.json. Do not re-plan the project and do not
+   tidy features nothing objected to.
+2. The requirement inventory is fixed. Do not edit plan/plan.json, and do not
+   name a requirement id that is not in it.
+3. The bar may move, never drop. A feature you keep may not end with fewer
+   acceptance criteria than it has now, and every requirement some feature
+   covers now must still be covered by some feature afterwards.
+4. Features of kind "gate" are writ's: do not edit or delete them.
+5. Only features with status "planned" may be edited or removed. `id`, `kind`
+   and `status` are not yours to change.
+6. Do not write `depends_on` between features: writ derives it from the
+   contracts. A feature depends on whoever `provides` an interface it
+   `consumes`, matched on the name before the colon. To add an edge, add the
+   interface; every consumed interface needs exactly one provider, and the
+   contracts may not form a cycle.
+7. A feature is a subsystem one agent can build on its own: a goal, the
+   component or directory it `owns` (never a file list), 3 to 6 observable
+   behaviours as acceptance criteria, and no file or test names. Writ fences
+   it to `owns` plus the test directories; `allowed` follows `owns`.
+8. Every finding in to-fix.json needs an answer in the response: `accepted`
+   with `change` naming what you edited, or `declined` with `reason` giving the
+   evidence that the finding is wrong. A finding that needs a product decision
+   goes in `questions` with its `finding_id` instead; do not guess.
+9. A response that edits nothing and asks nothing is refused: an unchanged plan
+   draws the same findings again. If every finding is wrong, raise a question.
+
+Write no code, and change no file outside the working copy and the response."""
+
+FEATURE_EXAMPLE = """\
+{
+  "id": "new-timeout-propagation",
+  "title": "Propagate the CLI timeout into execution",
+  "milestone": "M03",
+  "notes": "why this feature exists and where its boundary is",
+  "design_section": "Execution",
+  "requirement_ids": ["REQ-014"],
+  "depends_on": ["M02-003"],
+  "acceptances": [
+    "a timeout given on the command line bounds the agent run",
+    "the project's test suite passes"
+  ],
+  "allowed": ["writ/runner/", "tests/"],
+  "forbidden": []
+}"""
+
+RULES = """\
+Rules:
+1. Repair the findings in to-fix.json. Do not re-plan the project and do not
+   tidy features nothing objected to.
+2. The requirement inventory is fixed. Do not edit plan/plan.json, and do not
+   name a requirement id that is not in it.
+3. The bar may move, never drop. A feature you keep may not end with fewer
+   acceptance criteria than it has now, and every requirement some task covers
+   now must still be covered by some task afterwards.
+4. Features of kind "gate" are writ's: do not edit or delete them. Writ
+   recomputes what each gate depends on from its milestone.
+5. Only features with status "planned" may be edited or removed. `id`, `kind`,
+   `milestone` and `status` are not yours to change; to move a feature to
+   another milestone, delete it and add a new one there.
+6. Every `depends_on` must name a feature in the working copy. No feature may
+   depend on itself, and there may be no cycles.
+7. A feature is one bounded session of work for an independent agent: a clear
+   outcome, 2 to 6 checkable acceptance criteria, and a fence (`allowed`) naming
+   the areas it owns — directories or modules, not files that do not exist yet.
+8. Every finding in to-fix.json needs an answer in the response: `accepted`
+   with `change` naming what you edited, or `declined` with `reason` giving the
+   evidence that the finding is wrong. A finding that needs a product decision
+   goes in `questions` with its `finding_id` instead; do not guess.
+9. A response that edits nothing and asks nothing is refused: an unchanged plan
+   draws the same findings again. If every finding is wrong, raise a question.
+
+Write no code, and change no file outside the working copy and the response."""
 
 
 @dataclass
@@ -83,130 +222,109 @@ class Result:
         return self.remaining == 0
 
 
+# --------------------------------------------------------------------------
+# the prompt
+
+
 def build_prompt(
     *,
     root: Path,
-    doc: Path | None,
-    plan_text: str,
-    patch_path: Path,
-    findings: Iterable[Finding],
-    requirements: Iterable[dict[str, Any]] = (),
-    prior_refusals: Iterable[Finding] = (),
-    accepted_entries: Iterable[str] = (),
+    doc: DesignDocs,
+    directory: Path,
+    blocking: int,
     round_number: int = 1,
     base_revision: int = 0,
+    previous: Path | None = None,
+    extra: Iterable[Ref] = (),
+    features: bool = False,
 ) -> str:
-    """Compose the adjudicator's prompt.
+    """Compose the adjudicator's prompt: what to read, what to edit, where to answer.
 
-    It is given the findings it must answer, the plan as committed, and — if a
-    previous attempt was refused — exactly which invariants it broke. That last part
-    is what makes the retry bounded rather than hopeful: an adjudicator told "you
-    dropped REQ-004" writes a different patch, while one told only "refused" writes
-    the same one again.
+    Nothing is pasted. The findings are in `to-fix.json`, the plan is the working
+    copy, and a refused attempt's reasons are its `validation.json` — which is
+    required reading on a retry, because an adjudicator told "you dropped
+    REQ-004" makes a different edit, while one told only "refused" makes the same
+    one again.
     """
-    blocking = [f for f in findings if f.severity == "error"]
-    advisory = [f for f in findings if f.severity == "warning"]
-    accepted_entries = list(accepted_entries)
+    work = directory / WORKING_DIRNAME
+    first = [
+        Ref(
+            directory / TO_FIX_FILENAME,
+            f"the {blocking} blocking finding(s) you must answer, and nothing else",
+        )
+    ]
+    if previous is not None:
+        first.append(
+            Ref(
+                previous,
+                "why writ REFUSED your previous attempt. The working copy still holds "
+                "that attempt's edits: fix what this lists and keep the rest",
+            )
+        )
+    first.append(
+        Ref(
+            work / planfiles.INDEX_FILENAME,
+            "the plan at a glance: requirements, milestones, one row per feature. "
+            "Reference only; do not edit it",
+        )
+    )
+    first.extend(prompts.design_refs(doc, "the design document the plan implements"))
+    as_needed = [
+        Ref(
+            work / planfiles.FEATURES_DIRNAME,
+            "the working copy, one file per feature: edit these",
+        ),
+        *extra,
+    ]
     lines = [
         "You are repairing a PLAN that has not been executed yet.",
         "",
-        "Independent checks and critics have read it and objected. Your job is to "
-        "propose a patch that answers those objections — not to re-plan the "
-        "project, and not to argue with the plan where nothing objected to it.",
+        "Independent checks and critics have read it and objected. Answer those "
+        "objections by editing a working copy of the plan — not by re-planning the "
+        "project, and not by changing what nothing objected to.",
         "",
-        f"Repository root: {root.resolve()}",
-        f"Plan revision: {base_revision} (your patch must state this as "
-        f"`base_revision`)",
+        prompts.root_line(root),
+        f"Plan revision: {base_revision}",
         f"Adjudication round: {round_number}",
+        "",
+        *prompts.references(root, first=first, as_needed=as_needed),
+        f"Edit the working copy in {planfiles.rel(root, work / planfiles.FEATURES_DIRNAME)}:",
+        "  - revise a feature by editing its file;",
+        "  - add a feature by creating <new-id>.json with an id of your choosing. "
+        + (
+            "Writ assigns the real id;"
+            if features
+            else "Writ assigns the real id and rewrites every depends_on that names it;"
+        ),
+        "  - remove a feature by deleting its file, for example when merging two "
+        "that overlap into one.",
+        "The feature files define which features exist; plan.json is not updated "
+        "by you. A new feature looks like:",
+        CONTRACT_EXAMPLE if features else FEATURE_EXAMPLE,
+        "",
+        CONTRACT_RULES if features else RULES,
+        "",
+        *prompts.output(root, "response", directory / RESPONSE_FILENAME),
+        "",
+        "The file must contain JSON only — no prose, no code fence.",
+        "",
+        "Schema:",
+        RESPONSE_SCHEMA,
+        "",
+        "If you cannot write the file, print the same JSON to stdout inside a "
+        "single ```json fenced block instead.",
     ]
-    if doc is not None:
-        lines.append(f"Design document: {doc}")
-    lines.extend(
-        [
-            "",
-            f"The {len(blocking)} blocking finding(s) you must answer. Every one "
-            "needs a disposition:",
-        ]
-    )
-    lines.extend(f"  {finding.line()}" for finding in blocking)
-    if advisory:
-        lines.extend(
-            [
-                "",
-                f"{len(advisory)} advisory finding(s). Fix them if the same patch "
-                "can, but they do not block and you do not have to answer them:",
-            ]
-        )
-        lines.extend(f"  {finding.line()}" for finding in advisory[:20])
-    refused = list(prior_refusals)
-    if refused:
-        lines.extend(
-            [
-                "",
-                "Writ REFUSED your previous patch for these reasons. A patch that "
-                "breaks the same rule will be refused again:",
-            ]
-        )
-        lines.extend(f"  {finding.line()}" for finding in refused)
-        if accepted_entries:
-            lines.extend(
-                [
-                    "",
-                    "Nothing was wrong with the rest of that patch. These entries "
-                    "were sound and a patch is all-or-nothing, so send them again "
-                    "unchanged and fix only what is listed above:",
-                ]
-            )
-            lines.extend(f"  {entry}" for entry in accepted_entries)
-    # The inventory is not repeated here. It travels inside `plan_text`, whose
-    # `requirements` array is the same rows — and this copy was truncated at 6000
-    # characters, which on a plan with 180 obligations meant the adjudicator was
-    # handed a JSON array cut off mid-object and a rule saying it may not drop any
-    # of the ids it could no longer read. The count is what this line was for.
-    inventory = list(requirements)
-    if inventory:
-        lines.extend(
-            [
-                "",
-                f"The plan states {len(inventory)} requirement(s); they are in "
-                "`requirements` in the plan below. A patch may not drop or invent "
-                "one.",
-            ]
-        )
-    lines.extend(
-        [
-            "",
-            "The plan as committed:",
-            "```json",
-            plan_text.strip(),
-            "```",
-            "",
-            "Write your patch as JSON to this exact path:",
-            f"  {patch_path}",
-            "",
-            "The file must contain JSON only — no prose, no code fence.",
-            "",
-            "Schema:",
-            repair.PATCH_SCHEMA,
-            "",
-            "You may also revise the tasks already in the plan:",
-            repair.REVISE_SCHEMA,
-            "",
-            repair.PATCH_RULES,
-            "",
-            repair.PLAN_PATCH_RULES,
-            "",
-            "If you cannot write the file, print the same JSON to stdout inside a "
-            "single ```json fenced block instead.",
-        ]
-    )
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# the loop
 
 
 def loop(
     *,
     root: Path,
-    doc: Path | None,
+    doc: DesignDocs,
     directory: Path,
     agent: str,
     model: str | None,
@@ -222,13 +340,17 @@ def loop(
 
     The loop stops for one of four reasons, and says which: nothing blocking is
     left; the budget is spent; a finding survived its own repair; or the adjudicator
-    raised a question that needs a human. It never stops because a patch was
+    raised a question that needs a human. It never stops because a copy was
     refused — a refusal is information for the next attempt, and
     `repair.patches_left` bounds those separately.
 
-    The budget counts patches that *landed*, not agent runs. A refused patch changed
+    The budget counts repairs that *landed*, not agent runs. A refused copy changed
     nothing, so spending the plan's repair allowance on it would stop the loop over
     a plan that had never been repaired once.
+
+    `directory` holds one `round-<n>/` per attempt. Numbering continues from the
+    rounds already there, so resuming with `writ adjudicate` never overwrites the
+    working copy a refused attempt left behind.
 
     `recheck` is how the critics get re-run between rounds. It is injected rather
     than called directly because that is a command-layer concern — it spends agents,
@@ -243,12 +365,10 @@ def loop(
     opened = _blocking_ids(state.load(root))
     # Two counters, because a refusal is not a round. `attempt` numbers the agent
     # runs, so each one gets its own directory and its own place in the record;
-    # `landed` counts the patches that actually changed the plan, which is what the
-    # budget is about. Counting attempts against the budget made two refused patches
-    # spend the whole allowance — the adjudicator was never told what was wrong a
-    # second time, the critics never re-read anything, and the loop stopped saying
-    # the plan had been adjudicated twice when it had not been adjudicated at all.
-    attempt = 0
+    # `landed` counts the copies that actually changed the plan, which is what the
+    # budget is about.
+    attempt = rounds_on_disk(directory)
+    first_attempt = attempt + 1
     landed = 0
     while True:
         attempt += 1
@@ -261,18 +381,31 @@ def loop(
         if not blocking:
             result.stopped = "clean"
             break
+        # A finding that asks for a ruling is not the adjudicator's to answer:
+        # repairing around it is a guess. It goes to the decision log, and only
+        # what a repair can close is handed on.
+        decide = [f for f in blocking if f.category == DECISION_CATEGORY]
+        if decide:
+            _route_decisions(root, decide)
+        blocking = [f for f in blocking if f.category != DECISION_CATEGORY]
+        if not blocking:
+            result.stopped = (
+                f"{len(decide)} finding(s) need a human decision rather than a "
+                "repair; they are in the decision log (writ decisions)."
+            )
+            break
         if landed >= budget:
             result.stopped = (
                 (
                     f"the plan has been repaired {landed} time(s), its budget. What "
-                    "is still open needs a decision rather than another patch."
+                    "is still open needs a decision rather than another repair."
                 )
                 if landed
                 else "no repair was allowed (--max-rounds 0), so nothing was tried."
             )
             break
         stop = repair.plan_exhausted(data, max_rounds=budget)
-        if stop and attempt > 1:
+        if stop and attempt > first_attempt:
             result.stopped = stop
             break
         round_ = _one_round(
@@ -296,14 +429,16 @@ def loop(
                 "could not settle itself; they are in the decision log "
                 "(writ decisions)."
             )
+            if round_.progressed and recheck is not None:
+                recheck()
             break
         if round_.error:
-            # Named for whose failure it was. A patch writ validated and then could
-            # not apply is writ's bug, and telling someone their adjudicator failed
+            # Named for whose failure it was. A copy writ validated and then could
+            # not promote is writ's bug, and telling someone their adjudicator failed
             # sends them to read a transcript of an agent that did nothing wrong.
             whose = (
                 "the repair could not be applied"
-                if round_.error.startswith("the patch could not be applied")
+                if round_.error.startswith(PROMOTION_FAILED)
                 else "the adjudicator failed"
             )
             result.stopped = f"{whose}: {round_.error}"
@@ -312,18 +447,18 @@ def loop(
             request = _open_request(root)
             if request is not None and not repair.patches_left(request):
                 result.stopped = (
-                    f"writ refused {repair.refusals(request)} patches for "
+                    f"writ refused {repair.refusals(request)} attempts for "
                     f"{request['id']}; what is being asked of the adjudicator is "
-                    "what needs to change, not the wording of its patch."
+                    "what needs to change, not the wording of its edit."
                 )
                 break
             continue
         if round_.progressed:
             landed += 1
             if recheck is not None:
-                # The patch landed, so every critic that passed the old revision has
+                # The copy landed, so every critic that passed the old revision has
                 # now reviewed something else. Re-running them is what closes a
-                # finding on evidence rather than on the patch's word.
+                # finding on evidence rather than on the response's word.
                 recheck()
     data = state.load(root)
     still_open = _blocking_ids(data)
@@ -332,10 +467,20 @@ def loop(
     return result
 
 
+def rounds_on_disk(directory: Path) -> int:
+    """The highest `round-<n>` already in `directory`, or 0."""
+    numbers = [
+        int(path.name.split("-", 1)[1])
+        for path in directory.glob("round-*")
+        if path.is_dir() and path.name.split("-", 1)[1].isdigit()
+    ]
+    return max(numbers, default=0)
+
+
 def _one_round(
     *,
     root: Path,
-    doc: Path | None,
+    doc: DesignDocs,
     directory: Path,
     resolved: agents.ResolvedAgent,
     timeout: int | None,
@@ -345,9 +490,8 @@ def _one_round(
     stream: bool,
     on_start: Callable[[int, agents.ResolvedAgent], None] | None,
 ) -> Round:
-    """One proposal: open a request, run the agent, validate, apply or refuse."""
+    """One attempt: prepare the round, run the agent, validate, promote or refuse."""
     directory.mkdir(parents=True, exist_ok=True)
-    patch_path = directory / PATCH_FILENAME
     with state.transaction(root) as data:
         request = repair.plan_request(data)
         if request is None:
@@ -365,10 +509,10 @@ def _one_round(
         request["status"] = "planning"
         request_id = request["id"]
         base_revision = plans.revision(data)
-        prior = _refusal_findings(request)
-        sound = _refusal_accepted(request)
-        plan_text = _plan_json(data, blocking)
-        inventory = [dict(record) for record in plans.requirements(data).values()]
+        seed, previous = _previous_attempt(root, request, base_revision, directory)
+        prepare(root, data, directory, blocking, seed=seed)
+        extra = _artifact_refs(root, data)
+        features = _has_features(data)
     round_ = Round(
         number=number,
         request_id=request_id,
@@ -378,17 +522,17 @@ def _one_round(
     prompt = build_prompt(
         root=root,
         doc=doc,
-        plan_text=plan_text,
-        patch_path=patch_path,
-        findings=blocking,
-        requirements=inventory,
-        prior_refusals=prior,
-        accepted_entries=sound,
+        directory=directory,
+        blocking=len(blocking),
         round_number=number,
         base_revision=base_revision,
+        previous=previous,
+        extra=extra,
+        features=features,
     )
     if on_start is not None:
         on_start(number, resolved)
+    response_path = directory / RESPONSE_FILENAME
     try:
         round_.exit_code = runner.run_agent(
             resolved.command,
@@ -408,30 +552,35 @@ def _one_round(
         round_.error = str(exc)
         _reopen(root, request_id)
         return round_
-    text = _patch_text(directory, patch_path)
+    text = _response_text(directory, response_path)
     if text is None:
-        round_.error = f"the adjudicator wrote no patch to {patch_path}"
+        round_.error = (
+            f"the adjudicator wrote no response to {planfiles.rel(root, response_path)}"
+        )
         _reopen(root, request_id)
         return round_
     try:
-        patch = repair.load_patch(text)
+        response = load_response(text)
     except WritError as exc:
-        round_.error = f"unusable patch: {exc}"
+        round_.error = f"unusable response: {exc}"
         _reopen(root, request_id)
         return round_
-    # `validate` decides what may be applied, so a patch that fails *during* apply
-    # has broken an invariant validation does not cover — writ's bug, not the
-    # adjudicator's. It still must not take the loop down with it: raising here
-    # escaped `loop` entirely, so `writ adjudicate` died on the round, printed
-    # `repair did not run`, and left the request at `planning` with no attempt on
-    # its record. The plan was then stuck: unrepaired, and out of anything that
-    # would try again. A round that cannot apply is a failed round, which is what
-    # every other failure in this function already is.
+    # Validation decides what may be promoted, so a copy that fails *during*
+    # promotion has broken an invariant validation does not cover — writ's bug, not
+    # the adjudicator's. It still must not take the loop down with it: the round
+    # fails, the transaction rolls back, and the request stays open.
     try:
         with state.transaction(root) as data:
             request = repair.get_request(data, request_id)
-            found = repair.validate(data, patch, request)
+            found, proposed, diff = validate(
+                data,
+                directory,
+                response,
+                finding_ids=[f.id for f in blocking if f.id],
+                base_revision=base_revision,
+            )
             refused = [finding for finding in found if finding.blocking]
+            _write_validation(directory, base_revision, found, diff)
             if refused:
                 round_.refused = refused
                 request["status"] = "open"
@@ -439,53 +588,927 @@ def _one_round(
                     {
                         "at": utcnow(),
                         "round": number,
+                        "revision": base_revision,
+                        "directory": planfiles.rel(root, directory),
                         "reasons": [finding.to_dict() for finding in refused],
-                        # What the refusal was *not* about. A patch is atomic, so one
-                        # bad entry costs all of it — on the plan this was written
-                        # for, eleven sound revisions were discarded over a single
-                        # objection to a twelfth, three rounds running, because the
-                        # adjudicator was told only what broke and rewrote everything
-                        # each time. Naming the entries that passed makes the retry a
-                        # targeted edit instead of a fresh attempt.
-                        "accepted_entries": _sound_entries(patch, refused),
                     }
                 )
                 return round_
-            if patch.empty and patch.questions:
-                round_.questions = list(patch.questions)
-                _raise_questions(data, patch, request)
+            questions = response["questions"]
+            if _no_edits(diff):
+                round_.questions = list(questions)
+                _raise_questions(data, questions, request)
                 return round_
-            round_.applied = repair.apply_patch(
-                data, patch, request, actor="adjudicator"
+            round_.applied = promote(
+                data, request, proposed, diff, response, actor="adjudicator"
             )
-            # Deterministic checks run against the patched plan immediately. A patch
+            if questions:
+                # Edits and questions together: the edits land, and the questions
+                # still stop the loop for the human who has to answer them.
+                round_.questions = list(questions)
+                _raise_questions(data, questions, request, status="applied")
+            # Deterministic checks run against the promoted plan immediately. A copy
             # that closed one finding and opened another says so here, before the
             # critics are spent on it.
             plans.run_check(data, root=root.resolve())
+            planfiles.export(root, data)
             round_.blocking_after = sum(
                 1
                 for finding in plans.findings(data, open_only=True)
                 if finding.severity == "error"
             )
     except WritError as exc:
-        # The transaction rolled back on the way out, so no half-applied patch is
-        # in the store and the round left the plan as it found it.
-        round_.error = f"the patch could not be applied: {exc}"
-        # Not `None`: `progressed` reads this, and a round that applied nothing is
-        # a round that changed nothing.
+        round_.error = f"{PROMOTION_FAILED}: {exc}"
         round_.applied = {}
+        round_.questions = []
         _reopen(root, request_id)
         return round_
     return round_
 
 
+# --------------------------------------------------------------------------
+# preparing a round
+
+
+def prepare(
+    root: Path,
+    data: dict[str, Any],
+    directory: Path,
+    blocking: Iterable[Finding],
+    *,
+    seed: Path | None = None,
+) -> Path:
+    """Write `to-fix.json` and the working copy for one attempt.
+
+    `seed` is a refused attempt's `plan/features/`. Starting from it is what makes
+    a retry a correction instead of a fresh attempt: the edits that were sound are
+    still there, and only what `validation.json` listed needs changing.
+    """
+    planfiles.dump(
+        directory / TO_FIX_FILENAME,
+        [finding.to_dict() for finding in blocking],
+    )
+    work = directory / WORKING_DIRNAME
+    features = work / planfiles.FEATURES_DIRNAME
+    if features.exists():
+        shutil.rmtree(features)
+    if seed is not None and seed.is_dir():
+        shutil.copytree(seed, features)
+    else:
+        planfiles.write_features(features, data.get("tasks", {}))
+    index = planfiles.index(root, data)
+    for row in index["features"]:
+        row["file"] = planfiles.rel(root, features / f"{row['id']}.json")
+    planfiles.dump(work / planfiles.INDEX_FILENAME, index)
+    return work
+
+
+def _previous_attempt(
+    root: Path, request: dict[str, Any], revision: int, directory: Path
+) -> tuple[Path | None, Path | None]:
+    """The refused working copy to start from, and its validation report.
+
+    Only a refusal against this same revision counts: a copy of an older plan
+    would undo whatever landed since.
+    """
+    refusals = request.get("refusals") or []
+    if not refusals:
+        return None, None
+    last = refusals[-1]
+    if last.get("revision") != revision or not last.get("directory"):
+        return None, None
+    folder = Path(root) / str(last["directory"])
+    if folder.resolve() == directory.resolve():
+        return None, None
+    seed = folder / WORKING_DIRNAME / planfiles.FEATURES_DIRNAME
+    report = folder / VALIDATION_FILENAME
+    return (
+        seed if seed.is_dir() else None,
+        report if report.exists() else None,
+    )
+
+
+def _artifact_refs(root: Path, data: dict[str, Any]) -> list[Ref]:
+    """The analysis artifacts next to the plan, when they exist."""
+    folder = planfiles.directory(root, data)
+    refs = []
+    for name, purpose in (
+        ("inventory.json", "the repo summary: language, tests, components"),
+        ("requirements.json", "each requirement and its details"),
+    ):
+        if (folder / name).exists():
+            refs.append(Ref(folder / name, purpose))
+    return refs
+
+
+# --------------------------------------------------------------------------
+# reading the attempt back
+
+
+def load_response(text: str) -> dict[str, Any]:
+    """Parse and shape-check the adjudicator's response. Semantics come later."""
+    from .planning import extract_json
+
+    stripped = (text or "").strip()
+    if not stripped:
+        raise WritError("the response is empty")
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        recovered = extract_json(stripped)
+        if recovered is None:
+            raise WritError(f"the response is not valid JSON: {exc}") from exc
+        payload = json.loads(recovered)
+    if not isinstance(payload, dict):
+        raise WritError("the response must be a JSON object")
+    return {
+        "analysis": str(payload.get("analysis", "")).strip(),
+        "dispositions": _objects(payload.get("dispositions"), "dispositions"),
+        "questions": _objects(payload.get("questions"), "questions"),
+    }
+
+
+def _objects(value: Any, where: str) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise WritError(f"`{where}` must be a list")
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise WritError(f"{where}[{index}] must be an object")
+    return list(value)
+
+
+def _response_text(directory: Path, path: Path) -> str | None:
+    """The response file, or JSON the adjudicator printed to stdout instead."""
+    from .planning import extract_json
+
+    if path.exists():
+        text = path.read_text(encoding="utf-8").strip()
+        if text:
+            return text
+    stdout = directory / "stdout.log"
+    if not stdout.exists():
+        return None
+    text = stdout.read_text(encoding="utf-8").strip()
+    if not text:
+        return None
+    return extract_json(text)
+
+
+LIST_FIELDS = (
+    "requirement_ids",
+    "depends_on",
+    "acceptances",
+    "allowed",
+    "forbidden",
+    "owns",
+    "provides",
+    "consumes",
+)
+
+
+def _criterion(item: Any) -> str:
+    return str(item.get("text", "")) if isinstance(item, dict) else str(item)
+
+
+def normal(entry: dict[str, Any]) -> dict[str, Any]:
+    """A feature's editable fields, in the form two of them are compared in."""
+    return {
+        "title": str(entry.get("title") or "").strip(),
+        "goal": str(entry.get("goal") or "").strip(),
+        "owns": [str(item) for item in entry.get("owns") or []],
+        "provides": [str(item) for item in entry.get("provides") or []],
+        "consumes": [str(item) for item in entry.get("consumes") or []],
+        "notes": str(entry.get("notes") or "").strip(),
+        "design_section": entry.get("design_section") or None,
+        "requirement_ids": [str(item) for item in entry.get("requirement_ids") or []],
+        "depends_on": [str(item) for item in entry.get("depends_on") or []],
+        "acceptances": [
+            _criterion(item).strip() for item in entry.get("acceptances") or []
+        ],
+        "allowed": [str(item) for item in entry.get("allowed") or []],
+        "forbidden": [str(item) for item in entry.get("forbidden") or []],
+    }
+
+
+def _refuse(category: str, message: str, where: str, action: str = "") -> Finding:
+    return Finding(
+        severity="error",
+        category=category,
+        message=message,
+        where=where,
+        suggested_action=action,
+        source="writ",
+    )
+
+
+def read_copy(work: Path) -> tuple[dict[str, dict[str, Any]], list[Finding]]:
+    """Every feature file in the working copy, and what is wrong with its shape."""
+    found: list[Finding] = []
+    proposed: dict[str, dict[str, Any]] = {}
+    folder = work / planfiles.FEATURES_DIRNAME
+    for path in sorted(folder.glob("*.json")):
+        where = f"{WORKING_DIRNAME}/{planfiles.FEATURES_DIRNAME}/{path.name}"
+        try:
+            entry = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            found.append(_refuse("feature-shape", f"is not valid JSON: {exc}", where))
+            continue
+        if not isinstance(entry, dict):
+            found.append(_refuse("feature-shape", "must be a JSON object", where))
+            continue
+        problems = []
+        if str(entry.get("id", "")) != path.stem:
+            problems.append(
+                f"its id {entry.get('id')!r} does not match its filename {path.stem!r}"
+            )
+        if not str(entry.get("title") or "").strip():
+            problems.append("has no title")
+        for key in LIST_FIELDS:
+            if entry.get(key) is not None and not isinstance(entry.get(key), list):
+                problems.append(f"`{key}` must be a list")
+        if isinstance(entry.get("acceptances"), list) and not any(
+            _criterion(item).strip() for item in entry["acceptances"]
+        ):
+            problems.append("has no acceptance criteria")
+        elif entry.get("acceptances") is None:
+            problems.append("has no acceptance criteria")
+        if problems:
+            found.extend(_refuse("feature-shape", problem, where) for problem in problems)
+            continue
+        proposed[path.stem] = entry
+    return proposed, found
+
+
+def _digest(rows: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(rows, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def validate(
+    data: dict[str, Any],
+    directory: Path,
+    response: dict[str, Any],
+    *,
+    finding_ids: Iterable[str],
+    base_revision: int,
+) -> tuple[list[Finding], dict[str, dict[str, Any]], dict[str, list[str]]]:
+    """Everything writ enforces about a working copy, as findings rather than a raise.
+
+    A list, because a copy with three problems should say so once. Returns the
+    findings, the features the copy proposes, and the diff against the committed
+    plan (`revised`, `added`, `removed`).
+    """
+    work = directory / WORKING_DIRNAME
+    tasks = data.get("tasks", {})
+    inventory = plans.requirements(data)
+    proposed, found = read_copy(work)
+    index_where = f"{WORKING_DIRNAME}/{planfiles.INDEX_FILENAME}"
+
+    if plans.revision(data) != base_revision:
+        found.append(
+            _refuse(
+                "stale-copy",
+                f"the copy was made from revision {base_revision}, but the plan is "
+                f"at {plans.revision(data)}; it changed underneath this attempt",
+                index_where,
+            )
+        )
+    try:
+        index = json.loads((work / planfiles.INDEX_FILENAME).read_text(encoding="utf-8"))
+        rows = index.get("requirements") if isinstance(index, dict) else None
+    except (OSError, json.JSONDecodeError):
+        rows = None
+    if rows is None or _digest(rows) != _digest(planfiles.requirement_rows(data)):
+        found.append(
+            _refuse(
+                "requirements-edited",
+                "the requirement inventory in the copied index was changed or "
+                "removed; the inventory is fixed",
+                index_where,
+                "leave plan/plan.json exactly as writ wrote it",
+            )
+        )
+
+    committed = {task_id: normal(planfiles.feature(task)) for task_id, task in tasks.items()}
+    diff: dict[str, list[str]] = {"revised": [], "added": [], "removed": []}
+    for task_id, task in tasks.items():
+        where = f"{WORKING_DIRNAME}/{planfiles.FEATURES_DIRNAME}/{task_id}.json"
+        entry = proposed.get(task_id)
+        is_gate = task.get("kind") == "gate"
+        if entry is None:
+            if is_gate:
+                found.append(
+                    _refuse("gate-edited", f"gate {task_id} was deleted", where,
+                            "restore the file; gates are writ's")
+                )
+            elif task.get("status") != "planned":
+                found.append(
+                    _refuse(
+                        "started-task-edited",
+                        f"{task_id} is {task.get('status')} and was deleted",
+                        where,
+                        "restore it, or raise a question",
+                    )
+                )
+            else:
+                diff["removed"].append(task_id)
+            continue
+        for key in ("kind", "milestone"):
+            if key in entry and entry.get(key) != task.get(key):
+                found.append(
+                    _refuse(
+                        "fixed-field-edited",
+                        f"`{key}` changed from {task.get(key)!r} to {entry.get(key)!r}",
+                        where,
+                        "to move a feature, delete it and add a new one",
+                    )
+                )
+        after = normal(entry)
+        before = committed[task_id]
+        if is_gate:
+            # What a gate depends on and covers is recomputed from its milestone,
+            # so only the parts writ does not derive are compared.
+            derived = ("depends_on", "requirement_ids")
+            if {k: v for k, v in after.items() if k not in derived} != {
+                k: v for k, v in before.items() if k not in derived
+            }:
+                found.append(
+                    _refuse("gate-edited", f"gate {task_id} was edited", where,
+                            "restore the file; gates are writ's")
+                )
+            continue
+        if after == before:
+            continue
+        if task.get("status") != "planned":
+            found.append(
+                _refuse(
+                    "started-task-edited",
+                    f"{task_id} is {task.get('status')} and was edited",
+                    where,
+                    "restore it, or raise a question",
+                )
+            )
+            continue
+        if len(after["acceptances"]) < len(before["acceptances"]):
+            found.append(
+                _refuse(
+                    "weakened-criteria",
+                    f"{task_id} ends with {len(after['acceptances'])} criteria; it "
+                    f"had {len(before['acceptances'])}",
+                    where,
+                    "sharpen criteria rather than removing them",
+                )
+            )
+        diff["revised"].append(task_id)
+    for ref, entry in proposed.items():
+        if ref in tasks:
+            continue
+        where = f"{WORKING_DIRNAME}/{planfiles.FEATURES_DIRNAME}/{ref}.json"
+        if str(entry.get("kind") or "task") != "task":
+            found.append(
+                _refuse("feature-shape", "a new feature must be of kind `task`", where)
+            )
+        milestone = entry.get("milestone")
+        milestones = data.get("milestones", {})
+        if milestone and milestone not in milestones:
+            found.append(
+                _refuse("feature-shape", f"names unknown milestone {milestone!r}", where)
+            )
+        elif not milestone and milestones and not contracts.is_feature(entry):
+            found.append(
+                _refuse(
+                    "feature-shape",
+                    "a new feature needs a `milestone`",
+                    where,
+                    f"one of {', '.join(sorted(milestones))}",
+                )
+            )
+        diff["added"].append(ref)
+
+    # Requirements: none invented, and none a task covered left uncovered.
+    for ref, entry in proposed.items():
+        unknown = [req for req in normal(entry)["requirement_ids"] if req not in inventory]
+        if unknown and inventory:
+            found.append(
+                _refuse(
+                    "unknown-requirement",
+                    f"names requirement(s) not in the inventory: {', '.join(unknown)}",
+                    f"{WORKING_DIRNAME}/{planfiles.FEATURES_DIRNAME}/{ref}.json",
+                )
+            )
+
+    def covered(features: dict[str, dict[str, Any]], kinds: dict[str, str]) -> set[str]:
+        return {
+            req
+            for ref, entry in features.items()
+            if kinds.get(ref, "task") != "gate"
+            for req in entry["requirement_ids"]
+        }
+
+    kinds = {task_id: task.get("kind", "task") for task_id, task in tasks.items()}
+    lost = covered(committed, kinds) - covered(
+        {ref: normal(entry) for ref, entry in proposed.items()}, kinds
+    )
+    if lost:
+        found.append(
+            _refuse(
+                "coverage-regression",
+                f"no task covers {', '.join(sorted(lost))} any more",
+                f"{WORKING_DIRNAME}/{planfiles.FEATURES_DIRNAME}/",
+                "keep every requirement covered by some task",
+            )
+        )
+
+    found.extend(_validate_graph(tasks, proposed))
+    found.extend(_validate_answers(response, finding_ids, diff))
+    return sort_findings(found), proposed, diff
+
+
+def _gate_edges(nodes: dict[str, dict[str, Any]]) -> dict[str, list[str]]:
+    """What each gate depends on, derived from milestone membership.
+
+    `nodes` maps an id to a record with `kind`, `milestone` and, for a gate,
+    `scope`. A milestone gate waits for the milestone's tasks; the final gate
+    waits for every milestone gate and every task no milestone gate covers.
+    """
+    plain = {ref: node for ref, node in nodes.items() if node.get("kind") != "gate"}
+    edges: dict[str, list[str]] = {}
+    milestone_gates = [
+        ref
+        for ref, node in nodes.items()
+        if node.get("kind") == "gate" and ref != gates.FINAL_GATE_ID
+    ]
+    for ref in milestone_gates:
+        milestone = gates.milestone_of(nodes[ref]) or nodes[ref].get("milestone")
+        edges[ref] = sorted(
+            other for other, node in plain.items() if node.get("milestone") == milestone
+        )
+    if gates.FINAL_GATE_ID in nodes:
+        held = {dep for deps in edges.values() for dep in deps}
+        edges[gates.FINAL_GATE_ID] = sorted(
+            set(milestone_gates) | {ref for ref in plain if ref not in held}
+        )
+    return edges
+
+
+def _validate_graph(
+    tasks: dict[str, dict[str, Any]], proposed: dict[str, dict[str, Any]]
+) -> list[Finding]:
+    """Dependencies name features in the copy, and there is no cycle."""
+    found: list[Finding] = []
+    nodes: dict[str, dict[str, Any]] = {}
+    for ref, entry in proposed.items():
+        task = tasks.get(ref)
+        nodes[ref] = {
+            "kind": task.get("kind", "task") if task else "task",
+            "milestone": task.get("milestone") if task else entry.get("milestone"),
+            "scope": task.get("scope") if task else None,
+        }
+    edges: dict[str, list[str]] = {}
+    for ref, entry in proposed.items():
+        if nodes[ref]["kind"] == "gate":
+            continue
+        where = f"{WORKING_DIRNAME}/{planfiles.FEATURES_DIRNAME}/{ref}.json"
+        deps = normal(entry)["depends_on"]
+        if contracts.is_feature(entry):
+            # a feature's edges to other features are derived on promotion, so
+            # a stale one left in the file is ignored rather than refused
+            deps = [
+                dep
+                for dep in deps
+                if not contracts.is_feature(tasks.get(dep) or proposed.get(dep) or {})
+                and not (dep in tasks and dep not in proposed)
+            ]
+        for dep in deps:
+            if dep == ref:
+                found.append(_refuse("bad-dependency", "depends on itself", where))
+            elif dep not in proposed:
+                found.append(
+                    _refuse(
+                        "bad-dependency",
+                        f"depends on {dep}, which is not in the working copy",
+                        where,
+                    )
+                )
+        edges[ref] = [dep for dep in deps if dep in proposed and dep != ref]
+    # the edges writ will derive from the contracts on promotion, so a cycle the
+    # contracts make is refused here rather than failing the promotion
+    for ref, deps in contracts.edges(_feature_entries(proposed)).items():
+        edges[ref] = sorted(set(edges.get(ref, [])) | set(deps))
+    edges.update(_gate_edges(nodes))
+    cycle = _cycle(edges)
+    if cycle:
+        found.append(
+            _refuse(
+                "dependency-cycle",
+                "dependency cycle: " + " -> ".join(cycle),
+                f"{WORKING_DIRNAME}/{planfiles.FEATURES_DIRNAME}/",
+                "a gate waits for its milestone's tasks, so a task may not depend "
+                "on its own milestone's gate",
+            )
+        )
+    return found
+
+
+def _cycle(edges: dict[str, list[str]]) -> list[str]:
+    marks: dict[str, int] = {}
+    trail: list[str] = []
+
+    def visit(node: str) -> list[str]:
+        mark = marks.get(node, 0)
+        if mark == 1:
+            return trail[trail.index(node):] + [node]
+        if mark == 2:
+            return []
+        marks[node] = 1
+        trail.append(node)
+        for dep in edges.get(node, []):
+            found = visit(dep)
+            if found:
+                return found
+        trail.pop()
+        marks[node] = 2
+        return []
+
+    for node in edges:
+        found = visit(node)
+        if found:
+            return found
+    return []
+
+
+def _no_edits(diff: dict[str, list[str]]) -> bool:
+    return not any(diff.values())
+
+
+def _validate_answers(
+    response: dict[str, Any], finding_ids: Iterable[str], diff: dict[str, list[str]]
+) -> list[Finding]:
+    """Every finding is answered, and the attempt did something."""
+    found: list[Finding] = []
+    questions = response["questions"]
+    if _no_edits(diff) and not questions:
+        found.append(
+            _refuse(
+                "no-op",
+                "edits nothing and asks nothing, so the plan would draw the same "
+                "findings again",
+                RESPONSE_FILENAME,
+                "edit the features the findings are about, or raise a question",
+            )
+        )
+        return found
+    if _no_edits(diff):
+        # "I cannot repair any of this without a ruling" answers the whole round, so
+        # its questions need not name each finding one by one.
+        return found
+    stated = {
+        str(entry.get("finding_id", "")): entry for entry in response["dispositions"]
+    }
+    asked = {str(question.get("finding_id", "")) for question in questions}
+    for finding_id in finding_ids:
+        entry = stated.get(finding_id)
+        if entry is None:
+            if finding_id not in asked:
+                found.append(
+                    _refuse(
+                        "undisposed-finding",
+                        f"{finding_id} is in to-fix.json and the response does not "
+                        "answer it",
+                        RESPONSE_FILENAME,
+                        "accept it and name the change, decline it with evidence, or "
+                        "raise it as a question",
+                    )
+                )
+            continue
+        disposition = str(entry.get("disposition", entry.get("resolution", ""))).lower()
+        if disposition == "declined":
+            if not str(entry.get("reason", "")).strip():
+                found.append(
+                    _refuse(
+                        "undisposed-finding",
+                        f"{finding_id} is declined with no reason given",
+                        RESPONSE_FILENAME,
+                        "say why the finding is wrong, with evidence",
+                    )
+                )
+        elif disposition == "accepted":
+            if not str(entry.get("change", "")).strip():
+                found.append(
+                    _refuse(
+                        "undisposed-finding",
+                        f"{finding_id} is accepted but `change` does not say what "
+                        "was edited",
+                        RESPONSE_FILENAME,
+                        "name the features you changed and how",
+                    )
+                )
+        else:
+            found.append(
+                _refuse(
+                    "undisposed-finding",
+                    f"{finding_id} has disposition {disposition!r}; use `accepted` "
+                    "or `declined`",
+                    RESPONSE_FILENAME,
+                )
+            )
+    return found
+
+
+def _write_validation(
+    directory: Path, revision: int, found: list[Finding], diff: dict[str, list[str]]
+) -> None:
+    refused = [finding for finding in found if finding.blocking]
+    planfiles.dump(
+        directory / VALIDATION_FILENAME,
+        {
+            "accepted": not refused,
+            "revision": revision,
+            "problems": [finding.to_dict() for finding in found],
+            "changes": diff,
+        },
+    )
+
+
+# --------------------------------------------------------------------------
+# promotion
+
+
+def promote(
+    data: dict[str, Any],
+    request: dict[str, Any],
+    proposed: dict[str, dict[str, Any]],
+    diff: dict[str, list[str]],
+    response: dict[str, Any],
+    *,
+    actor: str = "adjudicator",
+) -> dict[str, Any]:
+    """Apply a validated working copy to the graph.
+
+    The caller holds the state transaction, so a raise here rolls the whole
+    promotion back rather than leaving half a repair in the store.
+    """
+    tasks = data["tasks"]
+    removed = list(diff["removed"])
+    translate: dict[str, str] = {}
+    minted: list[str] = []
+    for ref in diff["added"]:
+        milestone = proposed[ref].get("milestone") or None
+        if contracts.is_feature(proposed[ref]) and milestone not in data.get(
+            "milestones", {}
+        ):
+            task_id = _next_feature_id(data, minted)
+        else:
+            task_id = repair._next_repair_id(
+                data,
+                milestone if milestone in data.get("milestones", {}) else None,
+                minted=minted,
+            )
+        minted.append(task_id)
+        translate[ref] = task_id
+
+    for task_id in removed:
+        tasks.pop(task_id, None)
+    for task in tasks.values():
+        if any(dep in removed for dep in task.get("depends_on", [])):
+            task["depends_on"] = [
+                dep for dep in task["depends_on"] if dep not in removed
+            ]
+
+    extras = _fence_extras(tasks)
+    for ref in diff["added"]:
+        entry = normal(proposed[ref])
+        feature = contracts.is_feature(proposed[ref])
+        milestone = proposed[ref].get("milestone") or None
+        task = add_task(
+            data,
+            task_id=translate[ref],
+            title=entry["title"],
+            milestone=milestone if milestone in data.get("milestones", {}) else None,
+            acceptances=entry["acceptances"],
+            allowed=(
+                contracts.fence(entry["owns"], [*entry["allowed"], *extras])
+                if feature
+                else entry["allowed"]
+            ),
+            forbidden=entry["forbidden"],
+            design_section=entry["design_section"] or entry["title"],
+            requirement_ids=entry["requirement_ids"],
+            notes=entry["notes"],
+            feature=(
+                {key: entry[key] for key in contracts_fields()} if feature else None
+            ),
+        )
+        task["repair"] = {
+            "request": request["id"],
+            "gate": "",
+            "scope": repair.scope_of(request),
+            "proposed_as": ref,
+            "round": request.get("round", 1),
+        }
+
+    revised: list[str] = []
+    for ref in [*diff["revised"], *diff["added"]]:
+        entry = normal(proposed[ref])
+        task = tasks[translate.get(ref, ref)]
+        before = normal(planfiles.feature(task))
+        entry["depends_on"] = [translate.get(dep, dep) for dep in entry["depends_on"]]
+        if ref in translate:
+            task["depends_on"] = entry["depends_on"]
+            continue
+        changed = sorted(key for key in entry if entry[key] != before[key])
+        if "owns" in changed and "allowed" not in changed:
+            # The fence follows the component: what was fenced beyond the old
+            # `owns` (the test directories, anything added by hand) stays.
+            kept = [path for path in before["allowed"] if path not in before["owns"]]
+            entry["allowed"] = contracts.fence(entry["owns"], kept)
+            if entry["allowed"] != before["allowed"]:
+                changed = sorted({*changed, "allowed"})
+        for key in changed:
+            if key == "acceptances":
+                # A criterion is a record, not a string: it carries the status a
+                # reviewer will set. One whose wording is unchanged keeps its record.
+                held = {item["text"]: item for item in task.get("acceptances", [])}
+                task["acceptances"] = [
+                    dict(held[text]) if text in held else {"text": text, "status": "pending"}
+                    for text in entry["acceptances"]
+                ]
+            else:
+                task[key] = entry[key]
+        if changed:
+            task.setdefault("revisions", []).append(
+                {"request": request["id"], "at": utcnow(), "fields": changed}
+            )
+            task["updated_at"] = utcnow()
+            revised.append(ref)
+
+    _rederive_edges(data)
+    _recompute_gates(data)
+    refresh_milestones(data)
+    check_dag(data)
+
+    for entry in response["dispositions"]:
+        disposition = str(entry.get("disposition", entry.get("resolution", ""))).lower()
+        if disposition not in ("accepted", "declined"):
+            continue
+        try:
+            plans.dispose(
+                data,
+                str(entry.get("finding_id", "")),
+                disposition,
+                actor=actor,
+                reason=str(entry.get("reason", "")),
+                change=str(entry.get("change", "")),
+            )
+        except WritError:
+            continue
+
+    added = [translate[ref] for ref in diff["added"]]
+    request["status"] = "applied"
+    request["applied_at"] = utcnow()
+    request["applied_tasks"] = added
+    request["revised_tasks"] = revised
+    request["removed_tasks"] = removed
+    request["analysis"] = response["analysis"]
+    request["questions"] = list(response["questions"])
+    plans.bump(data)
+    return {
+        "tasks": added,
+        "revised": revised,
+        "removed": removed,
+        "scope": repair.scope_of(request),
+        "revision": plans.revision(data),
+    }
+
+
+def contracts_fields() -> tuple[str, ...]:
+    return planfiles.CONTRACT_FIELDS
+
+
+def _has_features(data: dict[str, Any]) -> bool:
+    return any(contracts.is_feature(task) for task in data.get("tasks", {}).values())
+
+
+def _feature_entries(entries: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {ref: entry for ref, entry in entries.items() if contracts.is_feature(entry)}
+
+
+def _next_feature_id(data: dict[str, Any], minted: Iterable[str]) -> str:
+    claimed = set(data["tasks"]) | set(minted)
+    taken = [
+        int(task_id[3:])
+        for task_id in claimed
+        if task_id.startswith("FT-") and task_id[3:].isdigit()
+    ]
+    return f"FT-{(max(taken) + 1) if taken else 1:03d}"
+
+
+def _fence_extras(tasks: dict[str, dict[str, Any]]) -> list[str]:
+    """What every feature is fenced to beyond what it owns: the test directories.
+
+    Read off the committed features rather than the repo summary, because they
+    are what the summary put there at commit, and promotion has no other copy.
+    """
+    extras: list[set[str]] = [
+        set(task.get("allowed") or []) - set(task.get("owns") or [])
+        for task in tasks.values()
+        if contracts.is_feature(task) and task.get("kind") != "gate"
+    ]
+    if not extras:
+        return []
+    return sorted(set.intersection(*extras))
+
+
+def _rederive_edges(data: dict[str, Any]) -> None:
+    """Replace every planned feature's edges to other features with the derived ones.
+
+    Edges between features are the contracts' to state (docs/planning-redesign.md
+    §4). An edge to a plain task was stated by hand and is kept; an edge to a
+    feature is recomputed, so a contract a repair removed takes its edge with it.
+    """
+    tasks = data["tasks"]
+    features = {
+        task_id: task for task_id, task in tasks.items() if contracts.is_feature(task)
+    }
+    for task_id, deps in contracts.edges(features).items():
+        task = features[task_id]
+        if task.get("status") != "planned":
+            continue
+        stated = [
+            dep
+            for dep in task.get("depends_on", [])
+            if dep in tasks and dep not in features
+        ]
+        task["depends_on"] = stated + [dep for dep in deps if dep not in stated]
+
+
+def _route_decisions(root: Path, findings: list[Finding]) -> None:
+    """Put each `needs-decision` finding in the decision log, once."""
+    from . import decisions
+
+    with state.transaction(root) as data:
+        raised = {item.get("finding") for item in data.get("decisions", [])}
+        for finding in findings:
+            if not finding.id or finding.id in raised:
+                continue
+            record = decisions.propose(
+                data,
+                title=finding.message[:72] or "a plan decision",
+                decision="Undecided: a critic found the plan needs a ruling here.",
+                context=(
+                    f"{finding.id} ({finding.source}, {finding.where}): "
+                    f"{finding.message}"
+                    + (f" Suggested: {finding.suggested_action}" if finding.suggested_action else "")
+                ),
+                consequences="The plan stays unapproved until this is settled.",
+                proposed_by=finding.source or "critic",
+                tasks=[finding.where] if finding.where else [],
+            )
+            record["finding"] = finding.id
+
+
+def _recompute_gates(data: dict[str, Any]) -> None:
+    """Point every unfinished gate at its milestone's tasks as they now stand."""
+    tasks = data["tasks"]
+    for gate_id, deps in _gate_edges(tasks).items():
+        gate = tasks[gate_id]
+        if gate.get("status") != "planned":
+            continue
+        gate["depends_on"] = deps
+        if gate_id == gates.FINAL_GATE_ID:
+            gate["requirement_ids"] = gates.answerable_requirements(data)
+            continue
+        milestone = gates.milestone_of(gate) or gate.get("milestone")
+        requirement_ids = sorted(
+            {req for dep in deps for req in tasks[dep].get("requirement_ids", [])}
+        )
+        gate["requirement_ids"] = requirement_ids
+        if milestone in data.get("milestones", {}):
+            held = {item["text"]: item for item in gate.get("acceptances", [])}
+            gate["acceptances"] = [
+                dict(held[text]) if text in held else {"text": text, "status": "pending"}
+                for text in gates.milestone_criteria(data, milestone, requirement_ids)
+            ]
+
+
+# --------------------------------------------------------------------------
+# requests and questions
+
+
 def _raise_questions(
-    data: dict[str, Any], patch: repair.Patch, request: dict[str, Any]
+    data: dict[str, Any],
+    questions: list[dict[str, Any]],
+    request: dict[str, Any],
+    *,
+    status: str = "proposed",
 ) -> None:
     """Put what the adjudicator could not settle into the decision log."""
     from . import decisions
 
-    for question in patch.questions:
+    for question in questions:
         decisions.propose(
             data,
             title=str(question.get("question", ""))[:72] or "adjudication question",
@@ -498,33 +1521,8 @@ def _raise_questions(
             proposed_by="adjudicator",
             tasks=[],
         )
-    request["status"] = "proposed"
-    request["questions"] = list(patch.questions)
-
-
-def _sound_entries(patch: repair.Patch, refused: Iterable[Finding]) -> list[str]:
-    """The ids in a refused patch that nothing objected to.
-
-    A refusal's `where` is `<request>.revise_tasks[3]`-shaped, so the objected-to
-    entries are identifiable by index and everything else in the patch stood.
-    """
-    faulted: set[str] = set()
-    for finding in refused:
-        match = re.search(r"\.(revise_tasks|add_tasks)\[(\d+)\]", str(finding.where or ""))
-        if match is not None:
-            faulted.add(f"{match.group(1)}[{match.group(2)}]")
-    sound: list[str] = []
-    for field_name, entries in (
-        ("add_tasks", patch.add_tasks),
-        ("revise_tasks", patch.revise_tasks),
-    ):
-        for index, entry in enumerate(entries):
-            if f"{field_name}[{index}]" in faulted:
-                continue
-            ref = str(entry.get("id", "")).strip()
-            if ref:
-                sound.append(f"{field_name}: {ref}")
-    return sound
+    request["status"] = status
+    request["questions"] = list(questions)
 
 
 def _reopen(root: Path, request_id: str) -> None:
@@ -539,25 +1537,6 @@ def _reopen(root: Path, request_id: str) -> None:
 
 def _open_request(root: Path) -> dict[str, Any] | None:
     return repair.plan_request(state.load(root))
-
-
-def _refusal_findings(request: dict[str, Any]) -> list[Finding]:
-    """The reasons writ turned down this request's last patch."""
-    refusals = request.get("refusals") or []
-    if not refusals:
-        return []
-    return [
-        Finding.from_dict(payload)
-        for payload in (refusals[-1].get("reasons") or [])
-    ]
-
-
-def _refusal_accepted(request: dict[str, Any]) -> list[str]:
-    """The entries writ did not object to in this request's last refused patch."""
-    refusals = request.get("refusals") or []
-    if not refusals:
-        return []
-    return [str(entry) for entry in (refusals[-1].get("accepted_entries") or [])]
 
 
 def _summary(blocking: list[Finding]) -> str:
@@ -575,204 +1554,3 @@ def _blocking_ids(data: dict[str, Any]) -> set[str]:
         for finding in plans.findings(data, open_only=True)
         if finding.severity == "error" and finding.id
     }
-
-
-def _patch_text(directory: Path, patch_path: Path) -> str | None:
-    """The patch file, or JSON the adjudicator printed to stdout instead."""
-    from .planning import extract_json
-
-    if patch_path.exists():
-        text = patch_path.read_text(encoding="utf-8").strip()
-        if text:
-            return text
-    stdout = directory / "stdout.log"
-    if not stdout.exists():
-        return None
-    text = stdout.read_text(encoding="utf-8").strip()
-    if not text:
-        return None
-    return extract_json(text)
-
-
-#: what an adjudicator needs of a requirement record.
-#:
-#: Not `verification`, which is the hints the requirements stage collected and by
-#: far the largest field — 38KB of 57KB on the plan this was measured against — and
-#: not the timestamps, which say when a row was written and nothing about the
-#: obligation. A patch is judged on which ids it covers and whether it weakened a
-#: `must`, so that is what is sent.
-REQUIREMENT_FIELDS = (
-    "id",
-    "text",
-    "priority",
-    "status",
-    "source",
-    "evidence",
-    "reason",
-)
-
-
-def _requirement_view(record: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: record[key]
-        for key in REQUIREMENT_FIELDS
-        if record.get(key) not in (None, "", [])
-    }
-
-
-#: how many tasks the adjudicator is shown in full before the view is narrowed.
-#:
-#: Below this the whole graph is cheaper to send than to explain, and a small plan
-#: read whole is a better-informed patch. Above it, the full graph is mostly tasks
-#: no finding mentions: on the plan this bound was written for, 58 tasks and 180
-#: requirements made a 240KB prompt of which the 5 blocking findings touched 6 tasks.
-FULL_VIEW_TASKS = 25
-
-
-def _plan_json(
-    data: dict[str, Any], findings: Iterable[Finding] = (), *, full: bool = False
-) -> str:
-    """The committed plan, as the adjudicator reads it.
-
-    Statuses are included, which the critics' view does not need: an adjudicator has
-    to know which tasks it may revise, and `planned` is the only answer.
-
-    Narrowed to what the findings are about once the plan is large. An adjudicator
-    is answering specific objections, not re-planning, and a patch is validated
-    against the whole graph afterwards whatever it was shown — so the tasks a
-    finding names, everything those depend on or that depends on them, and their
-    milestones' gates are the working set. The rest is listed by id and title so
-    nothing is invisible and the ids stay citable, and the requirement inventory is
-    filtered to what the findings and the shown tasks actually reference.
-
-    `full` forces the whole graph, which is what a small plan gets anyway.
-    """
-    tasks = data.get("tasks", {})
-    requirements = plans.requirements(data)
-    shown = set(tasks)
-    if not full and len(tasks) > FULL_VIEW_TASKS:
-        shown = _relevant_tasks(data, findings)
-    detailed = [
-        {
-            "id": task["id"],
-            "title": task.get("title", ""),
-            "kind": task.get("kind", "task"),
-            "status": task.get("status"),
-            "milestone": task.get("milestone"),
-            "notes": task.get("notes", ""),
-            "design_section": task.get("design_section"),
-            "requirement_ids": task.get("requirement_ids", []),
-            "depends_on": task.get("depends_on", []),
-            "allowed": task.get("allowed", []),
-            "forbidden": task.get("forbidden", []),
-            "acceptances": task.get("acceptances", []),
-        }
-        for task_id, task in tasks.items()
-        if task_id in shown
-    ]
-    payload: dict[str, Any] = {
-        "revision": plans.revision(data),
-        "milestones": [
-            {"id": m["id"], "title": m.get("title", "")}
-            for m in data.get("milestones", {}).values()
-        ],
-        "tasks": detailed,
-    }
-    if len(shown) < len(tasks):
-        payload["tasks_not_shown"] = [
-            {
-                "id": task["id"],
-                "title": task.get("title", ""),
-                "milestone": task.get("milestone"),
-                "requirement_ids": task.get("requirement_ids", []),
-            }
-            for task_id, task in tasks.items()
-            if task_id not in shown
-        ]
-        payload["note"] = (
-            "`tasks` holds every task the findings touch, in full. "
-            "`tasks_not_shown` is the rest of the plan by id, so you can see it "
-            "exists and depend on it — ask for nothing from it and revise none of "
-            "it. Writ validates your patch against the whole graph."
-        )
-        wanted = {
-            req
-            for task_id in shown
-            for req in (tasks[task_id].get("requirement_ids") or [])
-        }
-        wanted.update(
-            req for finding in findings for req in (finding.requirement_ids or [])
-        )
-        payload["requirements"] = [
-            _requirement_view(record)
-            for req_id, record in requirements.items()
-            if req_id in wanted
-        ]
-        payload["requirements_not_shown"] = sorted(set(requirements) - wanted)
-    else:
-        payload["requirements"] = [
-            _requirement_view(record) for record in requirements.values()
-        ]
-    return json.dumps(payload, indent=2, sort_keys=True)
-
-
-def _relevant_tasks(
-    data: dict[str, Any], findings: Iterable[Finding]
-) -> set[str]:
-    """The tasks a set of findings is about, plus one hop of graph around them.
-
-    One hop in both directions, because the commonest plan repair is an ordering or
-    ownership problem between a task and its neighbour, and a patch that cannot see
-    the neighbour cannot fix it. Gates of the affected milestones come too: a gate's
-    criteria are what the tasks under it are held to, and an adjudicator that cannot
-    read them will propose work the gate does not ask for.
-    """
-    tasks = data.get("tasks", {})
-    seeds: set[str] = set()
-    for finding in findings:
-        for token in re.split(r"[\s,/]+", str(finding.where or "")):
-            token = token.strip().strip("().")
-            if token in tasks:
-                seeds.add(token)
-    if not seeds:
-        # No finding named a task, so fall back to what covers the requirements they
-        # are about. Second choice, not first: a `must` can be covered by a dozen
-        # tasks, and seeding on it pulled in most of the graph — which is how the
-        # narrowing came out 212KB against 223KB and bought nothing.
-        wanted_reqs = {
-            req for finding in findings for req in (finding.requirement_ids or ())
-        }
-        for task_id, task in tasks.items():
-            if set(task.get("requirement_ids") or ()) & wanted_reqs:
-                seeds.add(task_id)
-    if not seeds:
-        # Nothing resolvable at all. Better to send the whole plan than a view
-        # chosen by an empty seed set.
-        return set(tasks)
-    plain = {
-        task_id
-        for task_id, task in tasks.items()
-        if task.get("kind") != "gate"
-    }
-    wanted = set(seeds)
-    for task_id in seeds:
-        wanted.update(
-            dep
-            for dep in (tasks[task_id].get("depends_on") or ())
-            if dep in plain
-        )
-    # The reverse hop is restricted to ordinary tasks. Every gate depends on its
-    # milestone's tasks, so following dependents blindly drew in all eleven gates
-    # and the final gate, which depends on everything, drew in the whole plan.
-    for task_id in plain:
-        if set(tasks[task_id].get("depends_on") or ()) & seeds:
-            wanted.add(task_id)
-    milestones = {
-        tasks[task_id].get("milestone")
-        for task_id in seeds
-        if tasks[task_id].get("kind") != "gate"
-    } - {None}
-    for task_id, task in tasks.items():
-        if task.get("kind") == "gate" and task.get("milestone") in milestones:
-            wanted.add(task_id)
-    return wanted

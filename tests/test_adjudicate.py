@@ -3,12 +3,13 @@
 Writ could already produce findings against a plan and resolve them once it was
 running. Between those sat the gap these tests are about: a blocking finding before
 execution had no repair path, only a hand disposition or `approve --force`. So the
-claims worth pinning down are that an adjudicator's patch is validated rather than
+claims worth pinning down are that an adjudicator's edit is validated rather than
 trusted, that the bar cannot be lowered by one, that a finding closes on a re-check
-rather than on the patch's word, and that the loop stops.
+rather than on the response's word, and that the loop stops.
 
-The adjudicator is a real subprocess writing a real patch file, as in test_gates.py.
-The parts worth testing only exist once something has actually proposed a change.
+The adjudicator is a real subprocess editing a real working copy, as in
+test_gates.py. The parts worth testing only exist once something has actually
+proposed a change.
 """
 from __future__ import annotations
 
@@ -18,34 +19,47 @@ import sys
 
 import pytest
 
-from writ import adjudicate, phases, plancheck, plans, repair, state
+from writ import adjudicate, phases, plancheck, planfiles, plans, repair, state
 from writ.state import WritError
 
 from tests.test_plans import PLAN
 
 
-#: an adjudicator that writes whatever patch the test hands it, with the revision
-#: and finding id filled in from the prompt it was given.
+#: an adjudicator that edits the working copy the way the test tells it to.
+#:
+#: The edit is a JSON spec in WRIT_TEST_EDIT: `revise` merges fields into existing
+#: feature files, `add` creates new ones, `remove` deletes them, and `analysis`,
+#: `dispositions` and `questions` go into the response. Unless the spec says
+#: `_auto_dispositions: false`, every finding in to-fix.json is accepted. A list
+#: is one spec per round, so a test can be refused and then succeed.
 ADJUDICATOR = """
 import json, os, re, sys
+from pathlib import Path
 prompt = sys.stdin.read()
-path = re.search(r'Write your patch as JSON to this exact path:\\n  (\\S+)', prompt).group(1)
-revision = int(re.search(r'Plan revision: (\\d+)', prompt).group(1))
-findings = re.findall(r'(F-\\d+)', prompt)
+path = Path(re.search(r'Write your response as JSON to this exact path:\\n  (\\S+)', prompt).group(1))
 round_no = int(re.search(r'Adjudication round: (\\d+)', prompt).group(1))
-patch = json.loads(os.environ["WRIT_TEST_PATCH"])
-if isinstance(patch, list):
-    # A list means one patch per round, so a test can refuse then succeed.
-    patch = patch[min(round_no, len(patch)) - 1]
-patch.setdefault("base_revision", revision)
-if patch.pop("_auto_dispositions", True) and findings:
-    patch.setdefault("dispositions", [
-        {"finding_id": f, "resolution": "accepted", "change": "fixed it"}
-        for f in dict.fromkeys(findings)
+folder = path.parent
+features = folder / "plan" / "features"
+to_fix = [f["id"] for f in json.loads((folder / "to-fix.json").read_text())]
+spec = json.loads(os.environ["WRIT_TEST_EDIT"])
+if isinstance(spec, list):
+    spec = spec[min(round_no, len(spec)) - 1]
+for ref, fields in spec.get("revise", {}).items():
+    file = features / (ref + ".json")
+    entry = json.loads(file.read_text())
+    entry.update(fields)
+    file.write_text(json.dumps(entry))
+for ref, fields in spec.get("add", {}).items():
+    (features / (ref + ".json")).write_text(json.dumps(dict(fields, id=ref)))
+for ref in spec.get("remove", []):
+    (features / (ref + ".json")).unlink()
+response = {k: spec[k] for k in ("analysis", "dispositions", "questions") if k in spec}
+if spec.get("_auto_dispositions", True) and to_fix:
+    response.setdefault("dispositions", [
+        {"finding_id": f, "disposition": "accepted", "change": "fixed it"}
+        for f in to_fix
     ])
-    for entry in patch.get("add_tasks", []) + patch.get("revise_tasks", []):
-        entry.setdefault("resolves_findings", list(dict.fromkeys(findings)))
-open(path, "w").write(json.dumps(patch))
+path.write_text(json.dumps(response))
 """
 
 MUTE = """
@@ -66,7 +80,7 @@ first = not os.path.exists(marker)
 open(marker, "a").write("x")
 findings = [] if not first else [{
     "severity": "blocking",
-    "category": "missing-coverage",
+    "category": "uncovered-requirement",
     "where": "REQ-003",
     "message": "No task implements the queue depth view",
     "suggested_action": "add a task, or mark it out of scope with a reason",
@@ -83,10 +97,10 @@ open(path, "w").write(json.dumps({
 
 #: a critic that objects to something *different* each time it reads.
 #:
-#: The production case the seventy-note bug was hiding: a patch closes what was
-#: raised, and the re-read of the patched plan finds a new hole in the work the patch
-#: just added. That is the loop's whole purpose — and it needs two rounds, so a stub
-#: that reports the same thing forever (which escalates) cannot express it.
+#: The production case the seventy-note bug was hiding: a repair closes what was
+#: raised, and the re-read of the repaired plan finds a new hole in the work the
+#: repair just added. That is the loop's whole purpose — and it needs two rounds, so
+#: a stub that reports the same thing forever (which escalates) cannot express it.
 CRITIC_MOVES_ON = """
 import json, os, re, sys
 prompt = sys.stdin.read()
@@ -95,14 +109,17 @@ marker = os.environ["WRIT_TEST_READS"]
 reads = len(open(marker).read()) if os.path.exists(marker) else 0
 open(marker, "a").write("x")
 # A new requirement each read, so each finding is its own objection rather than the
-# same one coming back. Two of them, then satisfied.
+# same one coming back. Two of them, then satisfied. A verify pass may only raise a
+# blocker on a feature the repair changed, so the second one is placed there.
 holes = ["REQ-003", "REQ-004"]
+verify = os.path.join(os.path.dirname(path), "verify.json")
+changed = json.load(open(verify))["changed_features"] if os.path.exists(verify) else []
 findings = []
 if reads < len(holes):
     findings = [{
         "severity": "blocking",
-        "category": "missing-coverage",
-        "where": holes[reads],
+        "category": "uncovered-requirement",
+        "where": changed[0] if changed else holes[reads],
         "message": f"No task implements {holes[reads]}",
         "suggested_action": "add a task, or mark it out of scope with a reason",
         "requirement_ids": [holes[reads]],
@@ -120,8 +137,9 @@ def agent(script: str) -> str:
     return f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
 
 
-def patched(monkeypatch, patch) -> None:
-    monkeypatch.setenv("WRIT_TEST_PATCH", json.dumps(patch))
+def patched(monkeypatch, spec) -> None:
+    """Hand the fake adjudicator the edit it should make."""
+    monkeypatch.setenv("WRIT_TEST_EDIT", json.dumps(spec))
 
 
 @pytest.fixture
@@ -142,109 +160,125 @@ def objected(writ, project, design, tmp_path):
             [
                 plancheck.Finding(
                     severity="error",
-                    category="missing-coverage",
+                    category="uncovered-requirement",
                     message="No task implements the queue depth view",
                     where="REQ-003",
                     suggested_action="add a task, or mark it out of scope",
                     requirement_ids=["REQ-003"],
-                    source="critic:coverage",
+                    source="critic:fidelity",
                 )
             ],
-            scope="critic:coverage",
+            scope="critic:fidelity",
         )
     return writ
 
 
-#: a patch that closes the fixture's finding by adding the missing work
+#: the fixture's finding closed by adding the missing work
+NEW_FEATURE = {
+    "title": "Expose queue depth to the operator",
+    "milestone": "M01",
+    "requirement_ids": ["REQ-003"],
+    "acceptances": [
+        "a failing test in ops/depth_test.go reproduces the missing view",
+        "`go test ./ops` reports queue depth",
+    ],
+    "allowed": ["ops/"],
+}
+
 ADDS_THE_TASK = {
     "analysis": "nothing in the plan reads queue depth",
-    "add_tasks": [
-        {
-            "id": "proposed-queue-depth",
-            "title": "Expose queue depth to the operator",
-            "milestone": "M01",
-            "requirement_ids": ["REQ-003"],
-            "acceptances": [
-                "a failing test in ops/depth_test.go reproduces the missing view",
-                "`go test ./ops` reports queue depth",
-            ],
-            "allowed": ["ops/depth.go", "ops/depth_test.go"],
-        }
-    ],
+    "add": {"new-queue-depth": NEW_FEATURE},
 }
+
+
+def _run(objected, *extra):
+    return objected("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics", *extra)
+
+
+def _added(data):
+    return [
+        task
+        for task in data["tasks"].values()
+        if task.get("repair", {}).get("scope") == "plan"
+    ]
+
+
+def _reasons(data):
+    return [
+        reason["category"]
+        for request in repair.requests(data)
+        for refusal in request.get("refusals") or []
+        for reason in refusal["reasons"]
+    ]
+
+
+def _rounds(project):
+    data = state.load(project)
+    return planfiles.directory(project, data) / planfiles.ROUNDS_DIRNAME
 
 
 # --------------------------------------------------------------------------
 # the prompt
 
 
-def test_the_prompt_carries_the_findings_and_the_bar(tmp_path):
+def test_the_prompt_names_files_instead_of_pasting_them(tmp_path):
+    directory = tmp_path / ".writ" / "plans" / "p" / "rounds" / "r4" / "round-1"
     prompt = adjudicate.build_prompt(
         root=tmp_path,
         doc=tmp_path / "design.md",
-        plan_text='{"tasks": []}',
-        patch_path=tmp_path / "patch.json",
-        findings=[
-            plancheck.Finding(
-                severity="error",
-                category="missing-coverage",
-                message="nothing covers REQ-003",
-                where="REQ-003",
-                id="F-0001",
-            )
-        ],
+        directory=directory,
+        blocking=3,
         base_revision=4,
         round_number=1,
     )
     assert "has not been executed yet" in prompt
-    assert "F-0001" in prompt
     assert "Plan revision: 4" in prompt
-    # It is told the two things writ will refuse it for, in the rules it is given.
-    assert "drops a bar" in prompt or "lowers the bar" in prompt
-    assert "revise_tasks" in prompt
+    assert f"Repository root: {tmp_path.resolve()}" in prompt
+    # Relative paths, to the files the agent reads and the copy it edits.
+    assert ".writ/plans/p/rounds/r4/round-1/to-fix.json" in prompt
+    assert ".writ/plans/p/rounds/r4/round-1/plan/features" in prompt
+    assert ".writ/plans/p/rounds/r4/round-1/plan/plan.json" in prompt
+    assert "design.md" in prompt
+    assert (
+        "Write your response as JSON to this exact path:\n"
+        "  .writ/plans/p/rounds/r4/round-1/response.json"
+    ) in prompt
+    # It is told the bar it will be held to.
+    assert "never drop" in prompt
+    assert "revise_tasks" not in prompt
+    # No refusal to read on a first attempt.
+    assert "REFUSED" not in prompt
 
 
-def test_a_refused_patch_tells_the_next_round_exactly_why(tmp_path):
+def test_a_retry_is_pointed_at_why_the_last_attempt_was_refused(tmp_path):
     """A retry is only bounded if the next attempt knows more than the last."""
+    previous = tmp_path / "rounds" / "r1" / "round-1" / "validation.json"
     prompt = adjudicate.build_prompt(
         root=tmp_path,
         doc=None,
-        plan_text="{}",
-        patch_path=tmp_path / "patch.json",
-        findings=[],
-        prior_refusals=[
-            plancheck.Finding(
-                severity="error",
-                category="weakened-acceptance",
-                message="revision of M01-001 states 1 criteria where it had 2",
-                where="RR-0001.revise_tasks[0]",
-            )
-        ],
+        directory=tmp_path / "rounds" / "r1" / "round-2",
+        blocking=1,
+        previous=previous,
         round_number=2,
     )
     assert "REFUSED" in prompt
-    assert "states 1 criteria where it had 2" in prompt
+    assert "rounds/r1/round-1/validation.json" in prompt
 
 
 # --------------------------------------------------------------------------
-# a patch closes a finding
+# an edit closes a finding
 
 
 def test_an_adjudicated_plan_gains_the_work_the_finding_asked_for(
     objected, project, monkeypatch
 ):
     patched(monkeypatch, ADDS_THE_TASK)
-    code, out, _ = objected(
-        "adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics"
-    )
+    code, out, _ = _run(objected)
     data = state.load(project)
-    added = [
-        task
-        for task in data["tasks"].values()
-        if task.get("repair", {}).get("scope") == "plan"
-    ]
+    added = _added(data)
     assert added, [t["id"] for t in data["tasks"].values()]
     assert added[0]["requirement_ids"] == ["REQ-003"]
+    assert added[0]["repair"]["proposed_as"] == "new-queue-depth"
     assert code == 0, out
 
 
@@ -252,11 +286,11 @@ def test_the_finding_is_disposed_with_the_adjudicator_named(
     objected, project, monkeypatch
 ):
     patched(monkeypatch, ADDS_THE_TASK)
-    objected("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics")
+    _run(objected)
     record = [
         item
         for item in plans.finding_records(state.load(project))
-        if item["source"] == "critic:coverage"
+        if item["source"] == "critic:fidelity"
     ][0]
     assert record["disposition"] == "accepted"
     assert record["disposed_by"] == "adjudicator"
@@ -265,13 +299,13 @@ def test_the_finding_is_disposed_with_the_adjudicator_named(
 def test_a_repair_bumps_the_plan_revision(objected, project, monkeypatch):
     before = plans.revision(state.load(project))
     patched(monkeypatch, ADDS_THE_TASK)
-    objected("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics")
+    _run(objected)
     assert plans.revision(state.load(project)) > before
 
 
 def test_the_request_records_what_landed(objected, project, monkeypatch):
     patched(monkeypatch, ADDS_THE_TASK)
-    objected("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics")
+    _run(objected)
     data = state.load(project)
     request = repair.requests(data)[0]
     assert request["status"] == "applied"
@@ -282,306 +316,182 @@ def test_the_request_records_what_landed(objected, project, monkeypatch):
     assert repair.scope_of(request) == "plan"
 
 
+def test_the_plan_files_are_re_exported_at_the_new_revision(
+    objected, project, monkeypatch
+):
+    patched(monkeypatch, ADDS_THE_TASK)
+    _run(objected)
+    data = state.load(project)
+    index = json.loads(planfiles.index_path(project, data).read_text())
+    assert index["revision"] == plans.revision(data)
+    added = _added(data)[0]["id"]
+    assert (planfiles.features_dir(project, data) / f"{added}.json").exists()
+
+
+def test_a_round_leaves_its_working_copy_and_verdict_on_disk(
+    objected, project, monkeypatch
+):
+    patched(monkeypatch, ADDS_THE_TASK)
+    _run(objected)
+    rounds = _rounds(project)
+    [folder] = list(rounds.glob("r*/round-1"))
+    for name in ("to-fix.json", "response.json", "validation.json", "prompt.txt"):
+        assert (folder / name).exists(), name
+    assert (folder / "plan" / "plan.json").exists()
+    assert (folder / "plan" / "features" / "new-queue-depth.json").exists()
+    verdict = json.loads((folder / "validation.json").read_text())
+    assert verdict["accepted"] is True
+    assert verdict["changes"]["added"] == ["new-queue-depth"]
+    # Only blocking findings are handed over.
+    to_fix = json.loads((folder / "to-fix.json").read_text())
+    assert [item["severity"] for item in to_fix] == ["error"]
+
+
 # --------------------------------------------------------------------------
-# revising a task, which only this occasion allows
+# editing a feature, which only this occasion allows
 
 
 REVISES_THE_TASK = {
     "analysis": "the criterion names no command",
-    "revise_tasks": [
-        {
-            "id": "M01-001",
+    "revise": {
+        "M01-001": {
             "acceptances": [
                 "a failing test in store/log_test.go reproduces a torn append",
                 "`go test ./store` passes with appends fsync'd in order",
                 "`go test ./store -run Torn` proves the torn append is rejected",
             ],
         }
-    ],
+    },
 }
 
 
 def test_a_task_can_be_rewritten_before_it_runs(objected, project, monkeypatch):
     patched(monkeypatch, REVISES_THE_TASK)
-    objected("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics")
+    _run(objected)
     task = state.load(project)["tasks"]["M01-001"]
     assert len(task["acceptances"]) == 3
-    # The revision is on the record, with the finding it was for.
+    # The revision is on the record.
     assert task["revisions"][0]["fields"] == ["acceptances"]
 
 
-def test_a_revision_leaves_unnamed_fields_alone(objected, project, monkeypatch):
+def test_a_revision_leaves_unedited_fields_alone(objected, project, monkeypatch):
     before = state.load(project)["tasks"]["M01-001"]
-    fence, requirements = before["allowed"], before["requirement_ids"]
     patched(monkeypatch, REVISES_THE_TASK)
-    objected("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics")
+    _run(objected)
     after = state.load(project)["tasks"]["M01-001"]
-    assert after["allowed"] == fence
-    assert after["requirement_ids"] == requirements
+    assert after["allowed"] == before["allowed"]
+    assert after["requirement_ids"] == before["requirement_ids"]
+    # A criterion whose wording did not change keeps its record.
+    assert after["acceptances"][0] == before["acceptances"][0]
 
 
-#: the commonest plan repair there is: the work a task needs does not exist, so the
-#: patch adds it and points the task at it. Both halves in one patch, which is the
-#: only way to write it — a patch is applied atomically, so there is no earlier one
-#: for the new task to have landed in.
-ADDS_AND_DEPENDS_ON_IT = {
-    "analysis": "M01-002 needs work that is not in the plan",
-    "add_tasks": [
-        {
-            "id": "proposed-queue-depth",
-            "title": "Expose queue depth to the operator",
-            "milestone": "M01",
-            "requirement_ids": ["REQ-003"],
-            "acceptances": [
-                "a failing test in ops/depth_test.go reproduces the missing view",
-                "`go test ./ops` reports queue depth",
-            ],
-            "allowed": ["ops/depth.go", "ops/depth_test.go"],
-        }
-    ],
-    "revise_tasks": [
-        {
-            "id": "M01-002",
-            "depends_on": ["M01-001", "proposed-queue-depth"],
-        }
-    ],
-}
-
-
-def test_a_revision_may_depend_on_a_task_the_same_patch_adds(
+def test_a_feature_may_depend_on_one_the_same_edit_adds(
     objected, project, monkeypatch
 ):
-    """The patch is one transaction, so the new task's id is only the patch's word.
-
-    This was refused. `unknown-dependency` was judged against the committed graph
-    alone, which cannot contain a task the patch is introducing — so the one shape a
-    missing-dependency finding actually calls for was the one shape writ would not
-    accept, and the adjudicator's only way past the refusal was to drop the edge and
-    leave the finding unrepaired.
-    """
-    patched(monkeypatch, ADDS_AND_DEPENDS_ON_IT)
-    code, _, _ = objected("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics")
+    """The new feature's id is the copy's word, so writ has to translate the edge."""
+    patched(
+        monkeypatch,
+        dict(
+            ADDS_THE_TASK,
+            revise={"M01-002": {"depends_on": ["M01-001", "new-queue-depth"]}},
+        ),
+    )
+    code, _, _ = _run(objected)
     data = state.load(project)
     request = repair.requests(data)[-1]
     assert not request.get("refusals"), request.get("refusals")
-    assert request["status"] == "applied"
-    # And the edge points at the id writ minted, not the one the patch made up.
     added = request["applied_tasks"][0]
     assert added in data["tasks"]["M01-002"]["depends_on"]
-    assert "proposed-queue-depth" not in data["tasks"]["M01-002"]["depends_on"]
+    assert "new-queue-depth" not in data["tasks"]["M01-002"]["depends_on"]
     assert code == 0
 
 
-def test_a_revision_still_may_not_depend_on_nothing(objected, project, monkeypatch):
-    """The rule it relaxes, still enforced: a task the patch does not add either."""
+def test_a_dependency_must_name_a_feature_in_the_copy(objected, project, monkeypatch):
     patched(
         monkeypatch,
-        {
-            "analysis": "points at thin air",
-            "revise_tasks": [{"id": "M01-002", "depends_on": ["M09-999"]}],
-        },
+        {"analysis": "points at thin air", "revise": {"M01-002": {"depends_on": ["M09-999"]}}},
     )
-    objected("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics")
-    data = state.load(project)
-    reasons = [
-        reason["category"]
-        for refusal in repair.requests(data)[-1].get("refusals") or []
-        for reason in refusal["reasons"]
-    ]
-    assert "unknown-dependency" in reasons
+    _run(objected)
+    assert "bad-dependency" in _reasons(state.load(project))
 
 
-def _big_graph(task_count: int) -> dict:
-    """A committed-shaped graph with one gate and `task_count` ordinary tasks."""
-    tasks = {}
-    for n in range(1, task_count + 1):
-        tasks[f"M01-{n:03d}"] = {
-            "id": f"M01-{n:03d}",
-            "title": f"Task {n}",
-            "kind": "task",
-            "status": "planned",
-            "milestone": "M01",
-            "requirement_ids": [f"REQ-{n:03d}"],
-            "depends_on": [f"M01-{n - 1:03d}"] if n > 1 else [],
-            "allowed": [f"pkg/mod{n}.py"],
-            "acceptances": [{"text": f"`pytest -q tests/test_{n}.py` passes",
-                             "status": "pending"}],
-        }
-    tasks["G-M01"] = {
-        "id": "G-M01",
-        "title": "Storage gate",
-        "kind": "gate",
-        "status": "planned",
-        "milestone": "M01",
-        "requirement_ids": [f"REQ-{n:03d}" for n in range(1, task_count + 1)],
-        "depends_on": [f"M01-{n:03d}" for n in range(1, task_count + 1)],
-        "acceptances": [{"text": "`pytest -q` passes", "status": "pending"}],
-    }
-    return {
-        "tasks": tasks,
-        "milestones": {"M01": {"id": "M01", "title": "Storage"}},
-        "requirements": {
-            f"REQ-{n:03d}": {
-                "id": f"REQ-{n:03d}",
-                "text": f"Obligation {n}",
-                "priority": "must",
-                "status": "planned",
-                "source": "Storage",
-                "created_at": "2026-01-01T00:00:00+00:00",
-                "updated_at": "2026-01-01T00:00:00+00:00",
-                "verification": ["x" * 400],
-            }
-            for n in range(1, task_count + 1)
-        },
-        "plan": {"revision": 3},
-    }
+def test_a_cycle_is_refused(objected, project, monkeypatch):
+    patched(monkeypatch, {"revise": {"M01-001": {"depends_on": ["M01-002"]}}})
+    _run(objected)
+    assert "dependency-cycle" in _reasons(state.load(project))
 
 
-def test_a_large_plan_is_narrowed_to_what_the_findings_touch():
-    """The adjudicator reads the objection's neighbourhood, not the whole graph.
-
-    A 240KB prompt whose five findings touched six tasks is the shape this bounds.
-    Everything else stays listed by id so the ids remain citable and nothing the
-    patch might depend on is invisible.
-    """
-    data = _big_graph(40)
-    finding = plancheck.Finding(
-        severity="error",
-        category="task-too-broad",
-        message="M01-020 bundles four mechanisms",
-        where="M01-020",
-        requirement_ids=["REQ-020"],
-        source="critic:scope",
-    )
-    narrowed = json.loads(adjudicate._plan_json(data, [finding]))
-    shown = {task["id"] for task in narrowed["tasks"]}
-    assert "M01-020" in shown
-    assert "M01-019" in shown  # what it depends on
-    assert "M01-021" in shown  # what depends on it
-    assert "G-M01" in shown  # the gate that judges it
-    assert "M01-001" not in shown  # the far end of the graph
-    assert len(shown) < 10
-    listed = {task["id"] for task in narrowed["tasks_not_shown"]}
-    assert "M01-001" in listed
-    assert shown | listed == set(data["tasks"])
-    # Smaller, but the index of what is not shown is not free — that is the point of
-    # it. On a real 58-task plan this was 90KB against 223KB.
-    full = adjudicate._plan_json(data, [finding], full=True)
-    assert len(adjudicate._plan_json(data, [finding])) < len(full) * 0.6
-
-
-def test_a_small_plan_is_still_sent_whole():
-    """Below the bound the whole graph is cheaper to send than to explain."""
-    data = _big_graph(4)
-    finding = plancheck.Finding(
-        severity="error",
-        category="task-too-broad",
-        message="M01-002 is too broad",
-        where="M01-002",
-        source="critic:scope",
-    )
-    view = json.loads(adjudicate._plan_json(data, [finding]))
-    assert {task["id"] for task in view["tasks"]} == set(data["tasks"])
-    assert "tasks_not_shown" not in view
-
-
-def test_the_adjudicator_view_drops_verification_hints_and_timestamps():
-    """Requirement rows are sent as the obligation, not as the whole stored record.
-
-    `verification` was the largest field in the inventory and says how a requirement
-    could be demonstrated — which the synthesizer already used. An adjudicator is
-    judged on which ids it covers and whether it weakened a `must`.
-    """
-    view = json.loads(adjudicate._plan_json(_big_graph(3), []))
-    row = view["requirements"][0]
-    assert "verification" not in row
-    assert "created_at" not in row
-    assert row["priority"] == "must"
-    assert row["text"]
-
-
-def test_a_revision_may_not_drop_a_criterion(objected, project, monkeypatch):
-    """The failure the review warned about: closing a finding by lowering the bar."""
-    patched(
-        monkeypatch,
-        {
-            "revise_tasks": [
-                {"id": "M01-001", "acceptances": ["it works"]},
-            ]
-        },
-    )
-    code, out, _ = objected(
-        "adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics"
-    )
-    data = state.load(project)
-    assert len(data["tasks"]["M01-001"]["acceptances"]) == 2
-    assert code == 1
-    assert "refused" in out
-
-
-def test_a_revision_may_not_drop_a_requirement(objected, project, monkeypatch):
-    patched(
-        monkeypatch,
-        {"revise_tasks": [{"id": "M01-001", "requirement_ids": []}]},
-    )
-    objected("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics")
-    task = state.load(project)["tasks"]["M01-001"]
-    assert task["requirement_ids"] == ["REQ-001"]
-
-
-def test_a_refusal_says_which_entries_were_sound(objected, project, monkeypatch):
-    """A patch is atomic, so one bad entry costs all of it — say what was fine.
-
-    On the plan this was written for, eleven sound revisions were discarded over one
-    objection to a twelfth, three rounds running, and the adjudicator was told only
-    what broke. The retry should be an edit, not a fresh attempt.
-    """
-    patched(
-        monkeypatch,
-        {
-            "revise_tasks": [
-                {"id": "M01-001", "acceptances": ["it works"]},
-                {
-                    "id": "M01-002",
-                    "notes": "a perfectly sound change to a different task",
-                },
-            ]
-        },
-    )
-    objected("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics")
-    request = repair.plan_request(state.load(project))
-    refusal = (request.get("refusals") or [])[-1]
-    assert refusal["accepted_entries"] == ["revise_tasks: M01-002"]
-    prompt = adjudicate.build_prompt(
-        root=project,
-        doc=None,
-        plan_text="{}",
-        patch_path=project / "patch.json",
-        findings=[],
-        prior_refusals=[plancheck.Finding.from_dict(r) for r in refusal["reasons"]],
-        accepted_entries=refusal["accepted_entries"],
-    )
-    assert "Nothing was wrong with the rest of that patch" in prompt
-    assert "revise_tasks: M01-002" in prompt
-
-
-def test_a_revision_may_move_a_requirement_to_a_task_the_patch_adds(
+def test_a_task_may_not_wait_for_its_own_milestone_gate(
     objected, project, monkeypatch
 ):
-    """Splitting an overloaded task is not dropping a requirement.
+    """The gate waits for the milestone, so this edge closes a loop through it."""
+    gate_id = next(
+        task_id
+        for task_id, task in state.load(project)["tasks"].items()
+        if task.get("kind") == "gate" and task_id != "G-FINAL"
+    )
+    patched(monkeypatch, {"revise": {"M01-001": {"depends_on": [gate_id]}}})
+    _run(objected)
+    assert "dependency-cycle" in _reasons(state.load(project))
 
-    The deadlock this closes: `task-too-broad` can only be repaired by splitting,
-    splitting means the requirement moves off the task, and the drop check compared
-    the revision against its own before-state alone — so the only valid patch was
-    refused, every round, until the loop ran out. The refusal even suggested
-    "move it to a task this patch adds", which was the one thing it would not allow.
-    """
+
+def test_two_overlapping_features_can_be_merged(objected, project, monkeypatch):
+    """What the patch language could not say at all: one feature absorbs another."""
+    before = state.load(project)["tasks"]
+    patched(
+        monkeypatch,
+        dict(
+            ADDS_THE_TASK,
+            remove=["M01-002"],
+            revise={
+                "M01-001": {
+                    "title": "Event log and its projection",
+                    "requirement_ids": ["REQ-001", "REQ-002"],
+                    "acceptances": [
+                        *(item["text"] for item in before["M01-001"]["acceptances"]),
+                        "a replay reproduces the projection byte-for-byte",
+                    ],
+                }
+            },
+        ),
+    )
+    code, out, _ = _run(objected)
+    data = state.load(project)
+    assert "M01-002" not in data["tasks"], out
+    merged = data["tasks"]["M01-001"]
+    assert merged["requirement_ids"] == ["REQ-001", "REQ-002"]
+    request = repair.requests(data)[-1]
+    assert request["removed_tasks"] == ["M01-002"]
+    # Nothing still points at the task that is gone, gates included.
+    for task in data["tasks"].values():
+        assert "M01-002" not in task.get("depends_on", []), task["id"]
+    assert code == 0, out
+
+
+def test_gates_follow_their_milestone_after_a_repair(objected, project, monkeypatch):
+    patched(monkeypatch, ADDS_THE_TASK)
+    _run(objected)
+    data = state.load(project)
+    added = _added(data)[0]
+    gate = next(
+        task
+        for task in data["tasks"].values()
+        if task.get("kind") == "gate" and task["id"] != "G-FINAL"
+        and task.get("milestone", "M01") == added["milestone"]
+    )
+    assert added["id"] in gate["depends_on"]
+    assert "REQ-003" in gate["requirement_ids"]
+
+
+def test_a_requirement_may_move_to_a_feature_the_edit_adds(
+    objected, project, monkeypatch
+):
+    """Splitting an overloaded task is not dropping a requirement."""
     patched(
         monkeypatch,
         {
-            "add_tasks": [
-                {
-                    "id": "split-off",
+            "add": {
+                "split-off": {
                     "title": "Fsync the log on append",
                     "milestone": "M01",
                     "requirement_ids": ["REQ-001"],
@@ -591,10 +501,9 @@ def test_a_revision_may_move_a_requirement_to_a_task_the_patch_adds(
                     ],
                     "allowed": ["store/fsync.go"],
                 }
-            ],
-            "revise_tasks": [
-                {
-                    "id": "M01-001",
+            },
+            "revise": {
+                "M01-001": {
                     "requirement_ids": [],
                     "acceptances": [
                         "a failing test in store/log_test.go reproduces a torn append",
@@ -602,271 +511,336 @@ def test_a_revision_may_move_a_requirement_to_a_task_the_patch_adds(
                         "store/log.go exposes the writer the split task calls",
                     ],
                 }
-            ],
+            },
         },
     )
-    objected("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics")
+    _run(objected)
     data = state.load(project)
     assert data["tasks"]["M01-001"]["requirement_ids"] == []
-    moved = [
-        task
-        for task in data["tasks"].values()
-        if task.get("title") == "Fsync the log on append"
-    ]
+    moved = [t for t in data["tasks"].values() if t.get("title") == "Fsync the log on append"]
     assert len(moved) == 1
     assert moved[0]["requirement_ids"] == ["REQ-001"]
 
 
-def test_a_gate_does_not_vouch_for_a_requirement_a_revision_drops(
-    objected, project, monkeypatch
-):
-    """A gate judges requirements; it does not implement them.
+# --------------------------------------------------------------------------
+# the bar does not drop
 
-    Gates carry the union of their milestone's requirement ids, so counting them as
-    coverage would let a revision delete the only task implementing an obligation
-    and have the gate that merely checks it stand in.
-    """
-    patched(
-        monkeypatch,
-        {"revise_tasks": [{"id": "M01-002", "requirement_ids": []}]},
-    )
-    objected("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics")
-    task = state.load(project)["tasks"]["M01-002"]
-    assert task["requirement_ids"] == ["REQ-002"]
+
+def test_a_revision_may_not_drop_a_criterion(objected, project, monkeypatch):
+    """The failure the review warned about: closing a finding by lowering the bar."""
+    patched(monkeypatch, {"revise": {"M01-001": {"acceptances": ["it works"]}}})
+    code, out, _ = _run(objected)
+    data = state.load(project)
+    assert len(data["tasks"]["M01-001"]["acceptances"]) == 2
+    assert "weakened-criteria" in _reasons(data)
+    assert code == 1
+    assert "refused" in out
+
+
+def test_a_revision_may_not_drop_coverage(objected, project, monkeypatch):
+    patched(monkeypatch, {"revise": {"M01-001": {"requirement_ids": []}}})
+    _run(objected)
+    data = state.load(project)
+    assert data["tasks"]["M01-001"]["requirement_ids"] == ["REQ-001"]
+    assert "coverage-regression" in _reasons(data)
+
+
+def test_a_removal_may_not_drop_coverage(objected, project, monkeypatch):
+    """Deleting the only feature for a requirement is the same drop, said differently."""
+    patched(monkeypatch, dict(ADDS_THE_TASK, remove=["M01-002"]))
+    _run(objected)
+    data = state.load(project)
+    assert "M01-002" in data["tasks"]
+    assert "coverage-regression" in _reasons(data)
 
 
 def test_a_revision_may_not_invent_a_requirement(objected, project, monkeypatch):
     patched(
         monkeypatch,
-        {
-            "revise_tasks": [
-                {"id": "M01-001", "requirement_ids": ["REQ-001", "REQ-999"]}
-            ]
-        },
+        {"revise": {"M01-001": {"requirement_ids": ["REQ-001", "REQ-999"]}}},
     )
-    objected("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics")
-    task = state.load(project)["tasks"]["M01-001"]
-    assert task["requirement_ids"] == ["REQ-001"]
-
-
-def test_a_gate_is_not_an_adjudicators_to_rewrite(
-    writ, project, design, tmp_path, monkeypatch
-):
-    """A gate's criteria are the plan's own bar, not a task contract."""
-    artifact = tmp_path / "plan.json"
-    artifact.write_text(json.dumps(PLAN), encoding="utf-8")
-    writ("init")
-    writ("plan", str(design), "--from-plan", str(artifact))
+    _run(objected)
     data = state.load(project)
-    gate_id = next(
-        task["id"] for task in data["tasks"].values() if task.get("kind") == "gate"
-    )
+    assert data["tasks"]["M01-001"]["requirement_ids"] == ["REQ-001"]
+    assert "unknown-requirement" in _reasons(data)
+
+
+def test_a_gate_is_not_an_adjudicators_to_rewrite(objected, project, monkeypatch):
+    """A gate's criteria are the plan's own bar, not a task contract."""
+    data = state.load(project)
+    gate_id = next(t["id"] for t in data["tasks"].values() if t.get("kind") == "gate")
     before = list(data["tasks"][gate_id]["acceptances"])
-    with state.transaction(live := project) as data:
-        plans.record_findings(
-            data,
-            [
-                plancheck.Finding(
-                    severity="error",
-                    category="weak-acceptance",
-                    message="the gate says nothing checkable",
-                    where=gate_id,
-                    source="critic:acceptance",
-                )
-            ],
-            scope="critic:acceptance",
-        )
     patched(
         monkeypatch,
-        {"revise_tasks": [{"id": gate_id, "acceptances": ["it all works", "b", "c"]}]},
+        {"revise": {gate_id: {"acceptances": ["it all works", "b", "c", "d", "e"]}}},
     )
-    writ("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics")
-    assert state.load(project)["tasks"][gate_id]["acceptances"] == before
+    _run(objected)
+    data = state.load(project)
+    assert data["tasks"][gate_id]["acceptances"] == before
+    assert "gate-edited" in _reasons(data)
 
 
-def test_a_started_task_is_not_revisable(objected, project, monkeypatch):
+def test_a_started_task_is_not_editable(objected, project, monkeypatch):
     with state.transaction(project) as data:
         data["tasks"]["M01-001"]["status"] = "running"
     patched(monkeypatch, REVISES_THE_TASK)
-    objected("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics")
-    assert len(state.load(project)["tasks"]["M01-001"]["acceptances"]) == 2
+    _run(objected)
+    data = state.load(project)
+    assert len(data["tasks"]["M01-001"]["acceptances"]) == 2
+    assert "started-task-edited" in _reasons(data)
 
 
-def test_a_revision_is_refused_in_a_gate_repair():
-    """`revise_tasks` exists for the pre-execution occasion and no other."""
-    data = {
-        "tasks": {
-            "M01-001": {
-                "id": "M01-001",
-                "status": "planned",
-                "acceptances": ["a", "b"],
-                "requirement_ids": [],
-                "depends_on": [],
-            }
-        },
-        "requirements": {},
-        "findings": [],
-        "plan": {"revision": 1},
-    }
-    patch = repair.Patch(base_revision=1, revise_tasks=[{"id": "M01-001"}])
-    request = {"id": "RR-0001", "gate": "G-M01", "findings": []}
-    found = repair.validate(data, patch, request)
-    assert any(f.category == "revision-after-start" for f in found)
+def test_a_feature_may_not_change_milestone_in_place(objected, project, monkeypatch):
+    patched(monkeypatch, {"revise": {"M01-001": {"milestone": "M02"}}})
+    _run(objected)
+    assert "fixed-field-edited" in _reasons(state.load(project))
+
+
+def test_a_new_feature_needs_a_known_milestone(objected, project, monkeypatch):
+    patched(
+        monkeypatch,
+        {"add": {"new-queue-depth": dict(NEW_FEATURE, milestone="M42")}},
+    )
+    _run(objected)
+    data = state.load(project)
+    assert not _added(data)
+    assert "feature-shape" in _reasons(data)
+
+
+def test_a_feature_without_criteria_is_refused(objected, project, monkeypatch):
+    patched(
+        monkeypatch,
+        {"add": {"new-queue-depth": dict(NEW_FEATURE, acceptances=[])}},
+    )
+    _run(objected)
+    assert "feature-shape" in _reasons(state.load(project))
 
 
 # --------------------------------------------------------------------------
-# writ owns what may be applied
+# validation, directly
 
 
-def test_a_stale_patch_is_refused(objected, project, monkeypatch):
-    patched(monkeypatch, dict(ADDS_THE_TASK, base_revision=99))
-    code, out, _ = objected(
-        "adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics"
+@pytest.fixture
+def prepared(objected, project, tmp_path):
+    """A round directory writ has prepared, and the findings it was prepared for."""
+    data = state.load(project)
+    blocking = [f for f in plans.findings(data, open_only=True) if f.severity == "error"]
+    directory = tmp_path / "round"
+    adjudicate.prepare(project, data, directory, blocking)
+    return data, directory, [f.id for f in blocking]
+
+
+def _answer(ids):
+    return {
+        "analysis": "",
+        "dispositions": [
+            {"finding_id": f, "disposition": "accepted", "change": "fixed"} for f in ids
+        ],
+        "questions": [],
+    }
+
+
+def _add_new(directory):
+    folder = directory / "plan" / "features"
+    (folder / "new-x.json").write_text(json.dumps(dict(NEW_FEATURE, id="new-x")))
+
+
+def test_an_untouched_copy_validates_as_no_op(prepared):
+    data, directory, ids = prepared
+    found, _, diff = adjudicate.validate(
+        data, directory, _answer(ids), finding_ids=ids, base_revision=plans.revision(data)
     )
-    assert code == 1
-    assert "refused" in out
-    assert not [
-        task
-        for task in state.load(project)["tasks"].values()
-        if task.get("repair", {}).get("scope") == "plan"
-    ]
+    assert [f.category for f in found] == ["no-op"]
+    assert diff == {"revised": [], "added": [], "removed": []}
 
 
-def test_an_empty_patch_is_refused(objected, project, monkeypatch):
+def test_a_copy_of_an_older_revision_is_stale(prepared):
+    data, directory, ids = prepared
+    _add_new(directory)
+    found, _, _ = adjudicate.validate(
+        data, directory, _answer(ids), finding_ids=ids,
+        base_revision=plans.revision(data) - 1,
+    )
+    assert "stale-copy" in [f.category for f in found]
+
+
+def test_the_requirement_inventory_is_fixed(prepared):
+    data, directory, ids = prepared
+    _add_new(directory)
+    index_path = directory / "plan" / "plan.json"
+    index = json.loads(index_path.read_text())
+    index["requirements"][0]["text"] = "something easier"
+    index_path.write_text(json.dumps(index))
+    found, _, _ = adjudicate.validate(
+        data, directory, _answer(ids), finding_ids=ids, base_revision=plans.revision(data)
+    )
+    assert "requirements-edited" in [f.category for f in found]
+
+
+def test_a_mismatched_filename_is_refused(prepared):
+    data, directory, ids = prepared
+    folder = directory / "plan" / "features"
+    (folder / "new-x.json").write_text(json.dumps(dict(NEW_FEATURE, id="new-y")))
+    found, _, _ = adjudicate.validate(
+        data, directory, _answer(ids), finding_ids=ids, base_revision=plans.revision(data)
+    )
+    assert "feature-shape" in [f.category for f in found]
+
+
+def test_a_decline_needs_a_reason(prepared):
+    data, directory, ids = prepared
+    _add_new(directory)
+    response = _answer(ids)
+    response["dispositions"] = [{"finding_id": ids[0], "disposition": "declined"}]
+    found, _, _ = adjudicate.validate(
+        data, directory, response, finding_ids=ids, base_revision=plans.revision(data)
+    )
+    assert "undisposed-finding" in [f.category for f in found]
+
+
+def test_a_sound_copy_validates_clean(prepared):
+    data, directory, ids = prepared
+    _add_new(directory)
+    found, proposed, diff = adjudicate.validate(
+        data, directory, _answer(ids), finding_ids=ids, base_revision=plans.revision(data)
+    )
+    assert [f for f in found if f.blocking] == []
+    assert diff["added"] == ["new-x"]
+    assert "new-x" in proposed
+
+
+# --------------------------------------------------------------------------
+# a refusal, and the attempt after it
+
+
+def test_an_empty_edit_is_refused(objected, project, monkeypatch):
     patched(monkeypatch, {"analysis": "I looked and it seems fine"})
-    code, out, _ = objected(
-        "adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics"
-    )
+    code, out, _ = _run(objected)
     assert code == 1
     assert "refused" in out
+    assert "no-op" in _reasons(state.load(project))
 
 
-def test_an_accepted_finding_needs_work_that_closes_it(
-    objected, project, monkeypatch
-):
+def test_an_accepted_finding_must_name_its_change(objected, project, monkeypatch):
     patched(
         monkeypatch,
         dict(
             ADDS_THE_TASK,
             _auto_dispositions=False,
-            add_tasks=[
-                dict(ADDS_THE_TASK["add_tasks"][0], resolves_findings=[]),
-            ],
-            dispositions=[
-                {
-                    "finding_id": "F-0001",
-                    "resolution": "accepted",
-                    "change": "trust me",
-                }
-            ],
+            dispositions=[{"finding_id": "F-0001", "disposition": "accepted"}],
         ),
     )
-    code, out, _ = objected(
-        "adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics"
-    )
+    code, out, _ = _run(objected)
     assert code == 1
     assert "refused" in out
+    assert "undisposed-finding" in _reasons(state.load(project))
 
 
-def test_a_refused_patch_leaves_the_request_open_for_the_next_round(
+def test_a_refused_edit_leaves_the_request_open_for_the_next_round(
     objected, project, monkeypatch
 ):
-    patched(monkeypatch, dict(ADDS_THE_TASK, base_revision=99))
-    objected("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics")
+    patched(monkeypatch, {"revise": {"M01-001": {"acceptances": ["it works"]}}})
+    _run(objected)
     request = repair.requests(state.load(project))[0]
     assert request["status"] == "open"
     assert repair.refusals(request) >= 1
 
 
-def test_a_refusal_is_followed_by_a_better_patch(objected, project, monkeypatch):
-    """The loop's actual value: round two is told why round one was refused."""
-    monkeypatch.setenv(
-        "WRIT_TEST_PATCH",
-        json.dumps([dict(ADDS_THE_TASK, base_revision=99), ADDS_THE_TASK]),
-    )
-    code, out, _ = objected(
-        "adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics"
-    )
-    data = state.load(project)
-    assert [
-        task
-        for task in data["tasks"].values()
-        if task.get("repair", {}).get("scope") == "plan"
+def test_a_refusal_writes_why_next_to_the_copy(objected, project, monkeypatch):
+    patched(monkeypatch, {"revise": {"M01-001": {"acceptances": ["it works"]}}})
+    _run(objected)
+    [folder] = list(_rounds(project).glob("r*/round-1"))
+    verdict = json.loads((folder / "validation.json").read_text())
+    assert verdict["accepted"] is False
+    assert "weakened-criteria" in [item["category"] for item in verdict["problems"]]
+
+
+def test_a_retry_starts_from_the_refused_copy(objected, project, monkeypatch):
+    """The sound edits of a refused attempt are still there on the next one.
+
+    Round 1 adds the missing feature and, in the same attempt, drops a criterion.
+    Round 2 only restores the criterion. The feature it never re-created lands
+    anyway, because round 2 edited round 1's copy rather than a fresh one.
+    """
+    two = [
+        "a failing test in store/log_test.go reproduces a torn append",
+        "`go test ./store` passes with appends fsync'd in order",
     ]
+    patched(
+        monkeypatch,
+        [
+            dict(ADDS_THE_TASK, revise={"M01-001": {"acceptances": ["it works"]}}),
+            {"revise": {"M01-001": {"acceptances": two}}},
+        ],
+    )
+    code, out, _ = _run(objected)
+    data = state.load(project)
+    added = _added(data)
+    assert [task["repair"]["proposed_as"] for task in added] == ["new-queue-depth"], out
+    request = repair.requests(data)[-1]
+    assert request["status"] == "applied"
+    assert repair.refusals(request) == 1
+    # And the retry was told to read why the first one was refused.
+    [second] = list(_rounds(project).glob("r*/round-2"))
+    assert "round-1/validation.json" in (second / "prompt.txt").read_text()
     assert code == 0, out
+
+
+def test_a_retry_after_a_landed_repair_starts_fresh(objected, project, monkeypatch):
+    """A refused copy of an older revision would undo what landed since."""
+    patched(monkeypatch, {"revise": {"M01-001": {"acceptances": ["it works"]}}})
+    _run(objected)
+    data = state.load(project)
+    request = repair.plan_request(data)
+    [refused] = list(_rounds(project).glob("r*/round-1"))
+    assert (refused / "plan" / "features").is_dir()
+    revision = plans.revision(data)
+    # Same revision: the refused copy is where the next attempt starts.
+    seed, previous = adjudicate._previous_attempt(
+        project, request, revision, refused.parent / "round-99"
+    )
+    assert seed is not None and previous is not None
+    # A revision later, it is not.
+    seed, previous = adjudicate._previous_attempt(
+        project, request, revision + 1, refused.parent / "round-99"
+    )
+    assert seed is None and previous is None
 
 
 # --------------------------------------------------------------------------
 # the loop is bounded
 
 
-def test_the_loop_stops_at_its_budget(objected, project, monkeypatch):
-    """A patch that never closes the finding must not be tried forever."""
-    patched(
-        monkeypatch,
-        {
-            "add_tasks": [
-                {
-                    "id": "proposed-noop",
-                    "title": "Something unrelated",
-                    "milestone": "M01",
-                    "acceptances": ["`go test ./x` passes", "it is covered"],
-                    "allowed": ["x/x.go"],
-                }
-            ],
-            "_auto_dispositions": False,
-        },
-    )
-    code, out, _ = objected(
-        "adjudicate",
-        "--agent",
-        agent(ADJUDICATOR),
-        "--no-critics",
-        "--max-rounds",
-        "2",
-    )
+def test_the_loop_stops_when_writ_keeps_refusing(objected, project, monkeypatch):
+    """An edit that never passes must not be tried forever."""
+    patched(monkeypatch, {"revise": {"M01-001": {"acceptances": ["it works"]}}})
+    code, out, _ = _run(objected, "--max-rounds", "2")
     data = state.load(project)
-    applied = [r for r in repair.requests(data) if r["status"] == "applied"]
-    assert len(applied) <= 2, [r["id"] for r in applied]
+    assert [r for r in repair.requests(data) if r["status"] == "applied"] == []
     assert "stopped:" in out
+    assert "refused" in out
     assert code == 1
 
 
-def test_a_refused_patch_does_not_spend_a_round(objected, project, monkeypatch):
+def test_a_refused_edit_does_not_spend_a_round(objected, project, monkeypatch):
     """A refusal is information for the next attempt, not a repair that happened.
 
-    Counting agent runs against the budget instead of landed patches meant two
+    Counting agent runs against the budget instead of landed repairs meant two
     refusals — the one thing writ hands straight back with the reason — exhausted a
-    plan's whole repair allowance. The loop then reported the plan as adjudicated
-    twice when it had not been adjudicated once, and the critics never re-read
-    anything because nothing had changed for them to read.
+    plan's whole repair allowance.
     """
     patched(
         monkeypatch,
         [
-            # Refused: the edge points at a task that does not exist and is not
-            # being added either.
-            {
-                "analysis": "first try",
-                "revise_tasks": [{"id": "M01-002", "depends_on": ["M09-999"]}],
-            },
-            # Then the patch that answers the finding.
-            dict(ADDS_THE_TASK),
+            {"analysis": "first try", "revise": {"M01-002": {"depends_on": ["M09-999"]}}},
+            # The retry starts from the refused copy, so it has to undo the bad edge.
+            dict(ADDS_THE_TASK, revise={"M01-002": {"depends_on": ["M01-001"]}}),
         ],
     )
-    code, out, _ = objected(
-        "adjudicate",
-        "--agent",
-        agent(ADJUDICATOR),
-        "--no-critics",
-        "--max-rounds",
-        "1",
-    )
+    code, out, _ = _run(objected, "--max-rounds", "1")
     data = state.load(project)
     applied = [r for r in repair.requests(data) if r["status"] == "applied"]
     assert applied, out
-    # The refusal is on the record, and the patch after it still landed inside a
-    # budget of one. `MAX_PATCH_ATTEMPTS` is what bounds refusals.
     assert applied[-1].get("refusals"), applied[-1]
     assert repair.plan_rounds(data) == 1
     assert code == 0
@@ -874,14 +848,7 @@ def test_a_refused_patch_does_not_spend_a_round(objected, project, monkeypatch):
 
 def test_zero_rounds_adjudicates_nothing(objected, project, monkeypatch):
     patched(monkeypatch, ADDS_THE_TASK)
-    code, out, _ = objected(
-        "adjudicate",
-        "--agent",
-        agent(ADJUDICATOR),
-        "--no-critics",
-        "--max-rounds",
-        "0",
-    )
+    code, out, _ = _run(objected, "--max-rounds", "0")
     assert repair.requests(state.load(project)) == []
     # Says what happened rather than reporting a budget spent: nothing was tried,
     # which is not the same fact as a plan that has been repaired to its limit.
@@ -889,50 +856,38 @@ def test_zero_rounds_adjudicates_nothing(objected, project, monkeypatch):
     assert code == 1
 
 
-def test_an_adjudicator_that_writes_nothing_stops_the_loop(
-    objected, project, monkeypatch
-):
+def test_an_adjudicator_that_writes_nothing_stops_the_loop(objected, project):
     code, out, err = objected("adjudicate", "--agent", agent(MUTE), "--no-critics")
     assert code == 1
-    assert "wrote no patch" in out + err
+    assert "wrote no response" in out + err
     # And it did not leave the request claiming to be mid-planning.
     request = repair.requests(state.load(project))[0]
     assert request["status"] == "open"
 
 
-def test_a_patch_that_cannot_be_applied_leaves_the_request_open(
+def test_a_copy_that_cannot_be_promoted_leaves_the_request_open(
     objected, project, monkeypatch
 ):
-    """The failure that stranded a real plan at `needs-approval`.
+    """Any promotion failure is survivable, and named as writ's, not the agent's.
 
-    `apply_patch` was the one call in the round not wrapped: a patch that passed
-    validation and then raised on the way in took the exception out through `loop`,
-    so `writ adjudicate` died printing `repair did not run: task M06-006 already
-    exists` and left the request at `planning` — a status that is neither finished
-    nor retryable by anything. The plan could not be repaired and could not be
-    tried again.
-
-    The raise is simulated rather than reproduced: the id collision that caused it
-    is fixed in `repair._next_repair_id`, and what this test is about is that *any*
-    apply failure is survivable.
+    A copy that passed validation and then raised on the way in once took the
+    exception out through `loop`, leaving the request at `planning` — a status that
+    is neither finished nor retryable by anything.
     """
     patched(monkeypatch, ADDS_THE_TASK)
 
-    def explode(data, patch, request, **kwargs):
+    def explode(*args, **kwargs):
         raise WritError("task M01-003 already exists")
 
-    monkeypatch.setattr(repair, "apply_patch", explode)
-    code, out, err = objected("adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics")
-    assert repair.apply_patch is explode
+    monkeypatch.setattr(adjudicate, "promote", explode)
+    code, out, err = _run(objected)
     text = out + err
-    # Named as writ's failure, not the adjudicator's: it wrote a patch writ accepted.
     assert "could not be applied" in text, text
     assert "adjudicator failed" not in text, text
-    # And the request is retryable rather than stuck mid-planning.
     request = repair.requests(state.load(project))[0]
     assert request["status"] == "open", request["status"]
     # Nothing half-applied: the transaction rolled back.
-    assert "proposed-queue-depth" not in state.load(project)["tasks"]
+    assert not _added(state.load(project))
 
 
 def test_a_question_stops_the_loop_and_reaches_the_decision_log(
@@ -944,28 +899,41 @@ def test_a_question_stops_the_loop_and_reaches_the_decision_log(
             "_auto_dispositions": False,
             "questions": [
                 {
-                    "id": "Q-001",
+                    "finding_id": "F-0001",
                     "question": "Is queue depth per shard or per cluster?",
                 }
             ],
         },
     )
-    code, out, _ = objected(
-        "adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics"
-    )
+    code, out, _ = _run(objected)
     data = state.load(project)
     assert data["decisions"], data
     assert "per shard" in data["decisions"][0]["title"]
     assert code == 1
 
 
+def test_edits_and_a_question_both_land(objected, project, monkeypatch):
+    patched(
+        monkeypatch,
+        dict(
+            ADDS_THE_TASK,
+            questions=[{"finding_id": "F-0001", "question": "Per shard or per cluster?"}],
+        ),
+    )
+    _, out, _ = _run(objected)
+    data = state.load(project)
+    assert _added(data)
+    assert data["decisions"]
+    assert "question" in out
+
+
 def test_a_finding_that_survives_its_repair_is_escalated(objected, project):
-    """The worse bound: the same objection coming back after a patch closed it."""
+    """The worse bound: the same objection coming back after a repair closed it."""
     with state.transaction(project) as data:
         record = [
             item
             for item in plans.finding_records(data)
-            if item["source"] == "critic:coverage"
+            if item["source"] == "critic:fidelity"
         ][0]
         record["seen_count"] = repair.REPEAT_FINDING_LIMIT + 1
         record["reopened_at"] = "2026-01-01T00:00:00Z"
@@ -986,8 +954,7 @@ def test_repeated_advisories_do_not_escalate_the_plan(objected, project):
     A critic re-reports every note it still believes each time it re-reads, so a
     plan with seventy notes crosses any seen-count limit the first time the critics
     run twice — on a plan whose blocking findings were being fixed exactly as
-    intended. Counting those stopped the loop after one round and called a plan
-    beyond repair over objections no patch had ever been asked to answer.
+    intended.
     """
     with state.transaction(project) as data:
         plans.record_findings(
@@ -999,11 +966,11 @@ def test_repeated_advisories_do_not_escalate_the_plan(objected, project):
                     message="nothing in the design asks for it",
                     where="M01-001",
                     suggested_action="name the requirement it serves",
-                    source="critic:scope",
+                    source="critic:feasibility",
                 )
                 for severity in ("note", "warning")
             ],
-            scope="critic:scope",
+            scope="critic:feasibility",
         )
         for record in plans.finding_records(data):
             if record["severity"] in ("note", "warning"):
@@ -1022,17 +989,12 @@ def test_repeated_advisories_do_not_escalate_the_plan(objected, project):
 
 
 def test_a_blocking_finding_reopened_once_escalates(objected, project):
-    """`reopened_at` alone is the signal: a re-check disagreed with a patch.
-
-    Separate from the seen-count path because it needs no repetition to be
-    conclusive — the patch said it closed the finding and the critic that raised it
-    found it again on the patched plan.
-    """
+    """`reopened_at` alone is the signal: a re-check disagreed with a repair."""
     with state.transaction(project) as data:
         record = [
             item
             for item in plans.finding_records(data)
-            if item["source"] == "critic:coverage"
+            if item["source"] == "critic:fidelity"
         ][0]
         record["seen_count"] = 1
         record["reopened_at"] = "2026-01-01T00:00:00Z"
@@ -1061,6 +1023,7 @@ def test_the_plan_bound_counts_only_applied_repairs(objected, project):
     assert repair.plan_rounds(state.load(project)) == 0
 
 
+
 # --------------------------------------------------------------------------
 # a finding closes on a re-check, not on the patch's word
 
@@ -1071,19 +1034,25 @@ def test_the_plan_bound_counts_only_applied_repairs(objected, project):
 #: critic's report under a directory named for it, and no critic's brief happens to
 #: contain its own name.
 STUBBORN_CRITIC = """
-import json, re, sys
+import json, os, re, sys
 prompt = sys.stdin.read()
 path = re.search(r'Write your findings as JSON to this exact path:\\n  (\\S+)', prompt).group(1)
-findings = []
-if "/coverage/" in path:
+findings, still_open = [], []
+verify = os.path.join(os.path.dirname(path), "verify.json")
+if "/fidelity/" in path and os.path.exists(verify):
+    # a verify pass: every earlier blocker still stands
+    still_open = [item["id"] for item in json.load(open(verify))["open"]]
+elif "/fidelity/" in path:
     findings = [{
         "severity": "blocking",
-        "category": "missing-coverage",
+        "category": "uncovered-requirement",
         "where": "REQ-003",
         "message": "No task implements the queue depth view",
         "suggested_action": "add a task, or mark it out of scope",
     }]
-open(path, "w").write(json.dumps({"findings": findings, "summary": "still not covered"}))
+open(path, "w").write(json.dumps(
+    {"findings": findings, "still_open": still_open, "summary": "still not covered"}
+))
 """
 
 #: a critic satisfied by whatever the patch did
@@ -1139,7 +1108,7 @@ def test_a_finding_a_critic_still_reports_does_not_close(
     reopened = [
         item
         for item in plans.finding_records(data)
-        if item["category"] == "missing-coverage"
+        if item["category"] in ("missing-coverage", "uncovered-requirement")
         and item["disposition"] == "open"
     ]
     assert reopened, plans.finding_records(data)
@@ -1221,7 +1190,7 @@ def test_plan_repair_answers_what_the_critics_found_before_approval(
     patched(monkeypatch, ADDS_THE_TASK)
     code, out, _ = writ(
         "plan", str(design), "--from-plan", str(artifact),
-        "--critics", "coverage", "--critic-agent", agent(CRITIC_ONCE),
+        "--critics", "fidelity", "--critic-agent", agent(CRITIC_ONCE),
         "--repair", "--adjudicator-agent", agent(ADJUDICATOR),
         "--auto-approve", "--quiet",
     )
@@ -1253,7 +1222,7 @@ def test_check_stops_listing_what_the_repair_answered(
     patched(monkeypatch, ADDS_THE_TASK)
     writ(
         "plan", str(design), "--from-plan", str(artifact),
-        "--critics", "coverage", "--critic-agent", agent(CRITIC_ONCE),
+        "--critics", "fidelity", "--critic-agent", agent(CRITIC_ONCE),
         "--repair", "--adjudicator-agent", agent(ADJUDICATOR),
         "--quiet",
     )
@@ -1261,7 +1230,7 @@ def test_check_stops_listing_what_the_repair_answered(
     answered = [
         record["id"]
         for record in plans.finding_records(data)
-        if record["category"] == "missing-coverage"
+        if record["category"] in ("missing-coverage", "uncovered-requirement")
     ]
     assert answered
     for finding_id in answered:
@@ -1284,7 +1253,7 @@ def test_plan_without_repair_leaves_the_findings_standing(
     patched(monkeypatch, ADDS_THE_TASK)
     code, out, _ = writ(
         "plan", str(design), "--from-plan", str(artifact),
-        "--critics", "coverage", "--critic-agent", agent(CRITIC_ONCE),
+        "--critics", "fidelity", "--critic-agent", agent(CRITIC_ONCE),
         "--auto-approve", "--quiet",
     )
     assert code == 0
@@ -1393,11 +1362,11 @@ def test_a_new_blocking_finding_after_a_patch_opens_another_round(
                     message=f"allowed path 'src/thing{n}.py' does not exist yet",
                     where="M01-001",
                     suggested_action="confirm the path",
-                    source="critic:scope",
+                    source="critic:feasibility",
                 )
                 for n in range(40)
             ],
-            scope="critic:scope",
+            scope="critic:feasibility",
         )
         for record in plans.finding_records(data):
             if record["severity"] == "note":
@@ -1405,7 +1374,7 @@ def test_a_new_blocking_finding_after_a_patch_opens_another_round(
 
     code, out, _ = writ(
         "plan", str(design), "--from-plan", str(artifact),
-        "--critics", "coverage", "--critic-agent", agent(CRITIC_MOVES_ON),
+        "--critics", "fidelity", "--critic-agent", agent(CRITIC_MOVES_ON),
         "--repair", "--adjudicator-agent", agent(ADJUDICATOR),
         "--max-rounds", "4", "--quiet",
     )
@@ -1422,14 +1391,17 @@ def test_a_new_blocking_finding_after_a_patch_opens_another_round(
     raised = [
         record
         for record in plans.finding_records(data)
-        if record["scope"] == "critic:coverage"
+        if record["scope"] == "critic:fidelity"
     ]
     assert len(raised) == 2, [r["id"] for r in raised]
     for record in raised:
         assert record["disposition"] in ("resolved", "accepted"), record
     # Each round answered a different objection, which is what distinguishes this
     # from a finding surviving its repair.
-    assert {record["where"] for record in raised} == {"REQ-003", "REQ-004"}
+    assert {tuple(record["requirement_ids"]) for record in raised} == {
+        ("REQ-003",),
+        ("REQ-004",),
+    }
 
 
 def test_each_resumed_round_gets_its_own_step(objected, project, monkeypatch):
@@ -1455,7 +1427,7 @@ def test_each_resumed_round_gets_its_own_step(objected, project, monkeypatch):
     code, out, _ = objected(
         "adjudicate",
         "--agent", agent(ADJUDICATOR),
-        "--critics", "coverage",
+        "--critics", "fidelity",
         "--critic-agent", agent(CRITIC_MOVES_ON),
         "--max-rounds", "4",
     )

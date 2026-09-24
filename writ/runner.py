@@ -13,7 +13,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, IO, Iterable
 
-from . import agents, decisions, failures, planner, plans, procs, repair, state, verdict
+from . import (
+    agents,
+    contracts,
+    decisions,
+    failures,
+    planner,
+    plans,
+    procs,
+    repair,
+    state,
+    verdict,
+)
 from .stream import Renderer
 from .model import (
     DEFAULT_MAX_REWORK,
@@ -52,7 +63,13 @@ def build_prompt(
 ) -> str:
     """Compose the agent prompt from the task, its gates, and the design doc."""
     lines: list[str] = []
-    lines.append("You are implementing ONE bounded task in this project.")
+    feature = contracts.is_feature(task)
+    lines.append(
+        "You are implementing ONE feature of this project: a subsystem you build "
+        "on your own, inside its fence."
+        if feature
+        else "You are implementing ONE bounded task in this project."
+    )
     lines.append("")
     docs = list(data.get("design_docs", []))
     if task.get("design_doc") and task["design_doc"] not in docs:
@@ -65,16 +82,22 @@ def build_prompt(
     if task.get("milestone"):
         milestone = data["milestones"].get(task["milestone"], {})
         lines.append(f"Milestone: {task['milestone']} — {milestone.get('title', '')}")
+    if feature:
+        lines.extend(_feature_section(data, task))
     lines.append("")
     lines.append("Acceptance criteria (each must be demonstrably met):")
     for index, item in enumerate(task.get("acceptances", []), start=1):
         marker = "x" if item["status"] == "passed" else " "
         lines.append(f"  {index}. [{marker}] {item['text']}")
     lines.append("")
-    if task.get("depends_on"):
+    if task.get("depends_on") and not feature:
         lines.append(f"Completed prerequisites: {', '.join(task['depends_on'])}")
         lines.append("")
-    if task.get("allowed"):
+    if task.get("allowed") and feature:
+        lines.append("Fence (the component you own, and where tests go):")
+        lines.extend(f"- {item}" for item in task["allowed"])
+        lines.append("")
+    elif task.get("allowed"):
         lines.append("Allowed files/packages:")
         lines.extend(f"- {item}" for item in task["allowed"])
         lines.append("")
@@ -104,6 +127,53 @@ def build_prompt(
     lines.append("")
     lines.append(_verdict_instructions(task, verdict_path))
     return "\n".join(lines)
+
+
+def _feature_section(data: dict[str, Any], task: dict[str, Any]) -> list[str]:
+    """A feature's goal, contracts and upstream, and the instruction to plan it.
+
+    The plan named no files and no steps for a feature on purpose
+    (docs/planning-redesign.md §4): they are decided here, by the agent that can
+    see the repository as the upstream features actually left it. So this says
+    what those features claim to have provided, not what the plan hoped.
+    """
+    lines: list[str] = []
+    if task.get("goal"):
+        lines.append(f"Goal: {task['goal']}")
+    if task.get("requirement_ids"):
+        requirements = plans.requirements(data)
+        lines.append("Requirements this feature discharges (every detail counts):")
+        for req_id in task["requirement_ids"]:
+            record = requirements.get(req_id, {})
+            lines.append(f"- {req_id}: {record.get('text', '')}")
+            for detail in record.get("details") or []:
+                lines.append(f"    · {detail}")
+    if task.get("provides"):
+        lines.append("You provide (others build on exactly this; keep the names):")
+        lines.extend(f"- {item}" for item in task["provides"])
+    if task.get("consumes"):
+        lines.append("You consume:")
+        lines.extend(f"- {item}" for item in task["consumes"])
+    upstream = [dep for dep in task.get("depends_on", []) if dep in data["tasks"]]
+    if upstream:
+        lines.append("Upstream features, as they stand:")
+        for dep_id in upstream:
+            dep = data["tasks"][dep_id]
+            lines.append(f"- {dep_id} [{dep.get('status')}] {dep.get('title', '')}")
+            provided = dep.get("provides") or []
+            if provided:
+                lines.append(f"    provides: {'; '.join(provided)}")
+            claim = (dep.get("last_verdict") or {}).get("summary", "")
+            if claim:
+                lines.append(f"    reported: {_first_sentence(claim)}")
+    lines.append("")
+    lines.append(
+        "Plan your own steps. The plan names no files or tests for this feature: "
+        "choose them yourself, inside the fence below, after reading the code the "
+        "upstream features left. If a consumed interface is missing or differs "
+        "from its contract, say so in your verdict rather than building around it."
+    )
+    return lines
 
 
 def _rework_section(task: dict[str, Any]) -> str:

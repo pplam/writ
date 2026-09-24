@@ -389,7 +389,7 @@ def record_findings(
             # Somebody else's objection. A pass by this reporter is not evidence
             # about a finding it never looked for.
             continue
-        if not _closeable(payload):
+        if not closeable(payload):
             continue
         payload["disposition"] = "resolved"
         payload["resolved_at"] = utcnow()
@@ -467,7 +467,7 @@ def _shorten(text: str, limit: int) -> str:
 AGENT_ACTORS = ("adjudicator", "repair-planner", "writ")
 
 
-def _closeable(payload: dict[str, Any]) -> bool:
+def closeable(payload: dict[str, Any]) -> bool:
     """Whether this reporter's silence may close the finding.
 
     `open` is the ordinary case. An *agent's* acceptance also closes, and that is
@@ -611,9 +611,9 @@ def _stage_findings(
 ) -> list[Finding]:
     """Re-derive the staged-planning findings against the graph as it now stands.
 
-    These are `analysis.reconcile`'s — a requirement dropped, invented, replanned, or
-    verified by a method no task cites. They used to be produced once, at plan time,
-    and passed in as `extra`; every later check omitted them, so `record_findings`
+    These are `analysis.reconcile`'s — a requirement dropped, invented or
+    replanned. They used to be produced once, at plan time, and passed in as
+    `extra`; every later check omitted them, so `record_findings`
     saw a plan-scoped finding this reporter had not reported and should have closed.
     It did not, because they carry `source="stage:synthesis"` and only the reporter
     that raised a finding may close it — so 32 of them sat open at revision 1 while

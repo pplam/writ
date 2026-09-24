@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
+from . import contracts
 from .model import TERMINAL_STATUSES, add_task, milestone_tasks, refresh_milestones
 from .state import WritError, utcnow
 
@@ -253,13 +254,19 @@ def final_criteria(data: dict[str, Any]) -> list[str]:
     """What the final gate has to establish before a plan is complete."""
     criteria = [
         "Every `must` requirement in the inventory is satisfied by the integrated "
-        "code, or is recorded as existing with evidence, or out of scope with a "
-        "reason",
+        "code, including each of its `details`, or is recorded as existing with "
+        "evidence, or out of scope with a reason",
         "The design documents' stated behaviour holds end to end, not only per "
         "component",
         "The project's full verification passes from a clean checkout",
         "No requirement was satisfied by weakening what it asked for",
     ]
+    if any(contracts.is_feature(task) for task in data.get("tasks", {}).values()):
+        # Features were built apart, each against the others' stated contracts.
+        # This is the one place anything checks that the contracts were kept.
+        criteria.append(
+            "Every interface a feature provides behaves as its consumers use it"
+        )
     return criteria
 
 

@@ -1,51 +1,49 @@
-"""Staged planning: three analyses before anything is decomposed into tasks.
+"""Staged planning: two analyses before anything is decomposed into features.
 
 `writ plan` used to be one agent call. That agent read the design document, read
-the repository, decided how the work could be verified, chose task boundaries,
-inferred the dependency graph and wrote the acceptance bars — in one response,
-with no artifact between any two of those judgements.
+the repository, chose feature boundaries, inferred the dependency graph and wrote
+the acceptance bars — in one response, with no artifact between any two of
+those judgements.
 
 Those are different jobs, and running them together loses the thing that makes a
-plan checkable. An obligation the document states and the planner did not notice
-leaves no trace: there is no list it is missing from. A task fenced to a directory
-that does not exist looks exactly like a task fenced to one that does. A criterion
-that cannot be demonstrated reads the same as one that can, because nothing ever
-asked how it would be.
-
-So the judgements are separated, and each one writes down what it found before the
-next one runs:
+plan checkable. A capability the document asks for and the planner did not
+notice leaves no trace: there is no list it is missing from. So the judgements
+are separated, and each one writes down what it found before the next one runs:
 
 ```text
-requirements.json   what the document obliges, one entry per obligation
-inventory.json      what the repository already is, and already does
-verification.json   how each obligation could be demonstrated
+requirements.json   what the document asks for, as 10-25 capabilities
+inventory.json      a short summary of the repository: language, test
+                    command, test directories, baseline, components
         │
         ▼
-plan.json           the decomposition, synthesized from all three
+draft.json          the features, synthesized from both
 ```
 
 Two properties follow that a single call cannot have. Each artifact is *checkable
 on its own* — writ validates the inventory's requirement references before the
 planner ever sees it, so a hallucinated `REQ-009` fails at the stage that invented
-it rather than becoming a task nobody asked for. And the synthesizer is *held to*
+it rather than becoming work nobody asked for. And the synthesizer is *held to*
 the earlier artifacts: it receives the requirement inventory as a fixed list, and
 `reconcile` reports any id it dropped or invented as a finding on the plan.
 
-What this deliberately does not do is generate several competing plans and pick
-one. Candidate plans were in the original recommendation and are not here: with
-`requirements.json` fixed, the useful disagreement is about *coverage of a known
-list*, which the critics (`writ/critics.py`) provide by reading the one plan
-adversarially. Two plans with no shared vocabulary would need a third agent to
-choose between them, and that agent would be the unreviewed author again.
+Requirements are coarse on purpose (docs/planning-redesign.md §4). One entry per
+sentence of the document produced 60+ ids, and a plan checked against that many
+spent its repair rounds arguing about which task held which sentence. A
+capability groups them, and keeps the sentences as `details`, which the final
+gate checks.
+
+There used to be a third stage, deciding how each requirement would be
+verified. It is gone: it named test files for code that did not exist, and the
+plan was then faulted for not citing them. Acceptance lives on the feature, as
+behaviour.
 
 Stages are resumable. Artifacts live under `.writ/plans/<plan-id>/`, and a stage
 whose artifact is already there is not re-run unless asked, so a pipeline that
-failed at synthesis does not pay for three analyses again.
+failed at synthesis does not pay for the analyses again.
 """
 from __future__ import annotations
 
 import json
-import re
 import threading
 from concurrent import futures
 from contextlib import nullcontext
@@ -53,8 +51,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from . import agents, runner, state
+from . import agents, prompts, runner, state
 from .plancheck import Finding, Requirement
+from .planner import DesignDocs, doc_list
 from .stream import truncated
 from .state import WritError, utcnow
 
@@ -79,10 +78,9 @@ class Stage:
     rules: str
     #: what it must not do — the boundary that keeps it from being the planner
     out_of_scope: str = ""
-    #: the artifacts it cannot run without. Only a hard prerequisite belongs here:
-    #: verification is deciding how to prove each requirement, so it cannot start
-    #: before there is a list of them. An artifact that merely *sharpens* a stage
-    #: does not, which is what lets two stages share a wave — see `waves`.
+    #: the artifacts it cannot run without. Only a hard prerequisite belongs here;
+    #: an artifact that merely *sharpens* a stage does not, which is what lets two
+    #: stages share a wave — see `waves`.
     needs: tuple[str, ...] = ()
     #: the extra instruction to give this stage when the requirement inventory is
     #: not available to it, naming what it must therefore leave out. A stage that
@@ -95,18 +93,33 @@ class Stage:
         return f"stage:{self.name}"
 
 
+#: the most capabilities one document may produce. Past this, the list is
+#: sentences again, and every later stage pays for it.
+MAX_REQUIREMENTS = 25
+#: the fewest a document is asked for, however short it is
+MIN_REQUIREMENTS = 3
+#: roughly how many words of design one capability stands for
+WORDS_PER_REQUIREMENT = 250
+
+
+def requirement_cap(text: str) -> int:
+    """How many capabilities a document of this size should produce at most."""
+    words = len(text.split())
+    return max(MIN_REQUIREMENTS, min(MAX_REQUIREMENTS, -(-words // WORDS_PER_REQUIREMENT)))
+
+
 REQUIREMENTS_SCHEMA = """\
 {
   "requirements": [
     {
       "id": "REQ-001",
-      "text": "one obligation the document states, in your own words",
+      "text": "one capability the document asks for, named as a whole",
       "source": "the exact heading it came from",
       "priority": "must" | "should" | "may",
       "status": "planned" | "existing" | "out-of-scope" | "deferred",
-      "evidence": "status existing only: the test or code that satisfies it",
+      "evidence": "status existing only: the code that satisfies it",
       "reason": "status out-of-scope or deferred only: why it is not this plan's",
-      "verification": ["how this could be demonstrated, if the document says"]
+      "details": ["a finer obligation the capability contains", "another"]
     }
   ],
   "ambiguities": [
@@ -122,160 +135,94 @@ REQUIREMENTS_SCHEMA = """\
 
 REQUIREMENTS_RULES = """\
 Rules:
-- One obligation per entry. Do not fold two together to shorten the list: two
-  obligations in one entry can only ever be half-covered, and nothing downstream
-  can say which half.
-- Write every obligation the document states, of every kind: behaviour,
-  interface, constraint, data shape, error handling, performance bar,
-  compatibility promise, operational requirement. A constraint stated once in
-  prose is still an obligation.
+- Group. An entry is a capability a user of the system could name — "durable
+  event store", "search over stored memories" — not one sentence of the
+  document. Roughly one per major section; 10 to 25 for a full design, never
+  more than 25, and fewer for a short document.
+- Put every finer obligation the capability contains in its `details`: each
+  behaviour, interface, constraint, limit, error case, performance bar. Nothing
+  the document states should be lost; it just does not get an id of its own.
+  The final gate checks these details, so write them precisely.
 - `source` must be a heading that appears verbatim in the document. Use
-  "Parent / Child" for a nested heading. An obligation you cannot trace to a
-  heading is one you may have invented.
+  "Parent / Child" for a nested heading.
 - `priority` is the document's own emphasis, not your view of what matters.
   "must"/"shall"/"is required" is `must`; "should"/"prefer" is `should`;
   "may"/"could"/"optionally" is `may`. When the document is flat, `must`.
 - `status` is `planned` unless you have read the repository and found the
-  obligation already discharged, in which case `existing` with `evidence` naming
-  the test or code. Do not guess: `planned` for something already built is a
-  wasted task, which is cheaper than an obligation marked done that is not.
+  capability already built, in which case `existing` with `evidence` naming the
+  code. Do not guess.
 - Record what the document leaves genuinely open as an ambiguity, with the
-  readings it could bear. Do not silently pick one. An ambiguity is not an
-  excuse to omit the requirement — write the requirement too.
+  readings it could bear. Do not silently pick one.
 - Quote or paraphrase closely. This inventory becomes the list every later stage
-  is held to, so an obligation phrased more weakly here is weakened everywhere."""
+  is held to, so a capability phrased more weakly here is weakened everywhere."""
 
 INVENTORY_SCHEMA = """\
 {
-  "components": [
-    {
-      "name": "event store",
-      "paths": ["writ/state.py", "writ/runner.py"],
-      "existing_behavior": "what it does today, not what it should do",
-      "test_locations": ["tests/test_state.py"],
-      "extension_points": ["where new work would attach"],
-      "risks": ["what makes this component costly or dangerous to change"]
-    }
-  ],
-  "existing_coverage": [
-    {
-      "requirement_id": "REQ-003",
-      "status": "full" | "partial" | "none",
-      "evidence": "the test or code that shows it, by path and name"
-    }
-  ],
-  "conventions": ["how this repository does things, that new work should match"],
-  "baseline_commands": ["pytest -q"],
+  "language": "the main language and toolchain, e.g. python 3.12 with uv",
+  "test_commands": ["uv run pytest -q"],
+  "test_dirs": ["tests/"],
   "baseline_result": {
     "status": "pass" | "fail" | "unknown",
     "summary": "what the command printed, in a line or two",
     "known_failures": ["a test that already fails, by name"]
-  }
-}"""
-
-INVENTORY_RULES = """\
-Rules:
-- Report what the repository is, not what it should become. Every path you name
-  must exist; check rather than assume. A plan fenced to a directory you imagined
-  fails at execution with no useful error.
-- Run the project's own verification before anything is planned, and record the
-  result. This is the single most useful line in this file: without it, every
-  failure during execution is ambiguous between "the new work broke it" and "it
-  was already broken". If you cannot run it, say `unknown` and say why — do not
-  report `pass` for a command you did not run.
-- Name the tests that already exist per component. Work that has test coverage is
-  work a plan can safely change; work that has none needs its own bar first.
-- Map the requirements you were given onto what already exists. `full` means a
-  test demonstrates it today — name that test. `partial` means some of it holds.
-  Unevidenced `full` is worse than `none`: it deletes a requirement from the plan.
-- `requirement_id` must be an id from the inventory you were given. Do not invent
-  ids and do not renumber; if an obligation seems missing from that list, say so
-  in `conventions` and carry on — the list is fixed at this point.
-- Record the conventions that would make new work look like the existing code:
-  layout, naming, error handling, how tests are written, what the project
-  already depends on."""
-
-VERIFICATION_SCHEMA = """\
-{
-  "verification": [
+  },
+  "components": [
     {
-      "requirement_id": "REQ-001",
-      "methods": [
-        {
-          "kind": "test" | "command" | "artifact" | "inspection",
-          "location": "tests/test_parser.py",
-          "command": "pytest -q tests/test_parser.py",
-          "observable": "malformed input produces a stable error, exit 2",
-          "exists": true,
-          "needs": "what has to be built before this can run, if anything"
-        }
-      ],
-      "confidence": "high" | "medium" | "low"
+      "name": "event store",
+      "paths": ["app/store/"],
+      "summary": "what it does today, in a sentence"
     }
   ],
-  "missing_infrastructure": [
+  "conventions": ["how this repository does things, that new work should match"],
+  "existing_coverage": [
     {
-      "need": "there is no integration test harness",
-      "blocks": ["REQ-007", "REQ-011"],
-      "suggestion": "what would have to exist first"
-    }
-  ],
-  "undemonstrable": [
-    {
-      "requirement_id": "REQ-014",
-      "why": "why no method would actually demonstrate this",
-      "closest": "the nearest thing that could be checked"
+      "requirement_id": "REQ-003",
+      "status": "full" | "partial" | "none",
+      "evidence": "the code or test that shows it"
     }
   ]
 }"""
 
-VERIFICATION_RULES = """\
+INVENTORY_RULES = """\
 Rules:
-- Every requirement you were given gets an entry. A requirement with no way to
-  demonstrate it is the most expensive kind of plan defect — it produces work
-  that is reported complete because nothing could show otherwise — so say so
-  explicitly in `undemonstrable` rather than inventing a plausible command.
-- A method must be concrete enough to run or observe. Name the command, the test
-  file, the artifact, or the behaviour and how it is seen. "Verify it works" is
-  not a method.
-- `exists` is whether that test or command exists in the repository *now*. Check.
-  Where it does not, `needs` says what must be built, which is how the planner
-  knows a test is itself work rather than a bar it can just cite.
-- Prefer verification the repository can already run. A method requiring new
-  infrastructure needs that infrastructure planned, and a plan whose every bar
-  needs new scaffolding will never demonstrate anything.
-- Where a requirement can only be shown by inspection, say `inspection` honestly
-  rather than dressing it as a test. A reviewer reading criteria needs to know
-  which bars a machine can check.
-- Do not decide who does the work, in what order, or in how many tasks. You are
-  saying what proof would look like, not planning."""
+- Keep it short. This is a summary a planner reads in a minute, not a survey:
+  the language, how tests run, where they live, whether they pass today, and the
+  few components new work will attach to. Leave out components the design does
+  not touch.
+- Every path you name must exist; check rather than assume.
+- Run the project's test command before anything is planned, and record the
+  result in `baseline_result`. If you cannot run it, say `unknown` and say why —
+  do not report `pass` for a command you did not run. For an empty repository,
+  say what the test command will be and `unknown`.
+- `test_dirs` are where tests live, or where they would go by this ecosystem's
+  convention if there are none yet. Every feature may write there.
+- Map the requirements you were given onto what already exists. `full` means
+  the capability is built and tested today — name the evidence. Unevidenced
+  `full` is worse than `none`: it deletes a requirement from the plan.
+- `requirement_id` must be an id from the inventory you were given. Do not invent
+  ids and do not renumber."""
 
-#: the three analyses, in the order they run.
+#: the two analyses, in the order they run.
 #:
-#: Ordered by dependency rather than by cost: requirements is first because
-#: everything later references its ids, inventory second because verification
-#: needs to know which tests exist, verification last because it is the only one
-#: that needs both. Each receives the artifacts of the ones before it.
-#:
-#: `needs` records which of those dependencies is real. Only verification has one:
-#: it is asked how to prove each requirement, so a list of requirements is not
-#: context but input. The inventory is surveying the repository, which the design
-#: document does not change — it is given the requirement ids when they exist only
-#: so its coverage claims can attach to them.
+#: Requirements is first because everything later references its ids. The
+#: inventory is surveying the repository, which the design document does not
+#: change — it is given the requirement ids when they exist only so its coverage
+#: claims can attach to them, which is why it `needs` nothing and may share a
+#: wave with the requirements stage.
 STAGES: tuple[Stage, ...] = (
     Stage(
         name="requirements",
         artifact="requirements.json",
-        summary="what the design document obliges, as a numbered inventory",
+        summary="what the design document asks for, as 10-25 capabilities",
         brief=(
-            "You are reading a design document and writing down every obligation "
-            "it states. You are not planning the work, and you are not deciding "
-            "how it will be built."
+            "You are reading a design document and writing down the capabilities "
+            "it asks for, each with the finer obligations it contains. You are not "
+            "planning the work, and you are not deciding how it will be built."
         ),
         schema=REQUIREMENTS_SCHEMA,
         rules=REQUIREMENTS_RULES,
         out_of_scope=(
-            "Do not propose milestones, tasks, ordering, or file boundaries. This "
+            "Do not propose features, tasks, ordering, or file boundaries. This "
             "inventory is the list the plan will be checked against, and a list "
             "written with a decomposition already in mind gets shaped to fit it."
         ),
@@ -283,44 +230,22 @@ STAGES: tuple[Stage, ...] = (
     Stage(
         name="inventory",
         artifact="inventory.json",
-        summary="what the repository already is, does, and tests",
+        summary="a short summary of the repository: language, tests, baseline",
         brief=(
-            "You are surveying this repository so that the plan is grounded in "
-            "what is actually here. You are not planning the work, and you are "
-            "not changing anything."
+            "You are writing a short summary of this repository so that the plan "
+            "is grounded in what is actually here. You are not planning the work, "
+            "and you are not changing anything."
         ),
         schema=INVENTORY_SCHEMA,
         rules=INVENTORY_RULES,
         out_of_scope=(
-            "Do not propose tasks or an architecture for the new work. Do not "
-            "judge whether the design is a good idea. Report the ground, not the "
-            "route across it."
+            "Do not propose features or an architecture for the new work. Do not "
+            "judge whether the design is a good idea."
         ),
         without_requirements=(
             "You have not been given the requirement inventory: it is being written "
-            "at the same time as this survey. So leave `existing_coverage` empty. "
-            "Report what this repository has and what it proves in `components` and "
-            "`baseline_commands` as fully as you can, and leave the question of "
-            "which stated obligation that discharges to the stage that has the ids. "
+            "at the same time as this summary. So leave `existing_coverage` empty. "
             "Do not guess at requirement ids in order to fill the field."
-        ),
-    ),
-    Stage(
-        name="verification",
-        artifact="verification.json",
-        summary="how each obligation could be demonstrated",
-        brief=(
-            "You are deciding how each stated obligation could be proved to hold, "
-            "given this repository. You are not planning the work that satisfies "
-            "them."
-        ),
-        schema=VERIFICATION_SCHEMA,
-        rules=VERIFICATION_RULES,
-        needs=("requirements", "inventory"),
-        out_of_scope=(
-            "Do not group requirements into tasks, assign them an order, or write "
-            "acceptance criteria for work that does not exist yet. One requirement "
-            "at a time, and only how it would be shown."
         ),
     ),
 )
@@ -385,13 +310,15 @@ class RequirementsArtifact:
 
 @dataclass
 class InventoryArtifact:
-    """What the repository is, and what of the design it already satisfies."""
+    """The short repo summary, and what of the design it already satisfies."""
 
     components: list[dict[str, Any]] = field(default_factory=list)
     existing_coverage: list[dict[str, Any]] = field(default_factory=list)
     conventions: list[str] = field(default_factory=list)
     baseline_commands: list[str] = field(default_factory=list)
     baseline_result: dict[str, Any] = field(default_factory=dict)
+    language: str = ""
+    test_dirs: list[str] = field(default_factory=list)
 
     @property
     def baseline_status(self) -> str:
@@ -411,35 +338,11 @@ class InventoryArtifact:
 
 
 @dataclass
-class VerificationArtifact:
-    """How each requirement could be demonstrated, and which cannot be."""
-
-    verification: list[dict[str, Any]] = field(default_factory=list)
-    missing_infrastructure: list[dict[str, Any]] = field(default_factory=list)
-    undemonstrable: list[dict[str, Any]] = field(default_factory=list)
-
-    def methods_for(self, requirement_id: str) -> list[dict[str, Any]]:
-        for entry in self.verification:
-            if entry.get("requirement_id") == requirement_id:
-                return list(entry.get("methods", []))
-        return []
-
-    @property
-    def covered(self) -> set[str]:
-        return {
-            str(entry.get("requirement_id", ""))
-            for entry in self.verification
-            if entry.get("methods")
-        }
-
-
-@dataclass
 class Artifacts:
     """Whatever the pipeline has produced so far, for the stage that is next."""
 
     requirements: RequirementsArtifact | None = None
     inventory: InventoryArtifact | None = None
-    verification: VerificationArtifact | None = None
 
     def get(self, name: str) -> Any:
         return getattr(self, name, None)
@@ -518,6 +421,13 @@ def load_requirements(text: str, *, path: Path | None = None) -> RequirementsArt
             "A design document that states nothing cannot be planned; re-run the "
             "stage, or plan with --no-stages if this document really is empty."
         )
+    if len(requirements) > MAX_REQUIREMENTS:
+        raise WritError(
+            f"the requirements stage wrote {len(requirements)} requirements; "
+            f"{MAX_REQUIREMENTS} is the most one document may produce ({where}). "
+            "Group them into capabilities, with the finer obligations as `details`, "
+            "and re-run the stage with --refresh."
+        )
     ambiguities = _objects(payload.get("ambiguities"), "ambiguities")
     known = {requirement.id for requirement in requirements}
     for index, entry in enumerate(ambiguities):
@@ -583,75 +493,29 @@ def load_inventory(
     result["known_failures"] = _strings(
         result.get("known_failures"), "baseline_result.known_failures"
     )
+    commands = _strings(payload.get("test_commands"), "test_commands")
+    commands += [
+        command
+        for command in _strings(payload.get("baseline_commands"), "baseline_commands")
+        if command not in commands
+    ]
+    language = payload.get("language") or ""
+    if not isinstance(language, str):
+        raise WritError(f"language must be a string ({where})")
     return InventoryArtifact(
         components=components,
         existing_coverage=coverage,
         conventions=_strings(payload.get("conventions"), "conventions"),
-        baseline_commands=_strings(
-            payload.get("baseline_commands"), "baseline_commands"
-        ),
+        baseline_commands=commands,
         baseline_result=result,
-    )
-
-
-def load_verification(
-    text: str, *, known: Iterable[str] = (), path: Path | None = None
-) -> VerificationArtifact:
-    """Validate a verification strategy against the requirements it must cover."""
-    where = path or Path("verification.json")
-    payload = _payload(text, STAGES[2], where)
-    ids = set(known)
-    entries = _objects(payload.get("verification"), "verification")
-    seen: set[str] = set()
-    for index, entry in enumerate(entries):
-        req_id = str(entry.get("requirement_id", "")).strip()
-        if not req_id:
-            raise WritError(f"verification[{index}] names no requirement_id ({where})")
-        if ids and req_id not in ids:
-            raise WritError(
-                f"verification[{index}] is for {req_id}, which is not in the "
-                f"requirement inventory ({where}). Re-run the verification stage; "
-                "it may not invent requirement ids."
-            )
-        if req_id in seen:
-            raise WritError(
-                f"verification[{index}] is a second entry for {req_id}; one entry "
-                f"per requirement, with every method in its `methods` ({where})"
-            )
-        seen.add(req_id)
-        methods = _objects(entry.get("methods"), f"verification[{index}].methods")
-        for position, method in enumerate(methods):
-            detail = " ".join(
-                str(method.get(key, ""))
-                for key in ("command", "location", "observable")
-            ).strip()
-            if not detail:
-                raise WritError(
-                    f"verification[{index}].methods[{position}] states no command, "
-                    f"location or observable, so it verifies nothing ({where})"
-                )
-        entry["methods"] = methods
-    undemonstrable = _objects(payload.get("undemonstrable"), "undemonstrable")
-    for index, entry in enumerate(undemonstrable):
-        req_id = str(entry.get("requirement_id", "")).strip()
-        if ids and req_id and req_id not in ids:
-            raise WritError(
-                f"undemonstrable[{index}] is for {req_id}, which is not in the "
-                f"requirement inventory ({where})"
-            )
-    return VerificationArtifact(
-        verification=entries,
-        missing_infrastructure=_objects(
-            payload.get("missing_infrastructure"), "missing_infrastructure"
-        ),
-        undemonstrable=undemonstrable,
+        language=language.strip(),
+        test_dirs=_strings(payload.get("test_dirs"), "test_dirs"),
     )
 
 
 LOADERS: dict[str, Callable[..., Any]] = {
     "requirements": load_requirements,
     "inventory": load_inventory,
-    "verification": load_verification,
 }
 
 
@@ -695,23 +559,11 @@ def read_all(directory: Path) -> Artifacts:
 # prompts
 
 
-def _render_requirements(requirements: Iterable[Requirement]) -> list[str]:
-    lines: list[str] = []
-    for requirement in requirements:
-        head = f"- {requirement.id} [{requirement.priority}/{requirement.status}]"
-        lines.append(f"{head} {requirement.text}")
-        if requirement.source:
-            lines.append(f"    source: {requirement.source}")
-        if requirement.verification:
-            lines.append(f"    verification hints: {'; '.join(requirement.verification)}")
-    return lines
-
-
 def build_prompt(
     stage: Stage,
     *,
     root: Path,
-    doc: Path,
+    doc: DesignDocs,
     artifact_path: Path,
     artifacts: Artifacts,
     instructions: str | None = None,
@@ -719,34 +571,48 @@ def build_prompt(
 ) -> str:
     """Compose one stage's prompt: its brief, what came before, and its schema."""
     context = context or {}
+    folder = artifact_path.parent
     lines: list[str] = [stage.brief, ""]
-    lines.append(f"Repository root: {root}")
-    lines.append(f"Design document: {doc}")
+    lines.append(prompts.root_line(root))
     lines.append("")
+    first = prompts.design_refs(doc, "the design document")
+    as_needed: list[prompts.Ref] = []
+    if artifacts.requirements is not None and stage.name != "requirements":
+        first.append(
+            prompts.Ref(
+                folder / "requirements.json",
+                "the requirement inventory, already established. Its ids are "
+                "fixed: use them exactly, and do not add or renumber any. Its "
+                "`ambiguities` are already recorded",
+            )
+        )
+    as_needed.extend(
+        prompts.Ref(path, "another document already registered for this project")
+        for path in prompts.other_docs(context.get("design_docs", []), doc)
+    )
+    lines.extend(prompts.references(root, first=first, as_needed=as_needed))
+    lines.extend(prompts.design_note(doc))
     if stage.name == "requirements":
         lines.append(
             "Read the design document in full before writing anything. Read enough "
-            "of the repository to tell an obligation that is already discharged "
-            "from one that is not."
+            "of the repository to tell a capability that is already built from "
+            "one that is not."
         )
-    elif stage.name == "inventory":
-        lines.append(
-            "Read the repository. Run its own verification command. The design "
-            "document is here for context — you are surveying what exists, not "
-            "what it asks for."
-        )
+        cap = context.get("requirement_cap") or _document_cap(doc)
+        if cap and cap < MAX_REQUIREMENTS:
+            lines.append("")
+            lines.append(
+                f"This document is short enough that {cap} capabilities at most "
+                "is the right size. Group finer obligations into `details` "
+                "rather than exceed it."
+            )
     else:
         lines.append(
-            "Read the repository's existing tests and the design document. For "
-            "each obligation below, decide what would actually demonstrate it."
+            "Read the repository and run its test command. The design document "
+            "is here for context — you are summarising what exists, not what it "
+            "asks for."
         )
     lines.append("")
-
-    other_docs = [path for path in context.get("design_docs", []) if path != str(doc)]
-    if other_docs:
-        lines.append("Other documents already registered for this project:")
-        lines.extend(f"- {path}" for path in other_docs)
-        lines.append("")
 
     if (
         artifacts.requirements is None
@@ -756,52 +622,12 @@ def build_prompt(
         lines.append(stage.without_requirements)
         lines.append("")
 
-    if artifacts.requirements is not None and stage.name != "requirements":
-        lines.append(
-            "The requirement inventory, already established. These ids are fixed: "
-            "use them exactly, and do not add or renumber any."
-        )
-        lines.extend(_render_requirements(artifacts.requirements.requirements))
-        lines.append("")
-        if artifacts.requirements.ambiguities:
-            lines.append("Ambiguities already recorded in the document:")
-            for entry in artifacts.requirements.ambiguities:
-                question = str(entry.get("question", "")).strip()
-                assumed = str(entry.get("assumed", "")).strip()
-                lines.append(
-                    f"- {entry.get('id', 'AMB')}: {question}"
-                    + (f" (assumed: {assumed})" if assumed else " (unresolved)")
-                )
-            lines.append("")
-
-    if artifacts.inventory is not None and stage.name == "verification":
-        inventory = artifacts.inventory
-        lines.append("What the repository already is, from the inventory stage:")
-        for component in inventory.components:
-            paths = ", ".join(str(p) for p in component.get("paths", []))
-            tests = ", ".join(str(p) for p in component.get("test_locations", []))
-            lines.append(f"- {component.get('name')}: {paths or 'no paths given'}")
-            if tests:
-                lines.append(f"    tests: {tests}")
-        if inventory.baseline_commands:
-            lines.append(
-                f"  baseline commands: {', '.join(inventory.baseline_commands)} "
-                f"(currently: {inventory.baseline_status})"
-            )
-        if inventory.known_failures:
-            lines.append(
-                f"  already failing before any new work: "
-                f"{', '.join(inventory.known_failures)}"
-            )
-        lines.append("")
-
     if instructions:
         lines.append("Additional instructions from the operator (these win):")
         lines.append(instructions)
         lines.append("")
 
-    lines.append(f"Write your findings as JSON to this exact path:")
-    lines.append(f"  {artifact_path}")
+    lines.extend(prompts.output(root, "findings", artifact_path))
     lines.append("")
     lines.append("The file must contain JSON only — no prose, no code fence.")
     lines.append("")
@@ -820,6 +646,17 @@ def build_prompt(
     lines.append("")
     lines.append("Write no code and change no file other than that artifact.")
     return "\n".join(lines)
+
+
+def _document_cap(doc: DesignDocs) -> int | None:
+    """The cap for the design as a whole, so several short documents add up."""
+    try:
+        text = "\n\n".join(
+            path.read_text(encoding="utf-8") for path in doc_list(doc)
+        )
+    except OSError:
+        return None
+    return requirement_cap(text)
 
 
 # --------------------------------------------------------------------------
@@ -865,7 +702,7 @@ def run_stage(
     stage: Stage,
     *,
     root: Path,
-    doc: Path,
+    doc: DesignDocs,
     directory: Path,
     artifacts: Artifacts,
     agent: str,
@@ -984,9 +821,8 @@ def waves(chosen: Iterable[Stage]) -> list[list[Stage]]:
     """The chosen stages grouped into what may run at the same time.
 
     A stage joins the current wave if none of the stages in it produce something
-    it `needs`, and starts a new one otherwise. For the three analyses that means
-    requirements and inventory together, then verification — which needs both — on
-    its own. The grouping is derived from the declared dependencies rather than
+    it `needs`, and starts a new one otherwise. For the two analyses that means
+    both together. The grouping is derived from the declared dependencies rather than
     hardcoded, so a stage added later is placed by what it says it needs.
 
     Order is preserved, both between waves and within one, so a sequential run and
@@ -1038,7 +874,7 @@ def verify_coverage_ids(artifact: InventoryArtifact, *, known: Iterable[str]) ->
 def run_pipeline(
     *,
     root: Path,
-    doc: Path,
+    doc: DesignDocs,
     directory: Path,
     chosen: Iterable[Stage],
     agent: str,
@@ -1059,8 +895,7 @@ def run_pipeline(
 
     Sequential and fail-fast by default, unlike the critics. A critic that fails
     costs one perspective on a plan that still exists; a stage that fails leaves
-    the next stage with nothing to work from — verification cannot decide how to
-    prove a list of obligations it was never given. Stopping at the failure means
+    the next stage with nothing to work from. Stopping at the failure means
     the error names the stage that actually broke.
 
     With `parallel`, stages that need nothing from each other run at once (see
@@ -1166,8 +1001,6 @@ def reconcile(document: Any, artifacts: Artifacts) -> list[Finding]:
 
     - a requirement in the inventory and not in the plan was **dropped**
     - a requirement in the plan and not in the inventory was **invented**
-    - a requirement the verification stage could describe, whose covering tasks
-      cite none of it, has a **bar nobody worked out**
     - a requirement the inventory evidenced as already done, planned again, is
       **duplicated work**
 
@@ -1228,49 +1061,6 @@ def reconcile(document: Any, artifacts: Artifacts) -> list[Finding]:
         )
 
     covered = _covered_requirements(document)
-    if artifacts.verification is not None:
-        for req_id in sorted(artifacts.verification.covered & set(stated)):
-            tasks = covered.get(req_id, [])
-            if not tasks:
-                continue
-            methods = artifacts.verification.methods_for(req_id)
-            cited = [
-                token
-                for method in methods
-                for token in (
-                    str(method.get("command", "")).strip(),
-                    str(method.get("location", "")).strip(),
-                )
-                if token
-            ]
-            if not cited:
-                continue
-            text = " ".join(
-                criterion.lower()
-                for task in tasks
-                for criterion in task.acceptances
-            )
-            if _cites_verification(text, cited):
-                continue
-            findings.append(
-                Finding(
-                    severity="warning",
-                    category="unused-verification",
-                    where=", ".join(task.ref or task.title for task in tasks),
-                    requirement_ids=[req_id],
-                    source="stage:synthesis",
-                    message=(
-                        f"the verification stage worked out how to demonstrate "
-                        f"{req_id} ({_shorten(cited[0])}), and no task covering it "
-                        "states that as a bar"
-                    ),
-                    suggested_action=(
-                        "Use the verification that was already established, or say "
-                        "in the task's notes why a different bar is better."
-                    ),
-                )
-            )
-
     if artifacts.inventory is not None:
         satisfied = set(artifacts.inventory.satisfied())
         for req_id in sorted(satisfied):
@@ -1307,56 +1097,6 @@ def reconcile(document: Any, artifacts: Artifacts) -> list[Finding]:
                 )
             )
     return findings
-
-
-def _cites_verification(text: str, cited: Iterable[str]) -> bool:
-    """Whether a task's criteria reference the verification that was worked out.
-
-    A whole-string substring match was too literal to be useful. The verification
-    stage writes `python3 -m pytest -q tests/test_fts.py::test_bm25_lexical_search`
-    and the task states "`pytest tests/test_fts.py::test_bm25_lexical_search`
-    passes" — the same bar, reported as ignored, 32 times on one plan. What actually
-    identifies a method is its *target*: the test node id, or the file path. So the
-    runner prefix, its flags, and the interpreter are stripped and the target is what
-    is compared.
-    """
-    lowered = text.lower()
-    for token in cited:
-        candidate = token.lower().strip()
-        if not candidate:
-            continue
-        if candidate in lowered:
-            return True
-        for target in _verification_targets(candidate):
-            if target and target in lowered:
-                return True
-    return False
-
-
-#: a pytest node id, or a path with a test-ish extension, inside a longer command
-_TARGET_PATTERN = re.compile(
-    r"[\w./-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|kt|rb|sql|sh)(?:::[\w:\[\]-]+)?"
-)
-
-
-def _verification_targets(command: str) -> list[str]:
-    """The parts of a verification method that identify what it checks.
-
-    The node id if there is one, then the path, then the bare test name — each is
-    something a criterion could reasonably cite on its own. Flags and the runner
-    itself are not: every pytest command shares them, so matching on those would
-    pass any criterion that mentioned pytest at all.
-    """
-    targets: list[str] = []
-    for match in _TARGET_PATTERN.findall(command):
-        targets.append(match)
-        if "::" in match:
-            path, _, node = match.partition("::")
-            targets.append(path)
-            leaf = node.rsplit("::", 1)[-1]
-            if leaf:
-                targets.append(leaf)
-    return targets
 
 
 def _covered_requirements(document: Any) -> dict[str, list[Any]]:
@@ -1417,9 +1157,4 @@ def record(
             "status": artifacts.inventory.baseline_status,
             "known_failures": artifacts.inventory.known_failures,
         }
-    if artifacts.verification is not None:
-        pipeline["undemonstrable"] = [
-            str(entry.get("requirement_id", ""))
-            for entry in artifacts.verification.undemonstrable
-        ]
     return pipeline
