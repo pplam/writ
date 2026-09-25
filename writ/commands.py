@@ -224,9 +224,7 @@ def _plan(args, held: dict[str, Any]) -> int:
             label=f"{names} ({'staged' if staged else 'single-shot'})",
             steps=phases.declare(
                 stages=chosen_stages,
-                parallel_stages=bool(getattr(args, "parallel_stages", False)),
                 critics=declared_critics,
-                parallel_critics=bool(getattr(args, "parallel_critics", False)),
                 repair=bool(getattr(args, "repair", False)),
                 auto_approve=bool(getattr(args, "auto_approve", False)),
             ),
@@ -481,13 +479,12 @@ def _run_stages(
     # exists leaves a project littered with empty pipelines that never ran.
     agents.resolve(agent, list(getattr(args, "agent_args", []) or []), model)
     directory = state.plan_dir(root, plan_id)
-    parallel = bool(getattr(args, "parallel_stages", False))
-    grouped = analysis.waves(stages) if parallel else [[stage] for stage in stages]
+    grouped = analysis.waves(stages)
     print(
         f"analysing {planner.doc_names(doc)} in {len(stages)} stage(s) with {agent}..."
     )
     print(f"  artifacts: {directory}")
-    if parallel and any(len(wave) > 1 for wave in grouped):
+    if any(len(wave) > 1 for wave in grouped):
         print(
             "  at once: "
             + "; then ".join(", ".join(s.name for s in wave) for wave in grouped)
@@ -577,16 +574,16 @@ def _run_stages(
         context=context,
         refresh=bool(getattr(args, "refresh", False)),
         stream=not args.quiet,
-        parallel=parallel,
         on_start=announce,
         on_finish=finished,
         on_launch=record,
     )
     failed = [result for result in results if not result.ok]
     if failed:
-        names = ", ".join(result.stage for result in failed)
+        names = " and ".join(result.stage for result in failed)
+        noun = "stages" if len(failed) > 1 else "stage"
         print(
-            f"planning stopped: the {names} stage produced no usable artifact.\n"
+            f"planning stopped: the {names} {noun} produced no usable artifact.\n"
             f"  fix or re-run with: writ plan {_doc_args(doc)} --plan-id {plan_id}\n"
             "  (completed stages are reused; add --refresh to redo them)",
             file=sys.stderr,
@@ -1647,11 +1644,8 @@ def _run_critics(args, *, root, doc, chosen, plan_path, phase=None, verify=False
     found = plans.findings(data, open_only=True)
     revision = plans.revision(data)
     directory = planfiles.reviews_dir(root, data, revision)
-    parallel = bool(getattr(args, "parallel_critics", False))
-    step_id = _critic_steps(
-        root, phase, chosen, revision=revision, data=data, parallel=parallel
-    )
-    if parallel and not args.json:
+    step_id = _critic_steps(root, phase, chosen, revision=revision, data=data)
+    if len(chosen) > 1 and not args.json:
         grouped = critics.waves(chosen)
         print(
             "critics at once: "
@@ -1698,12 +1692,10 @@ def _run_critics(args, *, root, doc, chosen, plan_path, phase=None, verify=False
             print(f"  {report.critic} failed: {report.error}", file=sys.stderr)
             return
         counts = plancheck.tally(report.findings)
-        # Named when the critics overlap. Sequentially the header two lines up
-        # says whose counts these are; concurrently four headers are printed
-        # before any of them report, so a bare count belongs to nobody.
-        who = f"{report.critic}: " if parallel else ""
+        # Named because the critics overlap: every header is printed before any
+        # of them reports, so a bare count belongs to nobody.
         print(
-            f"  {who}{counts['error']} blocking, {counts['warning']} advisory"
+            f"  {report.critic}: {counts['error']} blocking, {counts['warning']} advisory"
             + (f", confidence {report.confidence}" if report.confidence else "")
         )
         if report.summary:
@@ -1721,7 +1713,6 @@ def _run_critics(args, *, root, doc, chosen, plan_path, phase=None, verify=False
         cwd=args.cwd,
         found=found,
         stream=not args.quiet,
-        parallel=parallel,
         on_start=announce,
         on_finish=report_back,
         on_launch=record,
@@ -1740,7 +1731,7 @@ def _run_critics(args, *, root, doc, chosen, plan_path, phase=None, verify=False
     return reports
 
 
-def _critic_steps(root, phase, chosen, *, revision: int, data, parallel: bool):
+def _critic_steps(root, phase, chosen, *, revision: int, data):
     """Decide what to call each critic's step, and register a re-review's.
 
     The critics can run more than once over one plan. `--repair` patches the plan
@@ -1774,7 +1765,7 @@ def _critic_steps(root, phase, chosen, *, revision: int, data, parallel: bool):
         return lambda name: f"critic:{name}"
 
     suffix = f"@r{revision}"
-    grouped = critics.waves(chosen) if parallel else [[critic] for critic in chosen]
+    grouped = critics.waves(chosen)
     declared = [
         phases.make_step(
             id=f"critic:{critic.name}{suffix}",

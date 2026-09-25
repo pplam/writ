@@ -886,20 +886,20 @@ def run_pipeline(
     context: dict[str, Any] | None = None,
     refresh: bool = False,
     stream: bool = False,
-    parallel: bool = False,
     on_start: Callable[[Stage, agents.ResolvedAgent], None] | None = None,
     on_finish: Callable[[Result], None] | None = None,
     on_launch: Callable[[Stage, agents.ResolvedAgent, Path], None] | None = None,
 ) -> tuple[Artifacts, list[Result]]:
-    """Run the analysis stages in order, stopping at the first that fails.
+    """Run the analysis stages wave by wave, stopping at the first that fails.
 
-    Sequential and fail-fast by default, unlike the critics. A critic that fails
+    Fail-fast, unlike the critics. A critic that fails
     costs one perspective on a plan that still exists; a stage that fails leaves
     the next stage with nothing to work from. Stopping at the failure means
     the error names the stage that actually broke.
 
-    With `parallel`, stages that need nothing from each other run at once (see
-    `waves`), and a wave that fails stops the pipeline as a single stage would.
+    Stages that need nothing from each other run at once (see `waves`), always:
+    it is not a setting, because the wall-clock is the planning phase's to spend
+    and nobody should have to know a flag to get it back. A wave that fails stops the pipeline as a single stage would.
     Only requirements and inventory qualify: the survey of the repository does not
     depend on what the document asks for. What it loses is the ability to say which
     stated obligation the existing code already discharges, because it has no ids
@@ -934,7 +934,7 @@ def run_pipeline(
             on_launch=on_launch,
         )
 
-    grouped = waves(chosen) if parallel else [[stage] for stage in chosen]
+    grouped = waves(chosen)
     lock = threading.Lock()
     for wave in grouped:
         if len(wave) == 1:

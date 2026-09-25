@@ -689,7 +689,6 @@ def review(
     cwd: str | None,
     found: Iterable[Finding] = (),
     stream: bool = False,
-    parallel: bool = False,
     on_start: Callable[[Critic, agents.ResolvedAgent], None] | None = None,
     on_finish: Callable[[Report], None] | None = None,
     on_launch: Callable[[Critic, agents.ResolvedAgent, Path], None] | None = None,
@@ -701,7 +700,7 @@ def review(
     `verify` maps a critic's name to what it should re-check; a critic not in it
     reviews in full.
 
-    Sequential by default. With `parallel`, both run at once (see `waves`).
+    All of them run at once (see `waves`).
     Streamed output is serialised a line at a time so the prefix naming each critic
     keeps meaning something.
 
@@ -709,34 +708,12 @@ def review(
     is worth more than nothing, and the failure is visible rather than silently
     reducing the review to whoever happened to succeed. Reports come back in the
     order the critics were given, whatever order they finished in, so a review
-    reads the same whether or not it ran concurrently.
+    reads the same whichever agent happened to finish first.
     """
     resolved = agents.resolve(agent, [], model, events=True)
     directory.mkdir(parents=True, exist_ok=True)
     chosen = list(chosen)
     known = write_known(directory / KNOWN_FINDINGS_FILENAME, found)
-    if not parallel:
-        return [
-            _review_one(
-                critic,
-                resolved=resolved,
-                root=root,
-                doc=doc,
-                plan=plan,
-                directory=directory,
-                timeout=timeout,
-                cwd=cwd,
-                known=known,
-                verify=(verify or {}).get(critic.name),
-                stream=stream,
-                on_start=on_start,
-                on_finish=on_finish,
-                on_launch=on_launch,
-                on_close=on_close,
-            )
-            for critic in chosen
-        ]
-
     # One lock for the whole review, not one per wave: it guards the terminal,
     # which is shared by everything that prints, including the callbacks that
     # announce a critic starting and finishing.

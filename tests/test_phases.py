@@ -62,16 +62,14 @@ def every_key_present(declared: list[dict]) -> bool:
 def test_waves_are_the_columns_the_pipeline_actually_runs():
     """The graph's columns come from the concurrency rules, not from a guess.
 
-    Sequentially each stage is its own wave; with `--parallel-stages` requirements
-    and inventory share one, because that is what `analysis.waves` says. A picture
-    that disagreed with those functions would show parallelism writ will not use.
+    Requirements and inventory share one, because that is what `analysis.waves`
+    says. A picture that disagreed with that function would show parallelism writ
+    will not use, or hide parallelism it does.
     """
     from writ import analysis
 
-    serial = phases.declare(stages=list(analysis.STAGES))
-    assert [e["wave"] for e in serial if e["kind"] == "stage"] == [0, 1]
-
-    together = phases.declare(stages=list(analysis.STAGES), parallel_stages=True)
+    together = phases.declare(stages=list(analysis.STAGES))
+    assert [len(w) for w in analysis.waves(analysis.STAGES)] == [2]
     by_wave = {e["id"]: e["wave"] for e in together if e["kind"] == "stage"}
     assert by_wave["stage:requirements"] == by_wave["stage:inventory"]
 
@@ -85,7 +83,7 @@ def test_the_critics_are_declared_as_one_column():
     from writ import critics
 
     declared = phases.declare(
-        stages=(), synthesis=False, critics=critics.CRITICS, parallel_critics=True
+        stages=(), synthesis=False, critics=critics.CRITICS
     )
     waves: dict[int, list[str]] = {}
     for entry in declared:
@@ -211,17 +209,17 @@ _out.write_text(_json.dumps(_prev + [{{'phase': _phase['status'], 'live': _live}
     observed = json.loads(seen.read_text())
     assert observed, "the agent never read the record"
     assert all(entry["phase"] == "running" for entry in observed)
-    # Each agent saw exactly its own step running: the requirements stage saw
-    # `stage:requirements` and nothing else.
-    assert observed[0]["live"] == ["stage:requirements"]
-    assert [entry["live"] for entry in observed] == [
-        ["stage:requirements"],
-        ["stage:inventory"],
-        ["synthesis"],
-    ]
+    # Each agent saw its own step running, and nothing outside its wave: the two
+    # analyses run together, so either may see the other, but synthesis runs
+    # alone once both have finished.
+    analyses = {"stage:requirements", "stage:inventory"}
+    stages, last = observed[:-1], observed[-1]
+    assert len(stages) == 2
+    assert all(entry["live"] and set(entry["live"]) <= analyses for entry in stages)
+    assert last["live"] == ["synthesis"]
 
 
-def test_parallel_stages_are_both_recorded_running(writ, design, project):
+def test_the_stages_are_both_recorded_running(writ, design, project):
     """Two stages at once, and the record says so while it is true.
 
     The reason the recording hooks are outside `mirror_lock`: a state write there
@@ -242,7 +240,7 @@ _prev = _json.loads(_out.read_text()) if _out.exists() else []
 _out.write_text(_json.dumps(_prev + [_live]))
 """
     code, out, err = writ(
-        "plan", str(design), "--agent", agent(script), "--parallel-stages", "--quiet"
+        "plan", str(design), "--agent", agent(script), "--quiet"
     )
     assert code == 0, err
     observed = json.loads(seen.read_text())
@@ -413,7 +411,7 @@ def test_an_edge_joins_a_step_to_what_it_waited_for(writ, design, project):
     writ("plan", str(design), *staged())
     payload = api.phase(state.load(project))
     pairs = {(edge["from"], edge["to"]) for edge in payload["edges"]}
-    assert ("stage:requirements", "stage:inventory") in pairs
+    assert ("stage:requirements", "synthesis") in pairs
     assert ("stage:inventory", "synthesis") in pairs
     assert all(edge["satisfied"] for edge in payload["edges"])
 

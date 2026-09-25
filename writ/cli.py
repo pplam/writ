@@ -233,12 +233,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--parallel-stages",
         action="store_true",
-        default=None,
-        help=(
-            "run the analysis stages that need nothing from each other at once "
-            "(requirements beside inventory). Costs the inventory its coverage "
-            "claims, which need the requirement ids it will not have yet"
-        ),
+        help=argparse.SUPPRESS,  # now always so; kept so old invocations still work
     )
     p.add_argument(
         "--stage-agent",
@@ -278,12 +273,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--parallel-critics",
         action="store_true",
-        default=None,
-        help=(
-            "run all the critics at once rather than one after another: two agent "
-            "runs' wall-clock for one. Only one of them runs the test suite, and "
-            "the rest are told to leave it alone"
-        ),
+        help=argparse.SUPPRESS,  # now always so; kept so old invocations still work
     )
     p.add_argument(
         "--critic-agent",
@@ -559,12 +549,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--parallel-critics",
         action="store_true",
-        default=None,
-        help=(
-            "run all the critics at once rather than one after another: two agent "
-            "runs' wall-clock for one. Only one of them runs the test suite, and "
-            "the rest are told to leave it alone"
-        ),
+        help=argparse.SUPPRESS,  # now always so; kept so old invocations still work
     )
     p.add_argument(
         "--quiet",

@@ -23,7 +23,7 @@ import { FINDING_FILTERS, renderPlan } from './views/plan.js';
 import { renderRunDetail, renderRunList, RUN_FILTERS } from './views/runs.js';
 import { FILTERS, renderTaskDetail, renderTaskList } from './views/tasks.js';
 
-type ViewName = 'overview' | 'plan' | 'graph' | 'tasks' | 'milestones' | 'runs' | 'decisions';
+type ViewName = 'overview' | 'plan' | 'tasks' | 'milestones' | 'runs' | 'decisions';
 
 /**
  * Whether a click that landed outside the drawer should dismiss it.
@@ -70,7 +70,6 @@ export function dismissesOnFocus(context: {
 const VIEWS: { name: ViewName; label: string }[] = [
   { name: 'overview', label: 'Overview' },
   { name: 'plan', label: 'Plan' },
-  { name: 'graph', label: 'Graph' },
   { name: 'tasks', label: 'Tasks' },
   { name: 'milestones', label: 'Milestones' },
   { name: 'runs', label: 'Runs' },
@@ -365,22 +364,14 @@ class App {
         this.body.replaceChildren(holder);
         break;
       }
-      case 'graph': {
-        const holder = el('div', { class: 'graph-holder', 'data-scroll-key': 'graph' });
-        renderGraph(holder, snapshot.graph, this.route.task ?? null, {
+      case 'tasks': {
+        // The graph above the list, on one page: the graph answers what can run
+        // and what waits on what, the list answers everything else about the same
+        // tasks, and one selection opens the same drawer from either.
+        const graph = el('div', { class: 'graph-holder', 'data-scroll-key': 'graph' });
+        renderGraph(graph, snapshot.graph, this.route.task ?? null, {
           onSelect: handlers.onSelect,
         });
-        this.body.replaceChildren(
-          this.toolbar(
-            el('span', { class: 'muted small' },
-              `${plural(snapshot.graph.nodes.length, 'task')} · ${snapshot.graph.levels} levels deep · a column can run at once`),
-          ),
-          holder,
-        );
-        fitTitles(holder);
-        break;
-      }
-      case 'tasks': {
         const list = el('div', { class: 'list-holder' });
         renderTaskList(list, snapshot.tasks, {
           filter: this.taskFilter,
@@ -388,6 +379,11 @@ class App {
           selected: this.route.task ?? null,
         }, { onSelect: handlers.onSelect, onRun: handlers.onRun });
         this.body.replaceChildren(
+          el('section', { class: 'task-graph', 'aria-label': 'dependency graph' },
+            el('div', { class: 'muted small graph-caption' },
+              `${plural(snapshot.graph.nodes.length, 'task')} · ${snapshot.graph.levels} levels deep · a column can run at once`),
+            graph,
+          ),
           this.toolbar(
             this.filterBar(Object.keys(FILTERS), this.taskFilter, (name) => {
               this.taskFilter = name;
@@ -397,6 +393,7 @@ class App {
           ),
           list,
         );
+        fitTitles(graph);
         break;
       }
       case 'milestones': {
@@ -696,7 +693,10 @@ function parseHash(hash: string): Route {
   const clean = hash.replace(/^#\/?/, '');
   if (!clean) return { view: 'overview' };
   const [view, kind, id] = clean.split('/');
-  const known = VIEWS.some((v) => v.name === view) ? (view as ViewName) : 'overview';
+  // `graph` was its own page before it moved above the task list; old links
+  // still land on the graph.
+  const named = view === 'graph' ? 'tasks' : view;
+  const known = VIEWS.some((v) => v.name === named) ? (named as ViewName) : 'overview';
   if (kind === 'task' && id) return { view: known, task: decodeURIComponent(id) };
   if (kind === 'run' && id) return { view: known, run: decodeURIComponent(id) };
   if (kind === 'step' && id) return { view: known, step: decodeURIComponent(id) };

@@ -413,7 +413,7 @@ def test_a_wave_is_not_invented_for_critics_that_were_not_chosen():
 
 def test_parallel_critics_all_report(planned_with_requirements, project, writ):
     """Concurrency must not reduce the review to whoever finished first."""
-    code, out, _ = writ("critique", "--agent", agent(SILENT), "--quiet", "--parallel-critics")
+    code, out, _ = writ("critique", "--agent", agent(SILENT), "--quiet")
     assert code == 0
     names = [record["critic"] for record in critics.reviews(state.load(project))]
     assert names == [critic.name for critic in critics.CRITICS]
@@ -423,29 +423,33 @@ def test_parallel_critics_all_report(planned_with_requirements, project, writ):
 def test_a_parallel_critic_report_names_whose_it_is(
     planned_with_requirements, project, writ
 ):
-    """Both headers print before either reports, so a bare count has no owner.
+    """Every header prints before any reports, so a bare count has no owner.
 
-    Run one at a time, the counts follow the header that named the critic. Run at
-    once they do not, and an unattributed `0 blocking, 0 advisory` is unreadable.
+    Run at once, the counts do not follow the header that named the critic, and
+    an unattributed `0 blocking, 0 advisory` is unreadable.
     """
-    _, parallel, _ = writ(
+    _, out, _ = writ("critique", "--agent", agent(SILENT), "--quiet")
+    for critic in critics.CRITICS:
+        assert f"{critic.name}: 0 blocking" in out
+
+
+def test_the_old_parallel_flags_still_parse(planned_with_requirements, writ):
+    """Concurrency is no longer a choice, but scripts that asked for it still run."""
+    code, _, _ = writ(
         "critique", "--agent", agent(SILENT), "--quiet", "--parallel-critics"
     )
-    assert "fidelity: 0 blocking" in parallel
-    _, sequential, _ = writ("critique", "--agent", agent(SILENT), "--quiet")
-    assert "fidelity: 0 blocking" not in sequential
-    assert "0 blocking" in sequential
+    assert code == 0
 
 
 def test_parallel_critics_report_in_the_order_they_were_asked_for(
     planned_with_requirements, project, writ
 ):
-    """A review reads the same whether or not it ran concurrently.
+    """Two identical reviews are recorded in the same order.
 
     Which agent finishes first is a timing accident, and a record that ordered
     itself by that would make two identical reviews look different.
     """
-    writ("critique", "--agent", agent(SILENT), "--quiet", "--parallel-critics")
+    writ("critique", "--agent", agent(SILENT), "--quiet")
     parallel = [record["critic"] for record in critics.reviews(state.load(project))]
     with state.transaction(project) as data:
         data["reviews"] = []
@@ -458,7 +462,7 @@ def test_parallel_critics_report_in_the_order_they_were_asked_for(
 def test_one_parallel_critic_failing_does_not_lose_the_others(
     planned_with_requirements, project, writ
 ):
-    code, out, err = writ("critique", "--agent", agent(MUTE), "--quiet", "--parallel-critics")
+    code, out, err = writ("critique", "--agent", agent(MUTE), "--quiet")
     assert code == 1
     records = critics.reviews(state.load(project))
     assert len(records) == len(critics.CRITICS)
@@ -472,7 +476,7 @@ def test_parallel_critics_findings_reach_the_same_ledger(
         "WRIT_TEST_REPORT", json.dumps({"findings": [BLOCKING_FINDING]})
     )
     monkeypatch.setenv("WRIT_TEST_CRITIC", "builds what the design")
-    code, _, _ = writ("critique", "--agent", agent(CRITIC), "--quiet", "--parallel-critics")
+    code, _, _ = writ("critique", "--agent", agent(CRITIC), "--quiet")
     assert code == 1
     records = [
         record

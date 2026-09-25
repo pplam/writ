@@ -371,7 +371,7 @@ def test_a_render_is_what_keeps_the_scroll_position():
           const zero = () => { pane.scrollLeft = 0; pane.scrollTop = 0; };
           Object.assign(app, {
             store: { current: { graph: {}, overview: { counts: {} } } },
-            route: { view: 'graph' },
+            route: { view: 'tasks' },
             nav: { querySelectorAll: () => [] },
             body: { querySelectorAll: () => [pane] },
             paintCounts: zero, paintView: zero, paintDrawer: zero,

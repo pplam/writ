@@ -1,4 +1,4 @@
-/* built from ui/src (c4b5e6adf002) */
+/* built from ui/src (434712eb28d0) */
 /*
  * One stylesheet, no framework.
  *
@@ -550,6 +550,10 @@ code, .mono, pre { font-family: var(--mono); }
 /* ------------------------------------------------------------- graph */
 
 .graph-holder { overflow: auto; padding-bottom: 8px; }
+
+/* The graph sits above the task list on the Tasks page, set off from it. */
+.task-graph { margin-bottom: 18px; padding-bottom: 14px; border-bottom: 1px solid var(--line); }
+.graph-caption { margin-bottom: 10px; }
 
 .dag { display: block; }
 .edge { fill: none; stroke: var(--edge); stroke-width: 1.5; }

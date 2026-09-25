@@ -114,10 +114,8 @@ def step(phase: dict[str, Any], step_id: str) -> dict[str, Any] | None:
 def declare(
     *,
     stages: Iterable[Any] = (),
-    parallel_stages: bool = False,
     synthesis: bool = True,
     critics: Sequence[Any] = (),
-    parallel_critics: bool = False,
     repair: bool = False,
     auto_approve: bool = False,
 ) -> list[dict[str, Any]]:
@@ -136,10 +134,7 @@ def declare(
 
     stages = list(stages)
     if stages:
-        grouped = (
-            analysis.waves(stages) if parallel_stages else [[s] for s in stages]
-        )
-        for group in grouped:
+        for group in analysis.waves(stages):
             landed = []
             for stage in group:
                 landed.append(
@@ -190,10 +185,7 @@ def declare(
 
     chosen = list(critics)
     if chosen:
-        grouped = (
-            critic_module.waves(chosen) if parallel_critics else [[c] for c in chosen]
-        )
-        for group in grouped:
+        for group in critic_module.waves(chosen):
             landed = []
             for critic in group:
                 landed.append(
