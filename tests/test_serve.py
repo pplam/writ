@@ -97,7 +97,7 @@ def test_the_snapshot_carries_every_view(served):
     assert headers["Content-Type"] == "application/json"
     payload = json.loads(body)
     for view in (
-        "overview", "tasks", "runs", "milestones", "graph", "decisions", "phase"
+        "overview", "tasks", "runs", "graph", "decisions", "phase"
     ):
         assert view in payload, view
 

@@ -1,4 +1,4 @@
-/* built from ui/src (434712eb28d0) */
+/* built from ui/src (b6d06649a777) */
 /*
  * One stylesheet, no framework.
  *
@@ -77,7 +77,8 @@ html, body { height: 100%; }
 body {
   margin: 0;
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
+  overflow: hidden;
   background: var(--bg);
   color: var(--ink);
   font: 14px/1.55 var(--sans);
@@ -86,51 +87,97 @@ body {
 
 code, .mono, pre { font-family: var(--mono); }
 
-/* ------------------------------------------------------------- header */
+/* ------------------------------------------------------------- shell */
 
-.top {
+/*
+ * A fixed sidebar and a scrolling page. The sidebar holds what is true of the
+ * whole project — where it stands, what is waiting — so it is readable from every
+ * page, and the page itself only has to say what it is about.
+ */
+.side {
+  flex: 0 0 220px;
   display: flex;
-  align-items: center;
-  gap: 20px;
-  padding: 0 18px;
-  height: 52px;
-  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 18px;
+  padding: 16px 12px 14px;
   background: var(--panel);
-  border-bottom: 1px solid var(--line);
-  position: sticky;
-  top: 0;
-  z-index: 20;
+  border-right: 1px solid var(--line);
+  overflow-y: auto;
 }
+
+.brand { display: flex; align-items: baseline; gap: 7px; padding: 0 8px; }
 
 .wordmark {
-  font-weight: 650;
-  letter-spacing: -0.01em;
-  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  font-size: 17px;
 }
 
-.tabs { display: flex; gap: 2px; }
+.brand-note { color: var(--faint); font-size: 12px; }
 
-.tab {
+.side-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px;
+  background: var(--sunken);
+  border-radius: var(--radius);
+}
+
+.side-progress-line { display: flex; justify-content: space-between; font-size: 12px; color: var(--dim); }
+.side-progress-line b { color: var(--ink); font-weight: 600; }
+.side-progress .meter.thin { height: 4px; margin: 5px 0 0; }
+
+.side-counts { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
+.side-counts:empty { display: none; }
+.side-count { display: flex; align-items: baseline; gap: 7px; font-size: 12.5px; color: var(--dim); }
+.side-count b { min-width: 2ch; text-align: right; font-weight: 650; }
+.side-count.live b { color: var(--i-running); }
+.side-count.warn b { color: var(--i-review); }
+.side-count.bad b { color: var(--i-failed); }
+
+.nav { display: flex; flex-direction: column; gap: 1px; }
+
+.nav-item {
   appearance: none;
   border: 0;
   background: transparent;
   color: var(--dim);
   font: inherit;
-  font-size: 13px;
-  padding: 6px 11px;
-  border-radius: 6px;
-  cursor: pointer;
-}
-
-.tab:hover { background: var(--sunken); color: var(--ink); }
-.tab.active { background: var(--sunken); color: var(--ink); font-weight: 550; }
-
-.header-counts {
-  margin-left: auto;
+  font-size: 13.5px;
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 10px;
+  padding: 7px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+  text-align: left;
 }
+
+.nav-item:hover { background: var(--sunken); color: var(--ink); }
+.nav-item.active { background: var(--sunken); color: var(--ink); font-weight: 600; }
+.nav-item.active .nav-icon { color: var(--accent); }
+.nav-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.nav-icon { width: 16px; text-align: center; font-size: 13px; color: var(--faint); }
+.nav-label { flex: 1 1 auto; }
+
+.nav-badge {
+  min-width: 20px;
+  padding: 0 6px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 18px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  background: var(--s-planned);
+  color: var(--dim);
+}
+
+.nav-badge.hidden { display: none; }
+.nav-badge.live { background: var(--s-running); color: var(--i-running); }
+.nav-badge.warn { background: var(--s-review); color: var(--i-review); }
+.nav-badge.bad { background: var(--s-failed); color: var(--i-failed); }
 
 .count {
   display: inline-flex;
@@ -145,20 +192,11 @@ code, .mono, pre { font-family: var(--mono); }
 .count.bad b { color: var(--i-failed); }
 .count.live b { color: var(--i-running); }
 
-.as-button {
-  appearance: none;
-  border: 0;
-  background: transparent;
-  font: inherit;
-  cursor: pointer;
-  padding: 0;
-}
-.as-button:hover .label { color: var(--ink); text-decoration: underline; }
-
 .conn {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  padding: 0 8px;
   font-size: 12px;
   color: var(--dim);
 }
@@ -179,19 +217,41 @@ code, .mono, pre { font-family: var(--mono); }
 /* ------------------------------------------------------------- layout */
 
 /*
- * A max width, because these are lists of short rows: at 2000px a task title
- * sits alone at the left with an id and a pill a metre away at the right, and
- * the eye cannot connect them.
+ * A max width, because these are rows of short fields: at 2000px a task title
+ * sits alone at the left with its status a metre away at the right, and the eye
+ * cannot connect them.
  */
-.body { flex: 1 1 auto; overflow: auto; padding: 18px; }
-.body > * { max-width: 1500px; margin-inline: auto; }
+.body { flex: 1 1 auto; min-width: 0; overflow: auto; padding: 22px 28px 40px; }
+.body > * { max-width: 1400px; margin-inline: auto; }
+.body > * + * { margin-top: 16px; }
+
+.page-head {
+  display: flex;
+  align-items: flex-end;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding-bottom: 4px;
+}
+
+.page-title { flex: 1 1 auto; min-width: 0; }
+.page-title h1 { margin: 0; font-size: 21px; font-weight: 700; letter-spacing: -0.02em; line-height: 1.25; }
+.page-title p { margin: 3px 0 0; font-size: 13px; }
+.page-aside { display: flex; align-items: center; gap: 10px; }
 
 .toolbar {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 12px;
   flex-wrap: wrap;
-  margin-bottom: 14px;
+}
+
+.card.flush > .toolbar { padding: 10px 12px; border-bottom: 1px solid var(--line); }
+.toolbar .search { margin-left: auto; }
+
+.toolbar-label {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--ink);
 }
 
 .filters { display: flex; gap: 2px; background: var(--sunken); padding: 2px; border-radius: 7px; }
@@ -208,7 +268,19 @@ code, .mono, pre { font-family: var(--mono); }
   cursor: pointer;
 }
 
-.filter.active { background: var(--panel); color: var(--ink); box-shadow: 0 1px 2px rgb(0 0 0 / 0.06); }
+.filter:hover { color: var(--ink); }
+.filter.active { background: var(--panel); color: var(--ink); font-weight: 600; box-shadow: 0 1px 2px rgb(0 0 0 / 0.08); }
+.filter:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
+.filter.none { color: var(--faint); }
+
+.filter-count {
+  margin-left: 6px;
+  font-size: 11px;
+  color: var(--faint);
+  font-weight: 500;
+}
+
+.filter.active .filter-count { color: var(--dim); }
 
 .search {
   appearance: none;
@@ -219,7 +291,7 @@ code, .mono, pre { font-family: var(--mono); }
   font-size: 13px;
   padding: 5px 10px;
   border-radius: 6px;
-  min-width: 220px;
+  min-width: 240px;
 }
 
 .search:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
@@ -257,13 +329,60 @@ code, .mono, pre { font-family: var(--mono); }
  */
 .overview { display: block; }
 
-.ov-band {
+.kpis {
   display: grid;
-  grid-template-columns: minmax(280px, 1.1fr) minmax(300px, 1.3fr) minmax(240px, 1fr);
-  gap: 14px;
-  align-items: start;
-  margin-bottom: 14px;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
 }
+
+.kpi {
+  appearance: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding: 12px 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+}
+
+.kpi:hover { border-color: var(--edge); }
+.kpi:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.kpi-label { font-size: 12px; font-weight: 550; color: var(--dim); }
+.kpi-value { font-size: 24px; font-weight: 680; letter-spacing: -0.02em; line-height: 1.2; font-variant-numeric: tabular-nums; }
+.kpi-note { font-size: 12px; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kpi-meter { display: flex; flex-direction: column; gap: 5px; }
+.kpi-meter .meter.thin { margin: 3px 0 0; height: 4px; }
+.kpi.live { box-shadow: inset 3px 0 0 var(--i-running); }
+.kpi.live .kpi-value { color: var(--i-running); }
+.kpi.warn { box-shadow: inset 3px 0 0 var(--i-review); }
+.kpi.warn .kpi-value { color: var(--i-review); }
+.kpi.bad { box-shadow: inset 3px 0 0 var(--i-failed); }
+.kpi.bad .kpi-value { color: var(--i-failed); }
+
+.stack-bar {
+  display: flex;
+  height: 8px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--sunken);
+  margin-bottom: 12px;
+}
+
+.stack-seg { height: 100%; background: var(--edge); }
+.stack-seg + .stack-seg { border-left: 1.5px solid var(--panel); }
+.stack-seg.completed { background: var(--i-completed); }
+.stack-seg.running, .stack-seg.reviewing { background: var(--i-running); }
+.stack-seg.awaiting-review { background: var(--i-review); }
+.stack-seg.failed, .stack-seg.blocked { background: var(--i-failed); }
+.stack-seg.ready { background: var(--faint); }
 
 .ov-split {
   display: grid;
@@ -275,13 +394,16 @@ code, .mono, pre { font-family: var(--mono); }
 .ov-column { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
 .ov-activity { min-width: 0; }
 
+@media (max-width: 1280px) {
+  .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
 @media (max-width: 1100px) {
-  .ov-band { grid-template-columns: 1fr 1fr; }
   .ov-split { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 720px) {
-  .ov-band { grid-template-columns: 1fr; }
+  .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 .card {
@@ -289,26 +411,38 @@ code, .mono, pre { font-family: var(--mono); }
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 14px 16px;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.03);
 }
+
+/* A card whose table runs edge to edge: the toolbar and rows carry the padding. */
+.card.flush { padding: 0; overflow: hidden; }
 
 .card.urgent { border-color: var(--i-review); }
 
+/*
+ * A card title is the same tier as a drawer section title — dark, sentence
+ * case, 13px — so the page has one voice for "this is a region" rather than a
+ * grey uppercase one on the page and a dark one in the drawer.
+ */
 .card h2 {
   display: flex;
   align-items: center;
   gap: 7px;
-  margin: 0 0 10px;
-  font-size: 12px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--dim);
+  margin: 0 0 12px;
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: -0.005em;
+  color: var(--ink);
 }
+
+.card-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.card-head h2 { margin: 0; }
 
 .h2-count {
   font-variant-numeric: tabular-nums;
   letter-spacing: 0;
-  color: var(--ink);
+  font-weight: 600;
+  color: var(--dim);
   background: var(--sunken);
   border-radius: 20px;
   padding: 0 6px;
@@ -326,7 +460,7 @@ code, .mono, pre { font-family: var(--mono); }
 .clip { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tnum { font-variant-numeric: tabular-nums; }
 
-.empty { color: var(--dim); padding: 36px 4px; text-align: center; }
+.empty { color: var(--dim); padding: 40px 16px; text-align: center; }
 .muted { color: var(--dim); }
 .small { font-size: 12.5px; }
 .grow { flex: 1 1 auto; }
@@ -335,9 +469,6 @@ code, .mono, pre { font-family: var(--mono); }
 .prose { margin: 4px 0; white-space: pre-wrap; }
 
 /* ------------------------------------------------------------- progress */
-
-.headline { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }
-.big { font-size: 30px; font-weight: 620; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
 
 .meter {
   height: 6px;
@@ -373,20 +504,6 @@ code, .mono, pre { font-family: var(--mono); }
 .chip.failed, .chip.blocked { background: var(--s-failed); }
 .chip.awaiting-review { background: var(--s-review); }
 
-/*
- * A grid, not a wrapping flex row: five stats of different value widths wrapped
- * into a ragged two-and-a-half-line block that read as unrelated numbers.
- */
-.stats {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(84px, 1fr));
-  gap: 12px 14px;
-}
-
-.stat { display: flex; flex-direction: column; min-width: 0; }
-.stat-value { font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.15; }
-.stat-label { font-size: 11.5px; color: var(--dim); white-space: nowrap; }
-.stat-hint { font-size: 11px; color: var(--faint); }
 
 /* What is waiting on a human, as stacked buttons rather than a sentence. */
 .needs { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; }
@@ -411,54 +528,159 @@ code, .mono, pre { font-family: var(--mono); }
 .need.bad { border-left: 2.5px solid var(--i-failed); }
 .need.calm { border-left: 2.5px solid var(--edge); color: var(--dim); }
 
-/* ------------------------------------------------------------- lists */
+/* ------------------------------------------------------------- tables */
 
-.task-list, .run-list, .milestone-list, .activity, .history, .criteria {
+/*
+ * One table style for tasks, runs and decisions. Columns that hold the same kind
+ * of thing — an id, a status, a duration, a time — have the same width and
+ * alignment on every page, so moving between pages does not mean re-learning
+ * where to look.
+ */
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 13px;
+}
+
+.data-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 8px 10px;
+  background: var(--sunken);
+  border-bottom: 1px solid var(--line);
+  color: var(--dim);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.data-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: middle;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.data-table tbody tr:last-child td { border-bottom: 0; }
+.data-table tbody tr { cursor: pointer; transition: background 0.1s ease; }
+.data-table tbody tr:hover { background: var(--sunken); }
+.data-table tbody tr.selected { background: var(--sunken); box-shadow: inset 3px 0 0 var(--accent); }
+.data-table tbody tr:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.col-mark { width: 34px; text-align: center; padding-right: 0 !important; }
+.col-id { width: 118px; }
+.col-status { width: 132px; }
+.col-role { width: 96px; }
+.col-criteria { width: 128px; }
+.col-num { width: 92px; text-align: right; }
+.col-when { width: 112px; color: var(--faint); font-size: 12.5px; }
+.col-model { width: 170px; }
+.col-by { width: 150px; }
+.col-title { width: auto; }
+.data-table th.col-num { text-align: right; }
+
+.data-table td.col-mark .spinner { display: inline-block; vertical-align: middle; }
+.data-table code { font-size: 12px; }
+
+.cell-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.cell-title > .clip { flex: 0 1 auto; }
+.cell-title > .muted { font-size: 12.5px; }
+
+.tag {
+  flex: 0 0 auto;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 11px;
+  line-height: 17px;
+  color: var(--dim);
+  background: var(--panel);
+}
+
+.tag.warn { border-color: var(--i-review); color: var(--i-review); }
+
+.mini-meter { display: flex; align-items: center; gap: 8px; }
+.mini-meter .meter.thin { flex: 0 0 56px; height: 4px; margin: 0; }
+.mini-meter .tnum { font-size: 12px; color: var(--dim); }
+
+.task-row.completed .mark { color: var(--i-completed); }
+.task-row.failed .mark, .task-row.blocked .mark { color: var(--i-failed); }
+.run-row.failed .mark { color: var(--i-failed); }
+.run-row.completed .mark { color: var(--i-completed); }
+.task-row.cancelled td, .decision-row.superseded td, .decision-row.rejected td { color: var(--dim); }
+
+/* A proposal is the one row on the register that waits on a person. */
+.decision-row.proposed { box-shadow: inset 3px 0 0 var(--i-review); }
+.decision-row.proposed.selected { box-shadow: inset 3px 0 0 var(--accent); }
+
+/* A live duration, advanced in place every second. */
+.clock { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.clock.ticking { color: var(--i-running); font-weight: 600; }
+
+/*
+ * What kind of run it was. The one field that says whether a row is a dispatch
+ * or a review, so it is a badge with its own colour rather than a word.
+ */
+.role {
+  display: inline-block;
+  flex: 0 0 auto;
+  min-width: 62px;
+  padding: 0 7px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+  background: var(--s-planned);
+  color: var(--dim);
+  white-space: nowrap;
+}
+
+.role.agent { background: var(--s-running); color: var(--i-running); }
+.role.reviewer { background: var(--s-review); color: var(--i-review); }
+.role.gate { background: var(--s-completed); color: var(--i-completed); }
+.role.repair { background: var(--s-failed); color: var(--i-failed); }
+
+/* `.repair` is also a plan-page record; a badge must not inherit its card shape. */
+.role.repair { border: 0; margin: 0; padding: 0 7px; }
+
+.activity, .history, .criteria, .run-list, .timeline {
   list-style: none;
   margin: 0;
   padding: 0;
 }
 
-.task-row, .run-row, .milestone, .event {
+/* The overview's list of agents working now. */
+.run-list .run-row {
   display: flex;
   align-items: center;
   gap: 9px;
-  padding: 7px 9px;
+  padding: 7px 8px;
   border-radius: 6px;
-  border: 1px solid transparent;
+  cursor: pointer;
 }
 
-.task-list > li + li, .run-list > li + li { margin-top: 2px; }
-
-.task-row, .run-row {
-  background: var(--panel);
-  border-color: var(--line);
-}
-
-.clickable, .task-row[role="button"], .run-row[role="button"] { cursor: pointer; }
-.task-row:hover, .run-row:hover, .event.clickable:hover { border-color: var(--edge); }
-.task-row.selected, .run-row.selected { border-color: var(--accent); }
-.task-row:focus-visible, .run-row:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-
-.task-row .title, .milestone .title { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-list .run-row + .run-row { border-top: 1px solid var(--line); border-radius: 0; }
+.run-list .run-row:hover { background: var(--sunken); }
+.run-list .run-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
+.run-list .clip { max-width: 40%; }
 
 .mark { font-family: var(--mono); color: var(--dim); width: 1ch; text-align: center; }
-.task-row.completed .mark, .event.run-finished .mark { color: var(--i-completed); }
-.task-row.failed .mark, .task-row.blocked .mark { color: var(--i-failed); }
-.task-row.live .mark, .run-row.live .mark { color: var(--i-running); }
-
-.verb {
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--dim);
-  width: 8ch;
-}
-
-.verb.reviewer { color: var(--i-review); }
+.event.run-finished .mark { color: var(--i-completed); }
+.event.failed .mark, .mark.failed { color: var(--i-failed); }
+.mark.completed { color: var(--i-completed); }
 
 .pill {
+  display: inline-block;
   font-size: 11.5px;
-  padding: 1.5px 7px;
+  font-weight: 550;
+  line-height: 18px;
+  padding: 0 8px;
   border-radius: 20px;
   background: var(--sunken);
   color: var(--dim);
@@ -468,12 +690,14 @@ code, .mono, pre { font-family: var(--mono); }
 .pill.completed, .pill.passed, .pill.accept { background: var(--s-completed); color: var(--i-completed); }
 .pill.failed, .pill.reject, .pill.blocked { background: var(--s-failed); color: var(--i-failed); }
 .pill.running, .pill.reviewing, .pill.starting { background: var(--s-running); color: var(--i-running); }
-.pill.proposed { background: var(--s-review); color: var(--i-review); }
-.pill.ready { border: 1px solid var(--edge); }
+.pill.proposed, .pill.awaiting-review { background: var(--s-review); color: var(--i-review); }
+.pill.active { background: var(--s-completed); color: var(--i-completed); }
+.pill.superseded, .pill.rejected, .pill.cancelled { background: var(--s-cancelled); color: var(--dim); }
+.pill.ready { box-shadow: inset 0 0 0 1px var(--edge); background: var(--panel); color: var(--ink); }
 
 .spinner {
-  width: 9px;
-  height: 9px;
+  width: 10px;
+  height: 10px;
   border-radius: 50%;
   border: 1.5px solid var(--i-running);
   border-top-color: transparent;
@@ -484,25 +708,36 @@ code, .mono, pre { font-family: var(--mono); }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /*
- * A milestone summary row is a grid, not flex-wrap. The pieces have very
- * different widths and wrapping put the meter on its own line under a short
- * title but not a long one, so no two rows agreed on where anything was.
+ * A task's runs, oldest first, in its drawer. A rail down the left joins them,
+ * because the order is the story: dispatch, review, rework, review.
  */
-.milestone {
-  display: grid;
-  grid-template-columns: 1ch auto minmax(0, 1fr) 72px 3.5em;
-  align-items: center;
-  gap: 9px;
-  padding: 6px 6px;
+.timeline { position: relative; }
+
+.timeline-row {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 7px 8px;
   border-radius: 6px;
-  border: 1px solid transparent;
+  cursor: pointer;
 }
 
-.milestone-list > li + li { margin-top: 1px; }
-.milestone:hover { border-color: var(--line); background: var(--sunken); }
-.milestone:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.milestone .meter.thin { margin: 0; flex-basis: auto; }
-.milestone .mono { text-align: right; font-size: 12px; }
+.timeline-row + .timeline-row { margin-top: 2px; }
+.timeline-row:hover { background: var(--sunken); }
+.timeline-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
+.timeline-row > .role { margin-top: 1px; }
+.timeline-body { flex: 1 1 auto; min-width: 0; }
+.timeline-line { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.timeline-summary {
+  margin: 3px 0 0;
+  font-size: 12.5px;
+  color: var(--dim);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 
 /*
  * An activity row is two lines: the event, then the agent's own summary of what
@@ -511,18 +746,20 @@ code, .mono, pre { font-family: var(--mono); }
  */
 .activity > li {
   display: flex;
-  gap: 9px;
+  gap: 10px;
   align-items: baseline;
-  padding: 6px 4px;
+  padding: 8px 6px;
   border-radius: 6px;
   border: 1px solid transparent;
   font-size: 13px;
 }
 
 .activity > li + li { border-top: 1px solid var(--line); border-radius: 0; }
-.activity > li.clickable:hover { background: var(--sunken); border-color: var(--line); }
+.activity > li[data-opens] { cursor: pointer; }
+.activity > li[data-opens]:hover { background: var(--sunken); }
+.activity > li:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
 .event-body { flex: 1 1 auto; min-width: 0; }
-.event-line { display: flex; align-items: baseline; gap: 9px; }
+.event-line { display: flex; align-items: center; gap: 9px; min-width: 0; }
 .activity .what { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .activity .when { font-size: 12px; color: var(--faint); white-space: nowrap; }
 
@@ -551,9 +788,6 @@ code, .mono, pre { font-family: var(--mono); }
 
 .graph-holder { overflow: auto; padding-bottom: 8px; }
 
-/* The graph sits above the task list on the Tasks page, set off from it. */
-.task-graph { margin-bottom: 18px; padding-bottom: 14px; border-bottom: 1px solid var(--line); }
-.graph-caption { margin-bottom: 10px; }
 
 .dag { display: block; }
 .edge { fill: none; stroke: var(--edge); stroke-width: 1.5; }
@@ -587,20 +821,19 @@ code, .mono, pre { font-family: var(--mono); }
 
 .drawer {
   position: fixed;
-  top: 52px;
+  top: 0;
   right: 0;
   bottom: 0;
-  width: min(660px, 92vw);
+  width: min(680px, 92vw);
   background: var(--panel);
   border-left: 1px solid var(--line);
-  box-shadow: -8px 0 28px rgb(0 0 0 / 0.09);
   overflow: auto;
   transform: translateX(100%);
   transition: transform 0.22s ease;
   z-index: 30;
 }
 
-.drawer.open { transform: none; }
+.drawer.open { transform: none; box-shadow: -12px 0 36px rgb(0 0 0 / 0.12); }
 
 .close {
   position: absolute;
@@ -619,7 +852,7 @@ code, .mono, pre { font-family: var(--mono); }
 
 .close:hover { background: var(--sunken); color: var(--ink); }
 
-.detail { padding: 16px 18px 40px; }
+.detail { padding: 20px 24px 48px; }
 
 /*
  * Id, status and title on separate lines. Sharing one wrapping row meant a long
@@ -646,8 +879,8 @@ code, .mono, pre { font-family: var(--mono); }
 
 .detail-head h2 {
   margin: 0;
-  font-size: 17px;
-  font-weight: 650;
+  font-size: 18px;
+  font-weight: 680;
   line-height: 1.3;
   letter-spacing: -0.01em;
 }
@@ -666,8 +899,8 @@ code, .mono, pre { font-family: var(--mono); }
 
 /*
  * Labelled pairs. These were bare spans in a flex row, so with a gap alone the
- * text ran together: "milestone M02§ Replication/tmp/design.mdupdated a minute
- * ago" was one unbroken string on screen.
+ * text ran together: "task§ Replication/tmp/design.mdupdated a minute ago" was
+ * one unbroken string on screen.
  */
 .meta-row {
   display: flex;
@@ -678,6 +911,17 @@ code, .mono, pre { font-family: var(--mono); }
   border-bottom: 1px solid var(--line);
   font-size: 12.5px;
 }
+
+/* Under a drawer's title the facts are a panel of their own, not a ruled line. */
+.detail-head + .meta-row {
+  margin-bottom: 20px;
+  padding: 10px 12px;
+  background: var(--sunken);
+  border: 0;
+  border-radius: 6px;
+}
+
+.meta-row:empty { display: none; }
 
 .meta-item { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
 .meta-label { color: var(--faint); text-transform: uppercase; font-size: 11px; letter-spacing: 0.05em; }
@@ -790,7 +1034,19 @@ code, .mono, pre { font-family: var(--mono); }
 .proposed ul { margin: 2px 0 0; padding-left: 18px; }
 
 .tab-strip { display: flex; gap: 2px; border-bottom: 1px solid var(--line); margin-bottom: 0; }
-.tab-strip .tab { border-radius: 6px 6px 0 0; font-family: var(--mono); font-size: 12px; }
+.tab-strip .tab {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 6px 11px;
+  border-radius: 6px 6px 0 0;
+  cursor: pointer;
+}
+
+.tab-strip .tab:hover { color: var(--ink); }
 .tab-strip .tab.active { background: var(--sunken); color: var(--ink); }
 .tab-note { color: var(--faint); margin-left: 6px; font-size: 11px; }
 
@@ -822,69 +1078,25 @@ pre.command {
 
 /* ------------------------------------------------------------- decisions */
 
-.decision-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+/*
+ * A decision in the drawer. The register lists them; this is the one being read,
+ * so its title is a detail title like a task's, and its fields read as prose.
+ */
+.decision .field { margin-top: 18px; }
+.decision .field .prose { margin: 0; line-height: 1.6; }
 
-.decision {
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
+.decision .ruling {
+  margin: 0 0 8px;
   padding: 12px 14px;
-  background: var(--panel);
+  background: var(--s-review);
+  border-left: 3px solid var(--i-review);
+  border-radius: 6px;
 }
 
-.decision.proposed { border-left: 2.5px solid var(--i-review); }
-.decision.active { border-left: 2.5px solid var(--i-completed); }
-.decision.rejected { opacity: 0.72; }
-.decision header { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
-
-/*
- * A decision's h3 is a name, not a section label: it is the one line that says
- * what the fork was, so it is the largest thing in the card. Deliberately not
- * the .detail-section h3 treatment, which labels a region of a panel.
- */
-.decision h3 { margin: 0; font-size: 14.5px; font-weight: 650; letter-spacing: -0.005em; }
-
-.decision .field { margin-top: 10px; }
-.decision .ruling { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
-
-/* "To rule on this" is an instruction, not a field name, but the same tier. */
-.decision .ruling h4 { margin-bottom: 5px; }
-
-/*
- * A grid so the bar and count keep one column across every card. As flex-wrap
- * they dropped to a second row on any card with a long title, which read as
- * content rather than as a header.
- */
-.milestone-card .milestone-head {
-  display: grid;
-  grid-template-columns: 1ch auto minmax(0, 1fr) auto auto;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 10px;
-}
-
-/* A milestone name is a name, like a decision's: same tier, same treatment. */
-.milestone-card h2 {
-  display: block;
-  margin: 0;
-  font-size: 14.5px;
-  font-weight: 650;
-  text-transform: none;
-  letter-spacing: -0.005em;
-  color: var(--ink);
-}
-
-.milestone-card .milestone-head .pill { margin-left: 4px; }
-.milestone-progress { display: flex; align-items: center; gap: 9px; margin-left: 8px; }
-.milestone-progress .meter.thin { width: 90px; margin: 0; flex-basis: auto; }
-.milestone-progress .mono { font-size: 12px; }
-.milestone-card .task-list { margin-top: 2px; }
-.milestone-foot { margin: 8px 0 0; }
-
-@media (max-width: 720px) {
-  .milestone-card .milestone-head { grid-template-columns: 1ch auto minmax(0, 1fr); }
-  .milestone-card .milestone-head .pill,
-  .milestone-progress { grid-column: 2 / -1; }
-}
+/* "Waiting on a ruling" is an instruction, not a field name, but the same tier. */
+.decision .ruling h4 { margin-bottom: 5px; color: var(--i-review); }
+.decision .ruling .muted { color: var(--ink); opacity: 0.8; }
+.decision .ruling pre.command { background: var(--panel); }
 
 .link {
   appearance: none;
@@ -898,10 +1110,13 @@ pre.command {
   text-underline-offset: 2px;
 }
 
-@media (max-width: 720px) {
-  .top { gap: 10px; height: auto; padding: 8px 12px; flex-wrap: wrap; }
-  .header-counts { width: 100%; margin-left: 0; }
-  .body { padding: 12px; }
+@media (max-width: 900px) {
+  body { flex-direction: column; overflow: auto; }
+  .side { flex: 0 0 auto; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 10px; border-right: 0; border-bottom: 1px solid var(--line); }
+  .side-summary, .side > .grow { display: none; }
+  .nav { flex-direction: row; flex-wrap: wrap; }
+  .body { padding: 14px 16px 32px; overflow: visible; }
+  .col-model, .col-by, .col-criteria, .col-role { display: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1044,7 +1259,7 @@ pre.command {
 .pill.executing { background: var(--s-running); color: var(--i-running); }
 .pill.declined, .pill.out-of-scope, .pill.deferred, .pill.may { opacity: 0.8; }
 
-/* An id that opens the task drawer. Same affordance as .as-button, narrower use. */
+/* An id that opens the task drawer. Same affordance as .link, in mono. */
 .id-link {
   appearance: none;
   border: 0;

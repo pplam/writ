@@ -8,8 +8,8 @@
  * question is usually "what did it see, and what did it claim about it".
  */
 
-import { classes, code, el, replace } from '../dom.js';
-import { ago, clock, duration, isLive, mark } from '../format.js';
+import { activate, classes, code, el, liveClock, replace } from '../dom.js';
+import { ago, isLive, mark, roleLabel, stamp } from '../format.js';
 import type { LogTail, Run, RunRow } from '../types.js';
 
 export interface RunHandlers {
@@ -17,10 +17,19 @@ export interface RunHandlers {
   onTask(id: string): void;
 }
 
+/**
+ * The subsets worth finding. By role first, because "show me the reviews" was
+ * the question the old list could not answer without reading every row; then by
+ * outcome, because a failure or a rejection is the other thing people come
+ * here for.
+ */
 export const RUN_FILTERS: Record<string, (run: RunRow) => boolean> = {
   all: () => true,
   live: (r) => isLive(r.status),
+  dispatches: (r) => r.role === 'agent',
   reviews: (r) => r.role === 'reviewer',
+  gates: (r) => r.role === 'gate',
+  repairs: (r) => r.role === 'repair',
   failed: (r) => r.status === 'failed' || r.exit_code !== 0 && r.exit_code !== null,
   rejected: (r) => r.decision === 'reject',
 };
@@ -28,48 +37,86 @@ export const RUN_FILTERS: Record<string, (run: RunRow) => boolean> = {
 export function renderRunList(
   host: HTMLElement,
   runs: RunRow[],
-  options: { filter: string; selected: string | null },
+  options: { filter: string; query: string; selected: string | null },
   handlers: RunHandlers,
 ): void {
   const predicate = RUN_FILTERS[options.filter] ?? RUN_FILTERS.all;
-  const rows = runs.filter(predicate);
+  const query = options.query.trim().toLowerCase();
+  const rows = runs
+    .filter(predicate)
+    .filter((r) => !query || r.id.toLowerCase().includes(query) || r.task.toLowerCase().includes(query));
+  if (!rows.length) {
+    replace(host, el('p', { class: 'empty' }, runs.length ? 'No runs match.' : 'Nothing has been dispatched yet.'));
+    return;
+  }
   replace(host,
-    rows.length
-      ? el('ul', { class: 'run-list wide' }, ...rows.map((r) => runRow(r, r.id === options.selected, handlers)))
-      : el('p', { class: 'empty' }, 'No runs match.'),
+    el(
+      'table',
+      { class: 'data-table run-table' },
+      el(
+        'thead',
+        {},
+        el(
+          'tr',
+          {},
+          el('th', { class: 'col-mark' }),
+          el('th', { class: 'col-role' }, 'Role'),
+          el('th', { class: 'col-id' }, 'Task'),
+          el('th', {}, 'Outcome'),
+          el('th', { class: 'col-model' }, 'Model'),
+          el('th', { class: 'col-num' }, 'Duration'),
+          el('th', { class: 'col-when' }, 'Started'),
+        ),
+      ),
+      el('tbody', {}, ...rows.map((r) => runRow(r, r.id === options.selected, handlers))),
+    ),
   );
 }
 
+/** What a run came to, in one pill: the verdict if it gave one, else how it ended. */
+function outcomePill(run: RunRow): HTMLElement | null {
+  if (isLive(run.status)) return el('span', { class: classes('pill', run.status) }, run.status);
+  if (run.decision) return el('span', { class: classes('pill', run.decision) }, run.decision);
+  if (run.exit_code !== null && run.exit_code !== 0) {
+    return el('span', { class: 'pill failed' }, `exit ${run.exit_code}`);
+  }
+  if (run.no_verdict) return el('span', { class: 'pill failed' }, 'no verdict');
+  if (run.status !== 'completed') return el('span', { class: classes('pill', run.status) }, run.status);
+  return run.resulting_status
+    ? el('span', { class: classes('pill', run.resulting_status) }, run.resulting_status)
+    : el('span', { class: 'pill completed' }, 'completed');
+}
+
 function runRow(run: RunRow, isSelected: boolean, handlers: RunHandlers): HTMLElement {
+  const live = isLive(run.status);
   const row = el(
-    'li',
-    {
-      class: classes('run-row', run.status, isLive(run.status) && 'live', isSelected && 'selected', 'clickable'),
-      tabindex: 0,
-      role: 'button',
-      // See tasks.ts: the detail this row opens, so focus can come back to it.
-      'data-opens': `run:${run.id}`,
-    },
-    el('span', { class: 'mark' }, mark(run.status)),
-    el('span', { class: classes('verb', run.role) }, run.role === 'reviewer' ? 'review' : 'dispatch'),
-    code(run.task),
-    el('span', { class: 'muted mono small' }, run.model || run.command),
-    el('span', { class: 'grow' }),
-    run.decision ? el('span', { class: classes('pill', run.decision) }, run.decision) : null,
-    run.exit_code !== null && run.exit_code !== 0
-      ? el('span', { class: 'pill failed' }, `exit ${run.exit_code}`)
-      : null,
-    el('span', { class: 'muted mono small' }, duration(run.duration)),
-    el('span', { class: 'muted small', title: run.started_at ?? run.created_at }, ago(run.started_at ?? run.created_at)),
+    'tr',
+    { class: classes('run-row', run.status, live && 'live', isSelected && 'selected') },
+    el('td', { class: 'col-mark' }, live
+      ? el('span', { class: 'spinner', 'aria-hidden': 'true' })
+      : el('span', { class: classes('mark', run.status) }, mark(run.status))),
+    el('td', { class: 'col-role' }, el('span', { class: classes('role', run.role) }, roleLabel(run.role))),
+    el('td', { class: 'col-id' }, code(run.task)),
+    el(
+      'td',
+      { class: 'col-title' },
+      el(
+        'div',
+        { class: 'cell-title' },
+        outcomePill(run),
+        run.summary ? el('span', { class: 'clip muted' }, run.summary) : null,
+      ),
+    ),
+    el('td', { class: 'col-model muted mono small' }, el('span', { class: 'clip' }, run.model || '—')),
+    el('td', { class: 'col-num tnum' }, liveClock(live ? 0 : run.duration, live ? run.started_at : null)),
+    el(
+      'td',
+      { class: 'col-when muted', title: run.started_at ?? run.created_at },
+      ago(run.started_at ?? run.created_at),
+    ),
   );
-  const select = () => handlers.onSelect(run.id);
-  row.addEventListener('click', select);
-  row.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter' || event.key === ' ') {
-      event.preventDefault();
-      select();
-    }
-  });
+  // See tasks.ts: the detail this row opens, so focus can come back to it.
+  activate(row, `run:${run.id}`, () => handlers.onSelect(run.id));
   return row;
 }
 
@@ -81,23 +128,42 @@ export function renderRunDetail(host: HTMLElement, run: Run, handlers: RunHandle
     el(
       'header',
       { class: 'detail-head' },
-      el('span', { class: classes('mark', run.status) }, mark(run.status)),
-      code(run.id),
-      el('span', { class: classes('pill', run.status) }, run.status),
-      run.exit_code !== null ? el('span', { class: 'muted mono' }, `exit ${run.exit_code}`) : null,
+      el(
+        'div',
+        { class: 'detail-title' },
+        el('span', { class: classes('mark', run.status) }, mark(run.status)),
+        el('span', { class: classes('role', run.role) }, roleLabel(run.role)),
+        el('span', { class: classes('pill', run.status) }, run.status),
+        run.exit_code !== null ? el('span', { class: 'muted mono small' }, `exit ${run.exit_code}`) : null,
+      ),
+      el('h2', {}, `${roleLabel(run.role)} of `, taskButton),
+      el('div', { class: 'muted mono small' }, run.id),
     ),
-    el(
-      'div',
-      { class: 'meta-row' },
-      el('span', {}, run.role === 'reviewer' ? 'review of ' : 'dispatch of ', taskButton),
-      run.model ? el('span', { class: 'mono small' }, run.model) : null,
-      el('span', { class: 'mono small' }, run.command),
-      run.duration !== null ? el('span', {}, duration(run.duration)) : null,
-      run.started_at ? el('span', { title: run.started_at }, `started ${clock(run.started_at)}`) : null,
-    ),
+    runMeta(run),
     verdictSection(run),
     problemSection(run),
     tabs(run),
+  );
+}
+
+/** Discrete labelled facts, the same shape as the task drawer's. */
+function runMeta(run: Run): HTMLElement {
+  const live = isLive(run.status);
+  const item = (label: string, value: Node | string, mono = false) =>
+    el(
+      'div',
+      { class: 'meta-item' },
+      el('span', { class: 'meta-label' }, label),
+      el('span', { class: classes('meta-value', mono && 'mono') }, value),
+    );
+  return el(
+    'div',
+    { class: 'meta-row' },
+    item('duration', liveClock(live ? 0 : run.duration, live ? run.started_at : null)),
+    run.started_at ? item('started', stamp(run.started_at)) : null,
+    run.finished_at ? item('finished', stamp(run.finished_at)) : null,
+    run.model ? item('model', run.model, true) : null,
+    item('command', run.command, true),
   );
 }
 

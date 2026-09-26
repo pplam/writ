@@ -1,5 +1,5 @@
 /**
- * The shell: routing, the header, and the detail drawer.
+ * The shell: routing, the sidebar, each page's header, and the detail drawer.
  *
  * State here is deliberately small — which view, which task, which run, which
  * filter. Everything else comes from the snapshot, so a push re-renders from data
@@ -10,20 +10,19 @@
  * matters when the thing you are looking at is a specific run's stderr.
  */
 
-import { classes, el } from './dom.js';
-import { isLive, mark, plural } from './format.js';
+import { classes, el, tickClocks } from './dom.js';
+import { isLive, mark, percent, plural, setClockSkew } from './format.js';
 import { Store, type ConnectionState } from './store.js';
 import type { Snapshot } from './types.js';
-import { renderDecisions } from './views/decisions.js';
+import { DECISION_FILTERS, renderDecisionDetail, renderDecisions } from './views/decisions.js';
 import { fitTitles, renderGraph } from './views/graph.js';
-import { renderMilestones } from './views/milestones.js';
 import { renderOverview } from './views/overview.js';
 import { fitStepTitles, isPhase, renderStepDetail } from './views/phase.js';
 import { FINDING_FILTERS, renderPlan } from './views/plan.js';
 import { renderRunDetail, renderRunList, RUN_FILTERS } from './views/runs.js';
 import { FILTERS, renderTaskDetail, renderTaskList } from './views/tasks.js';
 
-type ViewName = 'overview' | 'plan' | 'tasks' | 'milestones' | 'runs' | 'decisions';
+type ViewName = 'overview' | 'plan' | 'tasks' | 'runs' | 'decisions';
 
 /**
  * Whether a click that landed outside the drawer should dismiss it.
@@ -67,13 +66,16 @@ export function dismissesOnFocus(context: {
   return context.movedTo === 'outside';
 }
 
-const VIEWS: { name: ViewName; label: string }[] = [
-  { name: 'overview', label: 'Overview' },
-  { name: 'plan', label: 'Plan' },
-  { name: 'tasks', label: 'Tasks' },
-  { name: 'milestones', label: 'Milestones' },
-  { name: 'runs', label: 'Runs' },
-  { name: 'decisions', label: 'Decisions' },
+/**
+ * The pages, in sidebar order. `blurb` is the line under each page's title: what
+ * the page is for, so a first-time reader does not have to infer it.
+ */
+const VIEWS: { name: ViewName; label: string; icon: string; blurb: string }[] = [
+  { name: 'overview', label: 'Overview', icon: '◎', blurb: 'Where the project stands and what is happening now.' },
+  { name: 'plan', label: 'Plan', icon: '▤', blurb: 'The reviewed plan: its status, findings, coverage and repairs.' },
+  { name: 'tasks', label: 'Tasks', icon: '▦', blurb: 'Every task, what it waits on, and how long agents have spent on it.' },
+  { name: 'runs', label: 'Runs', icon: '▶', blurb: 'Every dispatch, review, gate and repair an agent ran, newest first.' },
+  { name: 'decisions', label: 'Decisions', icon: '◆', blurb: 'Forks agents hit that the design did not settle, and how they were ruled.' },
 ];
 
 interface Route {
@@ -82,23 +84,30 @@ interface Route {
   run?: string;
   /** A planning step, from the phase graph on the Plan page. */
   step?: string;
+  /** A decision, from the register or the activity feed. */
+  decision?: string;
 }
 
 /** How often a watched step's output is re-fetched while it is still running. */
 const OUTPUT_POLL_MS = 1000;
+
+/** How often live durations are advanced between snapshots. */
+const TICK_MS = 1000;
 
 class App {
   private store = new Store();
   private route: Route = { view: 'overview' };
   private taskFilter = 'all';
   private runFilter = 'all';
+  private decisionFilter = 'all';
   // Findings default to `open`: the ones already answered are history, and the
   // question this view exists to answer is what stands against the plan now.
   private findingFilter = 'open';
-  private query = '';
+  /** The search box's text, per page: a task id typed on Tasks means nothing on Runs. */
+  private queries: Record<string, string> = {};
 
-  private nav = el('nav', { class: 'tabs', role: 'tablist' });
-  private counts = el('div', { class: 'header-counts' });
+  private nav = el('nav', { class: 'nav', 'aria-label': 'pages' });
+  private counts = el('div', { class: 'side-summary' });
   private conn = el('div', { class: 'conn', title: 'connection to writ serve' });
   private body = el('main', { class: 'body' });
   private drawer = el('aside', { class: 'drawer', 'aria-live': 'polite' });
@@ -110,8 +119,16 @@ class App {
   private watching: string | null = null;
 
   async start(): Promise<void> {
-    document.body.append(this.header(), this.body, this.drawer);
-    this.store.onSnapshot(() => this.render());
+    document.body.append(this.sidebar(), this.body, this.drawer);
+    this.store.onSnapshot(() => {
+      const current = this.store.current;
+      if (current) setClockSkew(current.generated_at);
+      this.render();
+    });
+    // Live durations advance every second in place, without a repaint: a
+    // snapshot only arrives when the store changes, and an agent mid-turn
+    // changes nothing for minutes at a time.
+    window.setInterval(() => tickClocks(document), TICK_MS);
     this.store.onConnection((state) => this.paintConnection(state));
     window.addEventListener('hashchange', () => {
       this.route = parseHash(location.hash);
@@ -179,6 +196,7 @@ class App {
     if (this.route.task) return `task:${this.route.task}`;
     if (this.route.run) return `run:${this.route.run}`;
     if (this.route.step) return `step:${this.route.step}`;
+    if (this.route.decision) return `decision:${this.route.decision}`;
     return null;
   }
 
@@ -201,20 +219,53 @@ class App {
     findOpener(key)?.focus();
   }
 
-  private header(): HTMLElement {
-    for (const view of VIEWS) {
-      const button = el('button', { class: 'tab', type: 'button', role: 'tab' }, view.label);
+  /**
+   * The sidebar: the project at a glance, the pages, and the connection.
+   *
+   * A sidebar rather than a row of tabs because each page carries a count worth
+   * seeing from every other page — runs live, decisions to rule on — and a tab
+   * strip had no room for them without wrapping.
+   */
+  private sidebar(): HTMLElement {
+    for (const [index, view] of VIEWS.entries()) {
+      const button = el(
+        'button',
+        { class: 'nav-item', type: 'button', title: `${view.label} (${index + 1})` },
+        el('span', { class: 'nav-icon', 'aria-hidden': 'true' }, view.icon),
+        el('span', { class: 'nav-label' }, view.label),
+        el('span', { class: 'nav-badge' }),
+      );
       button.dataset.view = view.name;
       button.addEventListener('click', () => this.go({ view: view.name }));
       this.nav.append(button);
     }
     return el(
-      'header',
-      { class: 'top' },
-      el('div', { class: 'brand' }, el('span', { class: 'wordmark' }, 'writ')),
-      this.nav,
+      'aside',
+      { class: 'side' },
+      el('div', { class: 'brand' }, el('span', { class: 'wordmark' }, 'writ'), el('span', { class: 'brand-note' }, 'dashboard')),
       this.counts,
+      this.nav,
+      el('div', { class: 'grow' }),
       this.conn,
+    );
+  }
+
+  /** The page's own title, what it is for, and what it is currently showing. */
+  private pageHead(snapshot: Snapshot, ...aside: (Node | null)[]): HTMLElement {
+    const view = VIEWS.find((v) => v.name === this.route.view) ?? VIEWS[0];
+    return el(
+      'header',
+      { class: 'page-head' },
+      el(
+        'div',
+        { class: 'page-title' },
+        el('h1', {}, view.label),
+        el('p', { class: 'muted' }, view.blurb),
+      ),
+      el('div', { class: 'page-aside' }, ...aside,
+        view.name === 'overview' && snapshot.overview.project
+          ? el('span', { class: 'muted small mono' }, snapshot.overview.project)
+          : null),
     );
   }
 
@@ -226,8 +277,11 @@ class App {
 
   private render(): void {
     const snapshot = this.store.current;
-    for (const button of this.nav.querySelectorAll<HTMLButtonElement>('.tab')) {
-      button.classList.toggle('active', button.dataset.view === this.route.view);
+    for (const button of this.nav.querySelectorAll<HTMLButtonElement>('.nav-item')) {
+      const current = button.dataset.view === this.route.view;
+      button.classList.toggle('active', current);
+      if (current) button.setAttribute('aria-current', 'page');
+      else button.removeAttribute('aria-current');
     }
     if (!snapshot) {
       this.body.replaceChildren(el('p', { class: 'empty' }, 'Loading…'));
@@ -300,60 +354,63 @@ class App {
     findOpener(key)?.focus();
   }
 
+  /**
+   * The sidebar's summary and the count on each page's nav item.
+   *
+   * A badge is shown only for what calls for attention — agents working now,
+   * decisions nobody has ruled on, tasks that failed — so a quiet sidebar means
+   * a quiet project.
+   */
   private paintCounts(snapshot: Snapshot): void {
     const { overview } = snapshot;
-    const parts: HTMLElement[] = [
-      el(
-        'span',
-        { class: 'count' },
-        el('b', {}, `${overview.completed}/${overview.tasks}`),
-        el('span', { class: 'label' }, 'done'),
-      ),
-    ];
-    if (overview.live) {
-      parts.push(
-        el(
-          'span',
-          { class: 'count live' },
-          el('span', { class: 'spinner', 'aria-hidden': 'true' }),
-          el('b', {}, String(overview.live)),
-          el('span', { class: 'label' }, 'running'),
-        ),
-      );
-    }
-    const waiting = overview.counts['awaiting-review'] ?? 0;
-    if (waiting) {
-      parts.push(
-        el('span', { class: 'count warn' }, el('b', {}, String(waiting)), el('span', { class: 'label' }, 'to review')),
-      );
-    }
-    if (overview.proposed_decisions) {
-      const button = el(
-        'button',
-        { class: 'count warn as-button', type: 'button' },
-        el('b', {}, String(overview.proposed_decisions)),
-        el('span', { class: 'label' }, 'decisions'),
-      );
-      button.addEventListener('click', () => this.go({ view: 'decisions' }));
-      parts.push(button);
-    }
+    const done = percent(overview.completed, overview.tasks);
     const failed = overview.counts.failed ?? 0;
-    if (failed) {
-      parts.push(
-        el('span', { class: 'count bad' }, el('b', {}, String(failed)), el('span', { class: 'label' }, 'failed')),
-      );
+    const waiting = overview.counts['awaiting-review'] ?? 0;
+    const line = (kind: string, value: number, label: string) =>
+      value ? el('li', { class: classes('side-count', kind) }, el('b', { class: 'tnum' }, String(value)), label) : null;
+    this.counts.replaceChildren(
+      el(
+        'div',
+        { class: 'side-progress' },
+        el('div', { class: 'side-progress-line' },
+          el('span', {}, 'Progress'),
+          el('b', { class: 'tnum' }, `${overview.completed}/${overview.tasks}`)),
+        el('div', { class: 'meter thin' }, el('div', { class: 'meter-fill', style: `width:${done}%` })),
+      ),
+      el(
+        'ul',
+        { class: 'side-counts' },
+        line('live', overview.live, 'running'),
+        line('warn', waiting, 'to review'),
+        line('warn', overview.proposed_decisions, 'to rule on'),
+        line('bad', failed, 'failed'),
+      ),
+    );
+    const badges: Partial<Record<ViewName, [number, string]>> = {
+      tasks: [failed, 'bad'],
+      runs: [overview.live, 'live'],
+      decisions: [overview.proposed_decisions, 'warn'],
+      plan: [overview.plan.blocking, 'bad'],
+    };
+    for (const button of this.nav.querySelectorAll<HTMLButtonElement>('.nav-item')) {
+      const badge = button.querySelector<HTMLElement>('.nav-badge');
+      if (!badge) continue;
+      const [value, kind] = badges[button.dataset.view as ViewName] ?? [0, ''];
+      badge.className = classes('nav-badge', kind, !value && 'hidden');
+      badge.textContent = value ? String(value) : '';
     }
-    this.counts.replaceChildren(...parts);
   }
 
   private paintView(snapshot: Snapshot): void {
     const handlers = {
       onTask: (id: string) => this.go({ view: this.route.view, task: id }),
       onRun: (id: string) => this.go({ view: this.route.view, run: id }),
+      onDecision: (id: string) => this.go({ view: this.route.view, decision: id }),
       onGoto: (view: string) => this.go({ view: view as ViewName }),
       onSelect: (id: string) => this.go({ view: this.route.view, task: id }),
       onStep: (id: string) => this.go({ view: this.route.view, step: id }),
     };
+    const query = this.queries[this.route.view] ?? '';
 
     switch (this.route.view) {
       case 'overview': {
@@ -361,7 +418,7 @@ class App {
         // grid here would treat those regions as cards and column them.
         const holder = el('div', { class: 'overview' });
         renderOverview(holder, snapshot, handlers);
-        this.body.replaceChildren(holder);
+        this.body.replaceChildren(this.pageHead(snapshot), holder);
         break;
       }
       case 'tasks': {
@@ -375,48 +432,51 @@ class App {
         const list = el('div', { class: 'list-holder' });
         renderTaskList(list, snapshot.tasks, {
           filter: this.taskFilter,
-          query: this.query,
+          query,
           selected: this.route.task ?? null,
         }, { onSelect: handlers.onSelect, onRun: handlers.onRun });
         this.body.replaceChildren(
-          el('section', { class: 'task-graph', 'aria-label': 'dependency graph' },
-            el('div', { class: 'muted small graph-caption' },
-              `${plural(snapshot.graph.nodes.length, 'task')} · ${snapshot.graph.levels} levels deep · a column can run at once`),
+          this.pageHead(snapshot),
+          el('section', { class: 'card task-graph', 'aria-label': 'dependency graph' },
+            el('header', { class: 'card-head' },
+              el('h2', {}, 'Dependency graph'),
+              el('span', { class: 'muted small' },
+                `${plural(snapshot.graph.nodes.length, 'task')} · ${snapshot.graph.levels} levels · a column can run at once`)),
             graph,
           ),
-          this.toolbar(
-            this.filterBar(Object.keys(FILTERS), this.taskFilter, (name) => {
-              this.taskFilter = name;
-              this.render();
-            }),
-            this.search(),
+          el('section', { class: 'card flush' },
+            this.toolbar(
+              this.filterBar(Object.keys(FILTERS), this.taskFilter, (name) => {
+                this.taskFilter = name;
+                this.render();
+              }, (name) => snapshot.tasks.filter(FILTERS[name]).length),
+              this.search('filter by id or title'),
+            ),
+            list,
           ),
-          list,
         );
         fitTitles(graph);
-        break;
-      }
-      case 'milestones': {
-        const holder = el('div', { class: 'grid one' });
-        renderMilestones(holder, snapshot.milestones, snapshot.tasks, handlers);
-        this.body.replaceChildren(holder);
         break;
       }
       case 'runs': {
         const list = el('div', { class: 'list-holder' });
         renderRunList(list, snapshot.runs, {
           filter: this.runFilter,
+          query,
           selected: this.route.run ?? null,
         }, { onSelect: handlers.onRun, onTask: handlers.onTask });
         this.body.replaceChildren(
-          this.toolbar(
-            this.filterBar(Object.keys(RUN_FILTERS), this.runFilter, (name) => {
-              this.runFilter = name;
-              this.render();
-            }),
-            el('span', { class: 'muted small' }, `${plural(snapshot.runs.length, 'run')}, newest first`),
+          this.pageHead(snapshot),
+          el('section', { class: 'card flush' },
+            this.toolbar(
+              this.filterBar(Object.keys(RUN_FILTERS), this.runFilter, (name) => {
+                this.runFilter = name;
+                this.render();
+              }, (name) => snapshot.runs.filter(RUN_FILTERS[name]).length),
+              this.search('filter by task or run id'),
+            ),
+            list,
           ),
-          list,
         );
         break;
       }
@@ -432,12 +492,15 @@ class App {
           { onTask: handlers.onTask, onStep: handlers.onStep },
         );
         this.body.replaceChildren(
+          this.pageHead(snapshot,
+            el('span', { class: classes('pill', snapshot.overview.plan.status) }, snapshot.overview.plan.status),
+            el('span', { class: 'muted small' }, `revision ${snapshot.overview.plan.revision}`)),
           this.toolbar(
+            el('span', { class: 'toolbar-label' }, 'Findings'),
             this.filterBar(Object.keys(FINDING_FILTERS), this.findingFilter, (name) => {
               this.findingFilter = name;
               this.render();
-            }),
-            el('span', { class: 'muted small' }, `revision ${snapshot.overview.plan.revision}`),
+            }, (name) => snapshot.findings.filter(FINDING_FILTERS[name]).length),
           ),
           holder,
         );
@@ -448,9 +511,25 @@ class App {
         break;
       }
       case 'decisions': {
-        const holder = el('div', { class: 'grid one' });
-        renderDecisions(holder, snapshot.decisions);
-        this.body.replaceChildren(holder);
+        const list = el('div', { class: 'list-holder' });
+        renderDecisions(list, snapshot.decisions, {
+          filter: this.decisionFilter,
+          query,
+          selected: this.route.decision ?? null,
+        }, { onSelect: handlers.onDecision, onTask: handlers.onTask });
+        this.body.replaceChildren(
+          this.pageHead(snapshot),
+          el('section', { class: 'card flush' },
+            this.toolbar(
+              this.filterBar(Object.keys(DECISION_FILTERS), this.decisionFilter, (name) => {
+                this.decisionFilter = name;
+                this.render();
+              }, (name) => snapshot.decisions.filter(DECISION_FILTERS[name]).length),
+              this.search('filter by id, title or task'),
+            ),
+            list,
+          ),
+        );
         break;
       }
     }
@@ -460,26 +539,42 @@ class App {
     return el('div', { class: 'toolbar' }, ...children.filter(Boolean) as Node[]);
   }
 
-  private filterBar(names: string[], active: string, pick: (name: string) => void): HTMLElement {
+  /**
+   * A segmented control of filters, each with how many it would show, so a
+   * reader can see there are three failures before choosing to look at them.
+   */
+  private filterBar(
+    names: string[],
+    active: string,
+    pick: (name: string) => void,
+    count?: (name: string) => number,
+  ): HTMLElement {
     const bar = el('div', { class: 'filters', role: 'group' });
     for (const name of names) {
-      const button = el('button', { class: classes('filter', name === active && 'active'), type: 'button' }, name);
+      const n = count ? count(name) : null;
+      const button = el(
+        'button',
+        { class: classes('filter', name === active && 'active', n === 0 && 'none'), type: 'button' },
+        name,
+        n !== null ? el('span', { class: 'filter-count tnum' }, String(n)) : null,
+      );
       button.addEventListener('click', () => pick(name));
       bar.append(button);
     }
     return bar;
   }
 
-  private search(): HTMLElement {
+  private search(placeholder: string): HTMLElement {
+    const view = this.route.view;
     const input = el('input', {
       class: 'search',
       type: 'search',
-      placeholder: 'filter by id or title',
-      value: this.query,
-      'aria-label': 'filter tasks',
+      placeholder,
+      value: this.queries[view] ?? '',
+      'aria-label': placeholder,
     });
     input.addEventListener('input', () => {
-      this.query = input.value;
+      this.queries[view] = input.value;
       this.render();
       // Re-rendering replaces the input, so put the cursor back where it was.
       const fresh = this.body.querySelector<HTMLInputElement>('.search');
@@ -496,8 +591,8 @@ class App {
    * during a run — its criteria fill in as the agent reports them.
    */
   private paintDrawer(): void {
-    const { task, run, step } = this.route;
-    if (!task && !run && !step) {
+    const { task, run, step, decision } = this.route;
+    if (!task && !run && !step && !decision) {
       this.stopFollowing();
       this.drawer.classList.remove('open');
       this.drawer.replaceChildren();
@@ -519,6 +614,18 @@ class App {
 
     if (step) {
       this.paintStep(step, close);
+      return;
+    }
+    if (decision) {
+      // Already in the snapshot, whole: nothing to fetch.
+      const found = this.store.current?.decisions.find((entry) => entry.id === decision);
+      if (!found) {
+        this.drawer.replaceChildren(close, el('p', { class: 'muted' }, `No decision ${decision}.`));
+        return;
+      }
+      const holder = el('div', { class: 'detail' });
+      renderDecisionDetail(holder, found, { onSelect: () => undefined, onTask: handlers.onTask });
+      this.drawer.replaceChildren(close, holder);
       return;
     }
     if (run) {
@@ -672,7 +779,7 @@ class App {
 
   private onKey(event: KeyboardEvent): void {
     if (event.target instanceof HTMLInputElement) return;
-    if (event.key === 'Escape' && (this.route.task || this.route.run || this.route.step)) {
+    if (event.key === 'Escape' && this.detailKey() !== null) {
       this.dismiss();
       return;
     }
@@ -700,6 +807,7 @@ function parseHash(hash: string): Route {
   if (kind === 'task' && id) return { view: known, task: decodeURIComponent(id) };
   if (kind === 'run' && id) return { view: known, run: decodeURIComponent(id) };
   if (kind === 'step' && id) return { view: known, step: decodeURIComponent(id) };
+  if (kind === 'decision' && id) return { view: known, decision: decodeURIComponent(id) };
   return { view: known };
 }
 
@@ -707,6 +815,7 @@ function toHash(route: Route): string {
   if (route.task) return `#/${route.view}/task/${encodeURIComponent(route.task)}`;
   if (route.run) return `#/${route.view}/run/${encodeURIComponent(route.run)}`;
   if (route.step) return `#/${route.view}/step/${encodeURIComponent(route.step)}`;
+  if (route.decision) return `#/${route.view}/decision/${encodeURIComponent(route.decision)}`;
   return `#/${route.view}`;
 }
 

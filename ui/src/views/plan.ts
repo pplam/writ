@@ -191,9 +191,12 @@ function baselineRow(baseline: Pipeline['baseline']): HTMLElement | null {
 }
 
 function statusCard(plan: Plan): HTMLElement {
+  // A finished plan is not runnable either, because there is nothing left to
+  // run — which is not the same as being refused, so it is not shown as urgent.
+  const complete = plan.status === 'complete';
   return el(
     'section',
-    { class: classes('card', !plan.runnable && 'urgent') },
+    { class: classes('card', !plan.runnable && !complete && 'urgent') },
     el(
       'header',
       { class: 'plan-head' },
@@ -204,9 +207,11 @@ function statusCard(plan: Plan): HTMLElement {
     el(
       'p',
       { class: 'muted' },
-      plan.runnable
-        ? 'Approved. `writ run` will dispatch work under this plan.'
-        : 'Not approved: `writ run` will refuse to start.',
+      complete
+        ? 'Complete: every task under this plan has finished.'
+        : plan.runnable
+          ? 'Approved. `writ run` will dispatch work under this plan.'
+          : 'Not approved: `writ run` will refuse to start.',
     ),
     el(
       'div',
@@ -231,7 +236,7 @@ function statusCard(plan: Plan): HTMLElement {
         )
       : null,
     plan.approval_note ? el('p', { class: 'prose' }, plan.approval_note) : null,
-    !plan.runnable && !plan.blocking
+    !plan.runnable && !plan.blocking && !complete
       ? el('div', { class: 'ruling' },
           el('h4', {}, 'Nothing blocking is open'),
           el('p', { class: 'muted small' }, 'The status comes from a check, so re-check it to approve on that basis.'),

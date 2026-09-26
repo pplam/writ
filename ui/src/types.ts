@@ -39,25 +39,9 @@ export interface Throughput {
   failures: number;
 }
 
-export interface MilestoneRow {
-  id: string;
-  title: string;
-  status: string;
-  done: number;
-  total: number;
-  counts: Partial<Record<TaskStatus, number>>;
-}
-
-export interface Milestone extends MilestoneRow {
-  tasks: TaskRow[];
-  design_section: string;
-  notes: string;
-}
-
 export interface TaskRow {
   id: string;
   title: string;
-  milestone: string;
   status: TaskStatus;
   stored_status: TaskStatus;
   /** `gate` nodes review an integrated outcome and write no code. */
@@ -76,6 +60,17 @@ export interface TaskRow {
   rework_attempts: number;
   /** A rejection this task has not yet answered: it is queued to be reworked. */
   awaiting_rework: boolean;
+  /** Seconds agents spent on this task in runs that have finished. */
+  agent_seconds: number;
+  /**
+   * When the run now working on it started, or null. The page adds the time since
+   * this to `agent_seconds` itself, so a live task's clock ticks between snapshots.
+   */
+  live_since: string | null;
+  /** When the first run on it started. */
+  started_at: string | null;
+  /** When its last run finished, or null while one is still going. */
+  finished_at: string | null;
 }
 
 export interface Acceptance {
@@ -470,6 +465,8 @@ export interface ActivityEvent {
   text: string;
   task: string;
   run?: string;
+  /** The run's role, for a run event: `agent`, `reviewer`, `gate` or `repair`. */
+  role?: string;
   decision?: string;
   status: string;
   summary?: string;
@@ -483,7 +480,6 @@ export interface Overview {
   tasks: number;
   completed: number;
   live: number;
-  milestones: MilestoneRow[];
   active_runs: RunRow[];
   proposed_decisions: number;
   throughput: Throughput;
@@ -493,7 +489,6 @@ export interface Overview {
 /** Everything the server pushes, and everything the app renders from. */
 export interface Snapshot {
   overview: Overview;
-  milestones: MilestoneRow[];
   tasks: TaskRow[];
   runs: RunRow[];
   decisions: Decision[];

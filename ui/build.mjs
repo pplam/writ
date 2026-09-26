@@ -40,7 +40,6 @@ const ORDER = [
   'views/tasks.js',
   'views/runs.js',
   'views/decisions.js',
-  'views/milestones.js',
   'views/plan.js',
   'app.js',
 ];

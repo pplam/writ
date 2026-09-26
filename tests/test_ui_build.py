@@ -266,15 +266,18 @@ def test_a_count_beside_a_section_title_is_not_part_of_the_name():
     assert note["color"] == "var(--faint)"
 
 
-def test_the_two_kinds_of_name_agree_with_each_other():
-    """A milestone name and a decision name are the same tier, so same treatment.
+def test_a_card_title_and_a_section_title_are_the_same_tier():
+    """A region of a page and a region of a drawer are named the same way.
 
-    They had drifted to the same size at different weights.
+    They had drifted into two voices: a grey uppercase label on the page and a dark
+    sentence-case title in the drawer, for what is the same role.
     """
-    milestone = _rule(".milestone-card h2")
-    decision = _rule(".decision h3")
-    assert milestone["font-size"] == decision["font-size"]
-    assert milestone["font-weight"] == decision["font-weight"]
+    card = _rule(".card h2")
+    section = _rule(".detail-section h3")
+    assert card["font-size"] == section["font-size"]
+    assert card["font-weight"] == section["font-weight"]
+    assert card["color"] == section["color"]
+    assert "text-transform" not in card
 
 
 def test_the_subordinate_label_is_defined_once():

@@ -1,4 +1,4 @@
-/* built from ui/src (434712eb28d0) */
+/* built from ui/src (b6d06649a777) */
 /*
  * writ dashboard — compiled from ui/src by ui/build.mjs.
  * Do not edit: change the TypeScript and rebuild.
@@ -83,6 +83,52 @@ function classes(...names) {
  */
 function replace(node, ...children) {
     node.replaceChildren(...children.filter((child) => child !== null && child !== undefined && child !== false));
+}
+/**
+ * Make a row open something on click, Enter or Space.
+ *
+ * `opens` is the detail key the drawer hands focus back to when it closes; see
+ * `findOpener` in app.ts for why it is looked up rather than remembered.
+ */
+function activate(node, opens, run) {
+    node.setAttribute('tabindex', '0');
+    node.setAttribute('role', 'button');
+    if (opens)
+        node.setAttribute('data-opens', opens);
+    node.addEventListener('click', run);
+    node.addEventListener('keydown', (event) => {
+        const key = event.key;
+        if (key === 'Enter' || key === ' ') {
+            event.preventDefault();
+            run();
+        }
+    });
+}
+/**
+ * A duration that keeps counting while its run is live.
+ *
+ * `base` is the seconds already spent, `since` the start of the run still going
+ * (or null). The figure is written now and then refreshed by `tickClocks` every
+ * second, in place, so a live task's time moves without a snapshot having to
+ * arrive — and without a repaint that would cost a reader their scroll or focus.
+ */
+function liveClock(base, since, empty = '—') {
+    const node = el('span', { class: classes('clock', !!since && 'ticking') });
+    if (since) {
+        node.dataset.tickBase = String(base ?? 0);
+        node.dataset.tickSince = since;
+    }
+    const seconds = since ? elapsed(base ?? 0, since, serverNow()) : base;
+    node.textContent = seconds ? duration(seconds) : since ? '<1s' : empty;
+    return node;
+}
+/** Refresh every live clock under `root`. SVG text works the same way. */
+function tickClocks(root) {
+    const now = serverNow();
+    for (const node of root.querySelectorAll('[data-tick-since]')) {
+        const base = Number(node.dataset.tickBase ?? 0);
+        node.textContent = duration(elapsed(base, node.dataset.tickSince, now)) || '<1s';
+    }
 }
 
 // ---- format.js ----
@@ -179,7 +225,7 @@ function ratio(passed, total) {
 function percent(done, total) {
     return total ? Math.round((done / total) * 100) : 0;
 }
-/** The status a milestone or task list should sort to the top. */
+/** The status a task list should sort to the top. */
 const WEIGHT = {
     running: 0,
     reviewing: 0,
@@ -196,6 +242,67 @@ function statusWeight(status) {
 }
 function plural(count, word, suffix = 's') {
     return `${count} ${word}${count === 1 ? '' : suffix}`;
+}
+/**
+ * What a run role is called on a page.
+ *
+ * `agent` is the implementer, and "dispatch" is the terminal's word for sending
+ * one. Gates and repairs were once labelled "dispatch" too, which hid the two
+ * kinds of run a reader goes looking for when a plan stops converging.
+ */
+const ROLES = {
+    agent: 'dispatch',
+    reviewer: 'review',
+    gate: 'gate',
+    repair: 'repair',
+};
+function roleLabel(role) {
+    return ROLES[role] ?? role;
+}
+/**
+ * How far the browser's clock is ahead of the server's, in milliseconds.
+ *
+ * A live duration is counted in the browser from a timestamp the server wrote,
+ * so a laptop a minute fast would show every running task a minute older than it
+ * is. Set from each snapshot's `generated_at`, which is as good as the one-second
+ * resolution it is written at.
+ */
+let clockSkew = 0;
+function setClockSkew(generatedAt) {
+    const then = Date.parse(generatedAt);
+    if (!Number.isNaN(then))
+        clockSkew = Date.now() - then;
+}
+/** Now, on the server's clock. */
+function serverNow() {
+    return Date.now() - clockSkew;
+}
+/**
+ * Seconds spent so far: what had finished, plus the time since a live run began.
+ *
+ * Pure, with `now` passed in, so the ticker and a test agree on what it means.
+ */
+function elapsed(base, since, now) {
+    if (!since)
+        return base;
+    const start = Date.parse(since);
+    if (Number.isNaN(start))
+        return base;
+    return base + Math.max(0, (now - start) / 1000);
+}
+/** A timestamp as a short absolute date and time, for a column that sorts by it. */
+function stamp(value) {
+    if (!value)
+        return '';
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime()))
+        return value;
+    return parsed.toLocaleString([], {
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+    });
 }
 
 // ---- store.js ----
@@ -411,9 +518,13 @@ function drawNode(node, isSelected, handlers) {
     group.append(svg('rect', { class: 'box', width: W, height: H, rx: 8 }));
     group.append(svg('text', { class: 'node-mark', x: 11, y: 19 }, mark(node.status)));
     group.append(svg('text', { class: 'node-id', x: 26, y: 19 }, node.id));
-    group.append(svg('text', { class: 'node-count', x: W - 11, y: 19, 'text-anchor': 'end' }, ratio(node.passed, node.total)));
+    group.append(timeLabel(node));
     group.append(svg('text', { class: 'node-title', x: 11, y: 38 }, node.title));
-    group.append(svg('text', { class: 'node-status', x: 11, y: 54 }, node.status));
+    const criteria = ratio(node.passed, node.total);
+    group.append(svg('text', { class: 'node-status', x: 11, y: 54 }, node.kind === 'gate' ? `gate · ${node.status}` : node.status));
+    if (criteria) {
+        group.append(svg('text', { class: 'node-count', x: W - 11, y: 54, 'text-anchor': 'end' }, criteria));
+    }
     if (node.total) {
         group.append(svg('rect', { class: 'track', x: 11, y: H - 7, width: W - 22, height: 3, rx: 1.5 }));
         group.append(svg('rect', {
@@ -436,8 +547,35 @@ function drawNode(node, isSelected, handlers) {
     });
     return group;
 }
+/**
+ * Time agents have spent on the task, top right where the eye lands after the id.
+ *
+ * A live one carries the same data attributes as `liveClock`, so the app's
+ * one-second ticker counts it up in place rather than it jumping at each snapshot.
+ */
+function timeLabel(node) {
+    const text = svg('text', {
+        class: classes('node-time', node.live_since !== null && 'ticking'),
+        x: W - 11,
+        y: 19,
+        'text-anchor': 'end',
+    });
+    if (node.live_since) {
+        text.dataset.tickBase = String(node.agent_seconds);
+        text.dataset.tickSince = node.live_since;
+        text.textContent = duration(elapsed(node.agent_seconds, node.live_since, serverNow())) || '<1s';
+    }
+    else {
+        text.textContent = node.agent_seconds ? duration(node.agent_seconds) : '';
+    }
+    return text;
+}
 function tooltip(node) {
     const lines = [`${node.id}  ${node.title}`, node.status];
+    if (node.agent_seconds || node.live_since) {
+        const spent = elapsed(node.agent_seconds, node.live_since, serverNow());
+        lines.push(`${duration(spent)} in agents over ${node.runs} run${node.runs === 1 ? '' : 's'}`);
+    }
     if (node.total)
         lines.push(`${node.passed}/${node.total} acceptance criteria`);
     if (node.depends_on.length)
@@ -681,13 +819,10 @@ function outputPanes(step, output) {
 /**
  * The overview: where the project stands, what is happening now, what it cost.
  *
- * Laid out as two regions rather than a bag of equal cards, because the cards
- * are not equal shapes. Progress, live agents, decisions and throughput are
- * fixed-height summaries; milestones and activity are lists that grow with the
- * project. Flowing all six through one `auto-fit` grid gave the timeline a
- * third of the width and made it eight hundred pixels tall while two thirds of
- * the row sat empty. So: a summary band across the top, then a two-column split
- * with the lists side by side.
+ * A strip of headline figures across the top, then a two-column split: the
+ * volatile things on the left (agents working now, what is waiting on a human)
+ * and the record on the right (activity). Each figure in the strip links to the
+ * view that explains it, so the overview is also the way into everything else.
  *
  * Ordered by what a reader needs first. Live agents come before totals because
  * during a run that is the only volatile thing on the page; proposed decisions
@@ -707,7 +842,21 @@ const STATUS_ORDER = [
 ];
 function renderOverview(host, snapshot, handlers) {
     const { overview } = snapshot;
-    replace(host, el('div', { class: 'ov-band' }, progressCard(overview), liveCard(overview, handlers), attentionCard(overview, handlers)), el('div', { class: 'ov-split' }, el('div', { class: 'ov-column' }, milestonesCard(overview, handlers), throughputCard(overview)), activityCard(snapshot.activity, handlers)));
+    replace(host, kpiStrip(overview, handlers), el('div', { class: 'ov-split' }, el('div', { class: 'ov-column' }, liveCard(overview, handlers), attentionCard(overview, handlers), statusBreakdown(overview)), activityCard(snapshot.activity, handlers)));
+}
+/**
+ * The headline figures. Each is a button to the view that holds the detail
+ * behind it: the number is the question, the view is the answer.
+ */
+function kpiStrip(overview, handlers) {
+    const t = overview.throughput;
+    const done = percent(overview.completed, overview.tasks);
+    const kpi = (label, value, note, view, kind) => {
+        const node = el('button', { class: classes('kpi', kind), type: 'button' }, el('span', { class: 'kpi-label' }, label), el('span', { class: 'kpi-value' }, value), note ? el('span', { class: 'kpi-note' }, note) : null);
+        node.addEventListener('click', () => handlers.onGoto(view));
+        return node;
+    };
+    return el('div', { class: 'kpis' }, kpi('Progress', `${done}%`, el('span', { class: 'kpi-meter' }, el('span', { class: 'meter thin' }, el('span', { class: 'meter-fill', style: `width:${done}%` })), `${overview.completed}/${overview.tasks} tasks`), 'tasks'), kpi('Working now', String(overview.live), overview.live ? 'agents running' : 'idle', 'runs', overview.live ? 'live' : undefined), kpi('To rule on', String(overview.proposed_decisions), 'proposed decisions', 'decisions', overview.proposed_decisions ? 'warn' : undefined), kpi('Runs', String(t.runs), `${t.reviews} review${t.reviews === 1 ? '' : 's'} · ${t.rejected} rejected`, 'runs'), kpi('Agent time', duration(t.agent_seconds) || '0s', `median run ${duration(t.median_seconds) || '—'}`, 'runs'), kpi('Failures', String(t.failures), t.failures ? 'runs that failed' : 'none', 'runs', t.failures ? 'bad' : undefined));
 }
 function card(title, ...body) {
     return el('section', { class: 'card' }, el('h2', {}, title), ...body);
@@ -716,10 +865,6 @@ function card(title, ...body) {
 function countedCard(title, count, ...body) {
     return el('section', { class: 'card' }, el('h2', {}, title, count ? el('span', { class: 'h2-count' }, String(count)) : null), ...body);
 }
-function progressCard(overview) {
-    const done = percent(overview.completed, overview.tasks);
-    return el('section', { class: 'card ov-progress' }, el('h2', {}, 'Progress'), el('div', { class: 'headline' }, el('span', { class: 'big' }, `${done}%`), el('span', { class: 'muted' }, `${overview.completed} of ${plural(overview.tasks, 'task')} complete`)), el('div', { class: 'meter' }, el('div', { class: 'meter-fill', style: `width:${done}%` })), el('ul', { class: 'chips' }, ...STATUS_ORDER.filter((status) => overview.counts[status]).map((status) => el('li', { class: classes('chip', status) }, el('span', { class: 'chip-mark' }, mark(status)), el('b', {}, String(overview.counts[status])), el('span', { class: 'chip-label' }, status)))));
-}
 function liveCard(overview, handlers) {
     const rows = overview.active_runs;
     return countedCard('Working now', rows.length, rows.length
@@ -727,8 +872,8 @@ function liveCard(overview, handlers) {
         : el('p', { class: 'blank' }, 'No agents running.'));
 }
 function liveRow(run, handlers) {
-    const row = el('li', { class: 'run-row live' }, el('span', { class: 'spinner', 'aria-hidden': 'true' }), el('button', { class: 'link', type: 'button', 'data-opens': `task:${run.task}` }, run.task), el('span', { class: 'verb' }, run.role === 'reviewer' ? 'review' : 'dispatch'), el('span', { class: 'grow' }), el('span', { class: 'muted mono small clip' }, run.model || run.command), el('span', { class: 'muted tnum', title: run.started_at ?? '' }, duration(run.duration)));
-    row.querySelector('button')?.addEventListener('click', () => handlers.onTask(run.task));
+    const row = el('li', { class: 'run-row live' }, el('span', { class: 'spinner', 'aria-hidden': 'true' }), el('span', { class: classes('role', run.role) }, roleLabel(run.role)), code(run.task), el('span', { class: 'grow' }), el('span', { class: 'muted mono small clip' }, run.model || run.command), el('span', { class: 'tnum' }, liveClock(0, run.started_at)));
+    activate(row, `run:${run.id}`, () => handlers.onRun(run.id));
     return row;
 }
 /**
@@ -757,35 +902,17 @@ function attentionCard(overview, handlers) {
         ? el('p', { class: 'muted small' }, 'Proposals stay inert until confirmed, so no run will clear them.')
         : null);
 }
-function throughputCard(overview) {
-    const t = overview.throughput;
-    const stat = (label, value, hint) => el('div', { class: 'stat' }, el('span', { class: 'stat-value' }, value), el('span', { class: 'stat-label' }, label), hint ? el('span', { class: 'stat-hint' }, hint) : null);
-    return card('Agent work', el('div', { class: 'stats' }, stat('runs', String(t.runs)), stat('in agents', duration(t.agent_seconds)), stat('median run', duration(t.median_seconds)), stat('reviews', String(t.reviews), t.reviews ? `${t.rejected} rejected` : undefined), stat('failed', String(t.failures))));
-}
-function milestonesCard(overview, handlers) {
-    const button = el('button', { class: 'link small', type: 'button' }, 'all milestones');
-    button.addEventListener('click', () => handlers.onGoto('milestones'));
-    return el('section', { class: 'card' }, el('h2', {}, 'Milestones', el('span', { class: 'grow' }), button), overview.milestones.length
-        ? el('ul', { class: 'milestone-list' }, ...overview.milestones.map((m) => milestoneRow(m, handlers)))
-        : el('p', { class: 'blank' }, 'No milestones.'));
-}
-/**
- * A milestone as a grid row, not a flex line. The parts have wildly different
- * widths — a two-word title next to a long one — and flex-wrap turned that into
- * a ragged block per milestone. A grid keeps id, bar and count in a column.
- */
-function milestoneRow(m, handlers) {
-    const done = percent(m.done, m.total);
-    const row = el('li', { class: classes('milestone', m.status, 'clickable'), tabindex: 0, role: 'button' }, el('span', { class: classes('mark', m.status) }, mark(m.status)), code(m.id), el('span', { class: 'title clip' }, m.title), el('div', { class: 'meter thin' }, el('div', { class: 'meter-fill', style: `width:${done}%` })), el('span', { class: 'muted mono tnum' }, ratio(m.done, m.total)));
-    const open = () => handlers.onGoto('milestones');
-    row.addEventListener('click', open);
-    row.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter' || event.key === ' ') {
-            event.preventDefault();
-            open();
-        }
-    });
-    return row;
+/** How the tasks divide by status, as one stacked bar and its legend. */
+function statusBreakdown(overview) {
+    const present = STATUS_ORDER.filter((status) => overview.counts[status]);
+    const count = (status) => overview.counts[status] ?? 0;
+    return card('Tasks by status', overview.tasks
+        ? el('div', { class: 'stack-bar' }, ...present.map((status) => el('span', {
+            class: classes('stack-seg', status),
+            title: `${count(status)} ${status}`,
+            style: `width:${percent(count(status), overview.tasks)}%`,
+        })))
+        : null, el('ul', { class: 'chips' }, ...present.map((status) => el('li', { class: classes('chip', status) }, el('span', { class: 'chip-mark' }, mark(status)), el('b', {}, String(count(status))), el('span', { class: 'chip-label' }, status)))));
 }
 function activityCard(events, handlers) {
     return el('section', { class: 'card ov-activity' }, el('h2', {}, 'Recent activity'), events.length
@@ -798,12 +925,16 @@ function activityCard(events, handlers) {
  * about what it did, so it gets its own line under the event.
  */
 function activityRow(event, handlers) {
-    const row = el('li', { class: classes('event', event.kind, isLive(event.status) && 'live') }, el('span', { class: classes('mark', event.status) }, mark(event.status)), el('div', { class: 'event-body' }, el('div', { class: 'event-line' }, el('span', { class: 'what' }, event.text), el('span', { class: 'grow' }), el('span', { class: 'when muted', title: event.at }, ago(event.at))), event.summary ? el('p', { class: 'event-summary' }, event.summary) : null));
+    const row = el('li', { class: classes('event', event.kind, isLive(event.status) && 'live') }, el('span', { class: classes('mark', event.status) }, mark(event.status)), el('div', { class: 'event-body' }, el('div', { class: 'event-line' }, event.role ? el('span', { class: classes('role', event.role) }, roleLabel(event.role)) : null, 
+    // The badge already says what kind of run it was, so a start reads as
+    // "review · FT-002 started" rather than repeating the verb.
+    el('span', { class: 'what' }, event.kind === 'run-started' ? `${event.task} started` : event.text), el('span', { class: 'grow' }), el('span', { class: 'when muted', title: event.at }, ago(event.at))), event.summary ? el('p', { class: 'event-summary' }, event.summary) : null));
     row.setAttribute('title', `${clock(event.at)} · ${event.text}`);
     if (event.run) {
-        row.classList.add('clickable');
-        row.setAttribute('data-opens', `run:${event.run}`);
-        row.addEventListener('click', () => handlers.onRun(event.run));
+        activate(row, `run:${event.run}`, () => handlers.onRun(event.run));
+    }
+    else if (event.decision) {
+        activate(row, `decision:${event.decision}`, () => handlers.onDecision(event.decision));
     }
     return row;
 }
@@ -835,31 +966,32 @@ function renderTaskList(host, tasks, options, handlers) {
         task.id.toLowerCase().includes(query) ||
         task.title.toLowerCase().includes(query))
         .sort((a, b) => statusWeight(a.status) - statusWeight(b.status) || a.id.localeCompare(b.id));
-    replace(host, rows.length
-        ? el('ul', { class: 'task-list' }, ...rows.map((t) => taskRow(t, t.id === options.selected, handlers)))
-        : el('p', { class: 'empty' }, 'No tasks match.'));
+    if (!rows.length) {
+        replace(host, el('p', { class: 'empty' }, tasks.length ? 'No tasks match.' : 'No tasks yet.'));
+        return;
+    }
+    replace(host, el('table', { class: 'data-table task-table' }, el('thead', {}, el('tr', {}, el('th', { class: 'col-mark' }), el('th', { class: 'col-id' }, 'Task'), el('th', {}, 'Title'), el('th', { class: 'col-status' }, 'Status'), el('th', { class: 'col-criteria' }, 'Criteria'), el('th', { class: 'col-num' }, 'Runs'), el('th', { class: 'col-num' }, 'Agent time'), el('th', { class: 'col-when' }, 'Last run'))), el('tbody', {}, ...rows.map((t) => taskRow(t, t.id === options.selected, handlers)))));
 }
 function taskRow(task, isSelected, handlers) {
-    const row = el('li', {
-        class: classes('task-row', task.status, isLive(task.status) && 'live', isSelected && 'selected'),
-        tabindex: 0,
-        role: 'button',
-        // What this row opens. The drawer hands focus back here when dismissed, and
-        // it cannot hold the element itself: opening re-renders the list, so the
-        // node that was clicked is gone by the time the drawer is on screen.
-        'data-opens': `task:${task.id}`,
-    }, el('span', { class: 'mark' }, mark(task.status)), code(task.id), el('span', { class: 'title' }, task.title), el('span', { class: 'grow' }), task.blocked_by.length
-        ? el('span', { class: 'muted small', title: `waiting on ${task.blocked_by.join(', ')}` }, `waits on ${task.blocked_by.length}`)
-        : null, el('span', { class: 'muted mono' }, ratio(task.passed, task.total)), el('span', { class: classes('pill', task.status) }, task.status));
-    const select = () => handlers.onSelect(task.id);
-    row.addEventListener('click', select);
-    row.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter' || event.key === ' ') {
-            event.preventDefault();
-            select();
-        }
-    });
+    const live = isLive(task.status);
+    const row = el('tr', { class: classes('task-row', task.status, live && 'live', isSelected && 'selected') }, el('td', { class: 'col-mark' }, live
+        ? el('span', { class: 'spinner', 'aria-hidden': 'true' })
+        : el('span', { class: classes('mark', task.status) }, mark(task.status))), el('td', { class: 'col-id' }, code(task.id)), el('td', { class: 'col-title' }, el('div', { class: 'cell-title' }, el('span', { class: 'clip' }, task.title), task.kind === 'gate' ? el('span', { class: 'tag' }, 'gate') : null, task.rework_attempts
+        ? el('span', { class: 'tag warn', title: 'times a reviewer sent it back' }, `rework ${task.rework_attempts}`)
+        : null, task.blocked_by.length
+        ? el('span', { class: 'tag', title: `waiting on ${task.blocked_by.join(', ')}` }, `waits on ${task.blocked_by.length}`)
+        : null)), el('td', { class: 'col-status' }, el('span', { class: classes('pill', task.status) }, task.status)), el('td', { class: 'col-criteria' }, criteriaMeter(task.passed, task.total)), el('td', { class: 'col-num tnum' }, task.runs ? String(task.runs) : '—'), el('td', { class: 'col-num tnum' }, liveClock(task.agent_seconds, task.live_since)), el('td', { class: 'col-when muted', title: task.finished_at ?? task.started_at ?? '' }, task.live_since ? 'now' : ago(task.finished_at ?? task.started_at) || '—'));
+    // What this row opens. The drawer hands focus back here when dismissed, and
+    // it cannot hold the element itself: opening re-renders the list, so the
+    // node that was clicked is gone by the time the drawer is on screen.
+    activate(row, `task:${task.id}`, () => handlers.onSelect(task.id));
     return row;
+}
+/** A small bar and the count beside it, so a column of them reads at a glance. */
+function criteriaMeter(passed, total) {
+    if (!total)
+        return el('span', { class: 'muted' }, '—');
+    return el('div', { class: 'mini-meter' }, el('div', { class: 'meter thin' }, el('div', { class: 'meter-fill', style: `width:${percent(passed, total)}%` })), el('span', { class: 'tnum' }, ratio(passed, total)));
 }
 function renderTaskDetail(host, task, handlers) {
     replace(host, el('header', { class: 'detail-head' }, el('div', { class: 'detail-title' }, el('span', { class: classes('mark', task.status) }, mark(task.status)), code(task.id), el('span', { class: classes('pill', task.status) }, task.status)), el('h2', {}, task.title)), metaRow(task), 
@@ -919,7 +1051,7 @@ function section(title, note, ...body) {
 }
 /**
  * Where this task came from. Rendered as discrete labelled items: these used to
- * be bare spans separated only by a flex gap, so a milestone id ran straight
+ * be bare spans separated only by a flex gap, so a task's kind ran straight
  * into a design section and then into a file path with nothing to show where
  * one ended and the next began.
  */
@@ -928,8 +1060,12 @@ function metaRow(task) {
         ? el('span', { class: classes('meta-value', mono && 'mono') }, value)
         : el('span', { class: 'meta-value' }, value));
     const bits = [];
-    if (task.milestone)
-        bits.push(item('milestone', code(task.milestone)));
+    bits.push(item('kind', task.kind));
+    if (task.agent_seconds || task.live_since) {
+        bits.push(item('agent time', liveClock(task.agent_seconds, task.live_since)));
+    }
+    if (task.started_at)
+        bits.push(item('started', stamp(task.started_at)));
     if (task.design_section)
         bits.push(item('section', task.design_section));
     if (task.design_doc)
@@ -979,18 +1115,26 @@ function dependencySection(task) {
         ? group('missing, so this can never become ready', task.unknown_deps, 'error')
         : null));
 }
+/**
+ * Every run on this task, oldest first, as a timeline.
+ *
+ * Oldest first because the order is the story: a dispatch, its review, a
+ * rejection, the rework, the review that accepted it. Each row says which of
+ * those it was, so the reviews are findable from the task they judged.
+ */
 function runSection(task, handlers) {
     if (!task.run_list.length) {
         return section('Runs', null, el('p', { class: 'blank' }, 'Never dispatched.'));
     }
-    return section('Runs', String(task.run_list.length), el('ul', { class: 'run-list' }, ...[...task.run_list].reverse().map((run) => {
-        const row = el('li', {
-            class: classes('run-row', run.status, isLive(run.status) && 'live', 'clickable'),
-            'data-opens': `run:${run.id}`,
-        }, el('span', { class: classes('mark', run.status) }, mark(run.status)), el('span', { class: 'verb' }, run.role === 'reviewer' ? 'review' : 'dispatch'), el('span', { class: 'grow' }), run.decision ? el('span', { class: classes('pill', run.decision) }, run.decision) : null, el('span', { class: 'muted mono small clip' }, run.model || run.command), el('span', { class: 'muted small tnum', title: run.started_at ?? '' }, ago(run.started_at)));
-        row.addEventListener('click', () => handlers.onRun(run.id));
-        return row;
-    })));
+    const reviews = task.run_list.filter((run) => run.role === 'reviewer').length;
+    return section('Runs', `${task.run_list.length}${reviews ? ` · ${reviews} review${reviews === 1 ? '' : 's'}` : ''}`, el('ol', { class: 'timeline' }, ...task.run_list.map((run) => timelineRow(run, handlers))));
+}
+function timelineRow(run, handlers) {
+    const live = isLive(run.status);
+    const outcome = run.decision || (run.status === 'completed' ? run.resulting_status : run.status);
+    const row = el('li', { class: classes('timeline-row', run.status, live && 'live') }, el('span', { class: classes('role', run.role) }, roleLabel(run.role)), el('div', { class: 'timeline-body' }, el('div', { class: 'timeline-line' }, outcome ? el('span', { class: classes('pill', outcome) }, outcome) : null, el('span', { class: 'muted mono small clip' }, run.model || run.command), el('span', { class: 'grow' }), el('span', { class: 'tnum small' }, liveClock(live ? 0 : run.duration, live ? run.started_at : null)), el('span', { class: 'muted small tnum', title: run.started_at ?? '' }, stamp(run.started_at))), run.summary ? el('p', { class: 'timeline-summary' }, run.summary) : null));
+    activate(row, `run:${run.id}`, () => handlers.onRun(run.id));
+    return row;
 }
 /**
  * What stopped a blocked task, when it said so.
@@ -1022,44 +1166,70 @@ function evidenceSection(task) {
  * shows one of them — and the reason to put them on a page together is that the
  * question is usually "what did it see, and what did it claim about it".
  */
+/**
+ * The subsets worth finding. By role first, because "show me the reviews" was
+ * the question the old list could not answer without reading every row; then by
+ * outcome, because a failure or a rejection is the other thing people come
+ * here for.
+ */
 const RUN_FILTERS = {
     all: () => true,
     live: (r) => isLive(r.status),
+    dispatches: (r) => r.role === 'agent',
     reviews: (r) => r.role === 'reviewer',
+    gates: (r) => r.role === 'gate',
+    repairs: (r) => r.role === 'repair',
     failed: (r) => r.status === 'failed' || r.exit_code !== 0 && r.exit_code !== null,
     rejected: (r) => r.decision === 'reject',
 };
 function renderRunList(host, runs, options, handlers) {
     const predicate = RUN_FILTERS[options.filter] ?? RUN_FILTERS.all;
-    const rows = runs.filter(predicate);
-    replace(host, rows.length
-        ? el('ul', { class: 'run-list wide' }, ...rows.map((r) => runRow(r, r.id === options.selected, handlers)))
-        : el('p', { class: 'empty' }, 'No runs match.'));
+    const query = options.query.trim().toLowerCase();
+    const rows = runs
+        .filter(predicate)
+        .filter((r) => !query || r.id.toLowerCase().includes(query) || r.task.toLowerCase().includes(query));
+    if (!rows.length) {
+        replace(host, el('p', { class: 'empty' }, runs.length ? 'No runs match.' : 'Nothing has been dispatched yet.'));
+        return;
+    }
+    replace(host, el('table', { class: 'data-table run-table' }, el('thead', {}, el('tr', {}, el('th', { class: 'col-mark' }), el('th', { class: 'col-role' }, 'Role'), el('th', { class: 'col-id' }, 'Task'), el('th', {}, 'Outcome'), el('th', { class: 'col-model' }, 'Model'), el('th', { class: 'col-num' }, 'Duration'), el('th', { class: 'col-when' }, 'Started'))), el('tbody', {}, ...rows.map((r) => runRow(r, r.id === options.selected, handlers)))));
+}
+/** What a run came to, in one pill: the verdict if it gave one, else how it ended. */
+function outcomePill(run) {
+    if (isLive(run.status))
+        return el('span', { class: classes('pill', run.status) }, run.status);
+    if (run.decision)
+        return el('span', { class: classes('pill', run.decision) }, run.decision);
+    if (run.exit_code !== null && run.exit_code !== 0) {
+        return el('span', { class: 'pill failed' }, `exit ${run.exit_code}`);
+    }
+    if (run.no_verdict)
+        return el('span', { class: 'pill failed' }, 'no verdict');
+    if (run.status !== 'completed')
+        return el('span', { class: classes('pill', run.status) }, run.status);
+    return run.resulting_status
+        ? el('span', { class: classes('pill', run.resulting_status) }, run.resulting_status)
+        : el('span', { class: 'pill completed' }, 'completed');
 }
 function runRow(run, isSelected, handlers) {
-    const row = el('li', {
-        class: classes('run-row', run.status, isLive(run.status) && 'live', isSelected && 'selected', 'clickable'),
-        tabindex: 0,
-        role: 'button',
-        // See tasks.ts: the detail this row opens, so focus can come back to it.
-        'data-opens': `run:${run.id}`,
-    }, el('span', { class: 'mark' }, mark(run.status)), el('span', { class: classes('verb', run.role) }, run.role === 'reviewer' ? 'review' : 'dispatch'), code(run.task), el('span', { class: 'muted mono small' }, run.model || run.command), el('span', { class: 'grow' }), run.decision ? el('span', { class: classes('pill', run.decision) }, run.decision) : null, run.exit_code !== null && run.exit_code !== 0
-        ? el('span', { class: 'pill failed' }, `exit ${run.exit_code}`)
-        : null, el('span', { class: 'muted mono small' }, duration(run.duration)), el('span', { class: 'muted small', title: run.started_at ?? run.created_at }, ago(run.started_at ?? run.created_at)));
-    const select = () => handlers.onSelect(run.id);
-    row.addEventListener('click', select);
-    row.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter' || event.key === ' ') {
-            event.preventDefault();
-            select();
-        }
-    });
+    const live = isLive(run.status);
+    const row = el('tr', { class: classes('run-row', run.status, live && 'live', isSelected && 'selected') }, el('td', { class: 'col-mark' }, live
+        ? el('span', { class: 'spinner', 'aria-hidden': 'true' })
+        : el('span', { class: classes('mark', run.status) }, mark(run.status))), el('td', { class: 'col-role' }, el('span', { class: classes('role', run.role) }, roleLabel(run.role))), el('td', { class: 'col-id' }, code(run.task)), el('td', { class: 'col-title' }, el('div', { class: 'cell-title' }, outcomePill(run), run.summary ? el('span', { class: 'clip muted' }, run.summary) : null)), el('td', { class: 'col-model muted mono small' }, el('span', { class: 'clip' }, run.model || '—')), el('td', { class: 'col-num tnum' }, liveClock(live ? 0 : run.duration, live ? run.started_at : null)), el('td', { class: 'col-when muted', title: run.started_at ?? run.created_at }, ago(run.started_at ?? run.created_at)));
+    // See tasks.ts: the detail this row opens, so focus can come back to it.
+    activate(row, `run:${run.id}`, () => handlers.onSelect(run.id));
     return row;
 }
 function renderRunDetail(host, run, handlers) {
     const taskButton = el('button', { class: 'link', type: 'button' }, run.task);
     taskButton.addEventListener('click', () => handlers.onTask(run.task));
-    replace(host, el('header', { class: 'detail-head' }, el('span', { class: classes('mark', run.status) }, mark(run.status)), code(run.id), el('span', { class: classes('pill', run.status) }, run.status), run.exit_code !== null ? el('span', { class: 'muted mono' }, `exit ${run.exit_code}`) : null), el('div', { class: 'meta-row' }, el('span', {}, run.role === 'reviewer' ? 'review of ' : 'dispatch of ', taskButton), run.model ? el('span', { class: 'mono small' }, run.model) : null, el('span', { class: 'mono small' }, run.command), run.duration !== null ? el('span', {}, duration(run.duration)) : null, run.started_at ? el('span', { title: run.started_at }, `started ${clock(run.started_at)}`) : null), verdictSection(run), problemSection(run), tabs(run));
+    replace(host, el('header', { class: 'detail-head' }, el('div', { class: 'detail-title' }, el('span', { class: classes('mark', run.status) }, mark(run.status)), el('span', { class: classes('role', run.role) }, roleLabel(run.role)), el('span', { class: classes('pill', run.status) }, run.status), run.exit_code !== null ? el('span', { class: 'muted mono small' }, `exit ${run.exit_code}`) : null), el('h2', {}, `${roleLabel(run.role)} of `, taskButton), el('div', { class: 'muted mono small' }, run.id)), runMeta(run), verdictSection(run), problemSection(run), tabs(run));
+}
+/** Discrete labelled facts, the same shape as the task drawer's. */
+function runMeta(run) {
+    const live = isLive(run.status);
+    const item = (label, value, mono = false) => el('div', { class: 'meta-item' }, el('span', { class: 'meta-label' }, label), el('span', { class: classes('meta-value', mono && 'mono') }, value));
+    return el('div', { class: 'meta-row' }, item('duration', liveClock(live ? 0 : run.duration, live ? run.started_at : null)), run.started_at ? item('started', stamp(run.started_at)) : null, run.finished_at ? item('finished', stamp(run.finished_at)) : null, run.model ? item('model', run.model, true) : null, item('command', run.command, true));
 }
 function verdictSection(run) {
     if (!run.decision && !run.summary && !run.unmet.length)
@@ -1199,29 +1369,65 @@ function bytes(tail) {
 
 // ---- views/decisions.js ----
 /**
- * Decisions an agent recorded, proposals first.
+ * Decisions an agent recorded, as a register, proposals first.
  *
  * A proposal is a fork an agent hit that the design document did not settle. It
  * stays inert until a human rules on it, which makes it the one kind of work no
- * `writ run` will ever clear — so this view shows the ruling command rather than
+ * `writ run` will ever clear — so the detail shows the ruling command rather than
  * a button. The dashboard is read-only, and a decision is exactly the kind of
  * thing that should be typed deliberately with a reason attached.
+ *
+ * A table rather than a card per decision: a project collects dozens, and a card
+ * that prints context, decision and consequences in full made the page a wall
+ * of prose in which the three proposals that needed a ruling were hard to find.
+ * The register answers "which, from where, in what state"; the drawer holds the
+ * reasoning for the one being read.
  */
-function renderDecisions(host, decisions) {
+const DECISION_FILTERS = {
+    all: () => true,
+    proposed: (d) => d.status === 'proposed',
+    active: (d) => d.status === 'active',
+    superseded: (d) => d.status === 'superseded',
+    rejected: (d) => d.status === 'rejected',
+};
+/** Proposals first, since they are the ones waiting; then newest first. */
+function decisionWeight(decision) {
+    return decision.status === 'proposed' ? 0 : decision.status === 'active' ? 1 : 2;
+}
+function renderDecisions(host, decisions, options, handlers) {
     if (!decisions.length) {
         replace(host, el('p', { class: 'empty' }, 'No decisions recorded. Agents propose them as they work.'));
         return;
     }
-    const proposed = decisions.filter((d) => d.status === 'proposed');
-    const settled = decisions.filter((d) => d.status !== 'proposed');
-    replace(host, proposed.length
-        ? el('section', { class: 'card urgent' }, el('h2', {}, `Waiting on a ruling (${proposed.length})`), el('p', { class: 'muted small' }, 'An agent hit a fork the design did not settle. Until you rule, this is recorded but not in force.'), el('div', { class: 'decision-grid' }, ...proposed.map(decisionCard)))
-        : null, settled.length
-        ? el('section', { class: 'card' }, el('h2', {}, 'Settled'), el('div', { class: 'decision-grid' }, ...settled.map(decisionCard)))
-        : null);
+    const predicate = DECISION_FILTERS[options.filter] ?? DECISION_FILTERS.all;
+    const query = options.query.trim().toLowerCase();
+    const rows = decisions
+        .filter(predicate)
+        .filter((d) => !query ||
+        d.id.toLowerCase().includes(query) ||
+        d.title.toLowerCase().includes(query) ||
+        d.task.toLowerCase().includes(query))
+        .sort((a, b) => decisionWeight(a) - decisionWeight(b) || (b.at || '').localeCompare(a.at || ''));
+    if (!rows.length) {
+        replace(host, el('p', { class: 'empty' }, 'No decisions match.'));
+        return;
+    }
+    replace(host, el('table', { class: 'data-table decision-table' }, el('thead', {}, el('tr', {}, el('th', { class: 'col-id' }, 'Decision'), el('th', {}, 'Title'), el('th', { class: 'col-status' }, 'Status'), el('th', { class: 'col-id' }, 'From task'), el('th', { class: 'col-by' }, 'By'), el('th', { class: 'col-when' }, 'Recorded'))), el('tbody', {}, ...rows.map((d) => decisionRow(d, d.id === options.selected, handlers)))));
 }
-function decisionCard(decision) {
-    return el('article', { class: classes('decision', decision.status) }, el('header', {}, code(decision.id), el('h3', {}, decision.title), el('span', { class: classes('pill', decision.status) }, decision.status)), el('div', { class: 'meta-row' }, decision.by ? el('span', {}, decision.by) : null, decision.task ? el('span', {}, 'from ', code(decision.task)) : null, decision.at ? el('span', { title: decision.at }, ago(decision.at)) : null, decision.supersedes ? el('span', {}, 'supersedes ', code(decision.supersedes)) : null), field('Context', decision.context), field('Decision', decision.decision), field('Consequences', decision.consequences), decision.reason ? field('Reason given', decision.reason) : null, decision.status === 'proposed' ? ruling(decision) : null);
+function decisionRow(decision, isSelected, handlers) {
+    const row = el('tr', { class: classes('decision-row', decision.status, isSelected && 'selected') }, el('td', { class: 'col-id' }, code(decision.id)), el('td', { class: 'col-title' }, el('div', { class: 'cell-title' }, el('span', { class: 'clip' }, decision.title), decision.supersedes
+        ? el('span', { class: 'tag', title: `supersedes ${decision.supersedes}` }, `↺ ${decision.supersedes}`)
+        : null)), el('td', { class: 'col-status' }, el('span', { class: classes('pill', decision.status) }, decision.status)), el('td', { class: 'col-id' }, decision.task ? code(decision.task) : el('span', { class: 'muted' }, '—')), el('td', { class: 'col-by muted small' }, el('span', { class: 'clip' }, decision.by || '—')), el('td', { class: 'col-when muted', title: decision.at }, ago(decision.at)));
+    activate(row, `decision:${decision.id}`, () => handlers.onSelect(decision.id));
+    return row;
+}
+function renderDecisionDetail(host, decision, handlers) {
+    const taskButton = decision.task
+        ? el('button', { class: 'link mono', type: 'button' }, decision.task)
+        : null;
+    taskButton?.addEventListener('click', () => handlers.onTask(decision.task));
+    const item = (label, value) => el('div', { class: 'meta-item' }, el('span', { class: 'meta-label' }, label), el('span', { class: 'meta-value' }, value));
+    replace(host, el('article', { class: classes('decision', decision.status) }, el('header', { class: 'detail-head' }, el('div', { class: 'detail-title' }, code(decision.id), el('span', { class: classes('pill', decision.status) }, decision.status)), el('h2', {}, decision.title)), el('div', { class: 'meta-row' }, decision.by ? item('by', decision.by) : null, taskButton ? item('from task', taskButton) : null, decision.at ? item('recorded', stamp(decision.at)) : null, decision.supersedes ? item('supersedes', code(decision.supersedes)) : null), decision.status === 'proposed' ? ruling(decision) : null, field('Context', decision.context), field('Decision', decision.decision), field('Consequences', decision.consequences), decision.reason ? field('Reason given', decision.reason) : null));
 }
 function field(label, value) {
     if (!value)
@@ -1229,61 +1435,7 @@ function field(label, value) {
     return el('div', { class: 'field' }, el('h4', {}, label), el('p', { class: 'prose' }, value));
 }
 function ruling(decision) {
-    return el('div', { class: 'ruling' }, el('h4', {}, 'To rule on this'), el('pre', { class: 'command' }, `writ set ${decision.id} active\nwrit set ${decision.id} rejected --reason "..."`));
-}
-
-// ---- views/milestones.js ----
-/**
- * Milestones with their tasks: the plan's own structure.
- *
- * A milestone is how the design document was divided, so this is the view that
- * answers "how far through the plan are we" rather than "what is running". Tasks
- * are shown in id order, not sorted by status, because within a milestone the
- * numbering is the intended sequence — and a milestone whose tasks jumped around
- * as agents worked would be unreadable as a plan.
- *
- * The header is a grid rather than a wrapping flex line. Everything after the
- * title used to wrap under it at narrow widths, so the count and the status
- * pill ended up in a second row that looked like content.
- */
-function renderMilestones(host, milestones, tasks, handlers) {
-    if (!milestones.length) {
-        host.replaceChildren(el('p', { class: 'empty' }, 'No milestones yet.'));
-        return;
-    }
-    host.replaceChildren(...milestones.map((milestone) => milestoneCard(milestone, tasks, handlers)));
-}
-function milestoneCard(milestone, tasks, handlers) {
-    const own = tasks
-        .filter((task) => task.milestone === milestone.id)
-        .sort((a, b) => a.id.localeCompare(b.id));
-    const done = percent(milestone.done, milestone.total);
-    const left = milestone.total - milestone.done;
-    return el('section', { class: classes('card milestone-card', milestone.status) }, el('header', { class: 'milestone-head' }, el('span', { class: classes('mark', milestone.status) }, mark(milestone.status)), code(milestone.id), el('h2', { class: 'clip' }, milestone.title), el('span', { class: classes('pill', milestone.status) }, milestone.status), el('div', { class: 'milestone-progress' }, el('div', { class: 'meter thin' }, el('div', { class: 'meter-fill', style: `width:${done}%` })), el('span', { class: 'muted mono tnum' }, `${ratio(milestone.done, milestone.total)}`))), own.length
-        ? el('ul', { class: 'task-list compact' }, ...own.map((task) => milestoneTaskRow(task, handlers)))
-        : el('p', { class: 'blank' }, 'No tasks in this milestone.'), left
-        ? el('p', { class: 'milestone-foot muted small' }, `${plural(left, 'task')} left`)
-        : null);
-}
-function milestoneTaskRow(task, handlers) {
-    const row = el('li', {
-        class: classes('task-row', task.status, 'clickable'),
-        tabindex: 0,
-        role: 'button',
-        // See tasks.ts: names the detail this row opens, so dismissing the drawer
-        // can return focus to it after the list has been re-rendered.
-        'data-opens': `task:${task.id}`,
-    }, el('span', { class: classes('mark', task.status) }, mark(task.status)), code(task.id), el('span', { class: 'title clip' }, task.title), el('span', { class: 'grow' }), task.blocked_by.length
-        ? el('span', { class: 'muted small', title: `waiting on ${task.blocked_by.join(', ')}` }, `waits on ${task.blocked_by.length}`)
-        : null, el('span', { class: 'muted mono tnum' }, ratio(task.passed, task.total)), el('span', { class: classes('pill', task.status) }, task.status));
-    row.addEventListener('click', () => handlers.onTask(task.id));
-    row.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter' || event.key === ' ') {
-            event.preventDefault();
-            handlers.onTask(task.id);
-        }
-    });
-    return row;
+    return el('div', { class: 'ruling' }, el('h4', {}, 'Waiting on a ruling'), el('p', { class: 'muted small' }, 'An agent hit a fork the design did not settle. Until you rule, this is recorded but not in force.'), el('pre', { class: 'command' }, `writ set ${decision.id} active\nwrit set ${decision.id} rejected --reason "..."`));
 }
 
 // ---- views/plan.js ----
@@ -1394,16 +1546,21 @@ function baselineRow(baseline) {
         : null);
 }
 function statusCard(plan) {
-    return el('section', { class: classes('card', !plan.runnable && 'urgent') }, el('header', { class: 'plan-head' }, el('h2', {}, 'Plan'), el('span', { class: classes('pill', plan.status) }, plan.status), el('span', { class: 'muted small' }, `revision ${plan.revision}`)), el('p', { class: 'muted' }, plan.runnable
-        ? 'Approved. `writ run` will dispatch work under this plan.'
-        : 'Not approved: `writ run` will refuse to start.'), el('div', { class: 'meta-row' }, el('span', {}, `${plural(plan.blocking, 'blocking finding')}`), el('span', {}, `${plan.advisory} advisory`), el('span', {}, `${plural(plan.requirements, 'requirement')}`), plan.uncovered.length
+    // A finished plan is not runnable either, because there is nothing left to
+    // run — which is not the same as being refused, so it is not shown as urgent.
+    const complete = plan.status === 'complete';
+    return el('section', { class: classes('card', !plan.runnable && !complete && 'urgent') }, el('header', { class: 'plan-head' }, el('h2', {}, 'Plan'), el('span', { class: classes('pill', plan.status) }, plan.status), el('span', { class: 'muted small' }, `revision ${plan.revision}`)), el('p', { class: 'muted' }, complete
+        ? 'Complete: every task under this plan has finished.'
+        : plan.runnable
+            ? 'Approved. `writ run` will dispatch work under this plan.'
+            : 'Not approved: `writ run` will refuse to start.'), el('div', { class: 'meta-row' }, el('span', {}, `${plural(plan.blocking, 'blocking finding')}`), el('span', {}, `${plan.advisory} advisory`), el('span', {}, `${plural(plan.requirements, 'requirement')}`), plan.uncovered.length
         ? el('span', { class: 'count bad' }, el('b', {}, String(plan.uncovered.length)), el('span', { class: 'label' }, 'uncovered'))
         : null, plan.open_repairs.length ? el('span', {}, `${plural(plan.open_repairs.length, 'open repair')}`) : null), plan.approved_by
         ? el('div', { class: 'meta-row' }, el('span', {}, `approved by ${plan.approved_by}`), plan.approved_at ? el('span', { title: plan.approved_at }, ago(plan.approved_at)) : null, 
         // An approval that overruled findings is the one a later reader most
         // needs to see, so it is a badge rather than a line of prose.
         plan.forced ? el('span', { class: 'pill forced' }, 'forced') : null)
-        : null, plan.approval_note ? el('p', { class: 'prose' }, plan.approval_note) : null, !plan.runnable && !plan.blocking
+        : null, plan.approval_note ? el('p', { class: 'prose' }, plan.approval_note) : null, !plan.runnable && !plan.blocking && !complete
         ? el('div', { class: 'ruling' }, el('h4', {}, 'Nothing blocking is open'), el('p', { class: 'muted small' }, 'The status comes from a check, so re-check it to approve on that basis.'), el('pre', { class: 'command' }, 'writ check'))
         : null);
 }
@@ -1470,7 +1627,7 @@ function taskLink(id, handlers) {
 
 // ---- app.js ----
 /**
- * The shell: routing, the header, and the detail drawer.
+ * The shell: routing, the sidebar, each page's header, and the detail drawer.
  *
  * State here is deliberately small — which view, which task, which run, which
  * filter. Everything else comes from the snapshot, so a push re-renders from data
@@ -1516,27 +1673,34 @@ function dismissesOnFocus(context) {
         return false;
     return context.movedTo === 'outside';
 }
+/**
+ * The pages, in sidebar order. `blurb` is the line under each page's title: what
+ * the page is for, so a first-time reader does not have to infer it.
+ */
 const VIEWS = [
-    { name: 'overview', label: 'Overview' },
-    { name: 'plan', label: 'Plan' },
-    { name: 'tasks', label: 'Tasks' },
-    { name: 'milestones', label: 'Milestones' },
-    { name: 'runs', label: 'Runs' },
-    { name: 'decisions', label: 'Decisions' },
+    { name: 'overview', label: 'Overview', icon: '◎', blurb: 'Where the project stands and what is happening now.' },
+    { name: 'plan', label: 'Plan', icon: '▤', blurb: 'The reviewed plan: its status, findings, coverage and repairs.' },
+    { name: 'tasks', label: 'Tasks', icon: '▦', blurb: 'Every task, what it waits on, and how long agents have spent on it.' },
+    { name: 'runs', label: 'Runs', icon: '▶', blurb: 'Every dispatch, review, gate and repair an agent ran, newest first.' },
+    { name: 'decisions', label: 'Decisions', icon: '◆', blurb: 'Forks agents hit that the design did not settle, and how they were ruled.' },
 ];
 /** How often a watched step's output is re-fetched while it is still running. */
 const OUTPUT_POLL_MS = 1000;
+/** How often live durations are advanced between snapshots. */
+const TICK_MS = 1000;
 class App {
     store = new Store();
     route = { view: 'overview' };
     taskFilter = 'all';
     runFilter = 'all';
+    decisionFilter = 'all';
     // Findings default to `open`: the ones already answered are history, and the
     // question this view exists to answer is what stands against the plan now.
     findingFilter = 'open';
-    query = '';
-    nav = el('nav', { class: 'tabs', role: 'tablist' });
-    counts = el('div', { class: 'header-counts' });
+    /** The search box's text, per page: a task id typed on Tasks means nothing on Runs. */
+    queries = {};
+    nav = el('nav', { class: 'nav', 'aria-label': 'pages' });
+    counts = el('div', { class: 'side-summary' });
     conn = el('div', { class: 'conn', title: 'connection to writ serve' });
     body = el('main', { class: 'body' });
     drawer = el('aside', { class: 'drawer', 'aria-live': 'polite' });
@@ -1547,8 +1711,17 @@ class App {
     /** The step that timer is following, so a repaint does not restart it. */
     watching = null;
     async start() {
-        document.body.append(this.header(), this.body, this.drawer);
-        this.store.onSnapshot(() => this.render());
+        document.body.append(this.sidebar(), this.body, this.drawer);
+        this.store.onSnapshot(() => {
+            const current = this.store.current;
+            if (current)
+                setClockSkew(current.generated_at);
+            this.render();
+        });
+        // Live durations advance every second in place, without a repaint: a
+        // snapshot only arrives when the store changes, and an agent mid-turn
+        // changes nothing for minutes at a time.
+        window.setInterval(() => tickClocks(document), TICK_MS);
         this.store.onConnection((state) => this.paintConnection(state));
         window.addEventListener('hashchange', () => {
             this.route = parseHash(location.hash);
@@ -1610,6 +1783,8 @@ class App {
             return `run:${this.route.run}`;
         if (this.route.step)
             return `step:${this.route.step}`;
+        if (this.route.decision)
+            return `decision:${this.route.decision}`;
         return null;
     }
     /**
@@ -1631,14 +1806,28 @@ class App {
             return;
         findOpener(key)?.focus();
     }
-    header() {
-        for (const view of VIEWS) {
-            const button = el('button', { class: 'tab', type: 'button', role: 'tab' }, view.label);
+    /**
+     * The sidebar: the project at a glance, the pages, and the connection.
+     *
+     * A sidebar rather than a row of tabs because each page carries a count worth
+     * seeing from every other page — runs live, decisions to rule on — and a tab
+     * strip had no room for them without wrapping.
+     */
+    sidebar() {
+        for (const [index, view] of VIEWS.entries()) {
+            const button = el('button', { class: 'nav-item', type: 'button', title: `${view.label} (${index + 1})` }, el('span', { class: 'nav-icon', 'aria-hidden': 'true' }, view.icon), el('span', { class: 'nav-label' }, view.label), el('span', { class: 'nav-badge' }));
             button.dataset.view = view.name;
             button.addEventListener('click', () => this.go({ view: view.name }));
             this.nav.append(button);
         }
-        return el('header', { class: 'top' }, el('div', { class: 'brand' }, el('span', { class: 'wordmark' }, 'writ')), this.nav, this.counts, this.conn);
+        return el('aside', { class: 'side' }, el('div', { class: 'brand' }, el('span', { class: 'wordmark' }, 'writ'), el('span', { class: 'brand-note' }, 'dashboard')), this.counts, this.nav, el('div', { class: 'grow' }), this.conn);
+    }
+    /** The page's own title, what it is for, and what it is currently showing. */
+    pageHead(snapshot, ...aside) {
+        const view = VIEWS.find((v) => v.name === this.route.view) ?? VIEWS[0];
+        return el('header', { class: 'page-head' }, el('div', { class: 'page-title' }, el('h1', {}, view.label), el('p', { class: 'muted' }, view.blurb)), el('div', { class: 'page-aside' }, ...aside, view.name === 'overview' && snapshot.overview.project
+            ? el('span', { class: 'muted small mono' }, snapshot.overview.project)
+            : null));
     }
     go(route) {
         this.route = route;
@@ -1647,8 +1836,13 @@ class App {
     }
     render() {
         const snapshot = this.store.current;
-        for (const button of this.nav.querySelectorAll('.tab')) {
-            button.classList.toggle('active', button.dataset.view === this.route.view);
+        for (const button of this.nav.querySelectorAll('.nav-item')) {
+            const current = button.dataset.view === this.route.view;
+            button.classList.toggle('active', current);
+            if (current)
+                button.setAttribute('aria-current', 'page');
+            else
+                button.removeAttribute('aria-current');
         }
         if (!snapshot) {
             this.body.replaceChildren(el('p', { class: 'empty' }, 'Loading…'));
@@ -1722,44 +1916,52 @@ class App {
             return;
         findOpener(key)?.focus();
     }
+    /**
+     * The sidebar's summary and the count on each page's nav item.
+     *
+     * A badge is shown only for what calls for attention — agents working now,
+     * decisions nobody has ruled on, tasks that failed — so a quiet sidebar means
+     * a quiet project.
+     */
     paintCounts(snapshot) {
         const { overview } = snapshot;
-        const parts = [
-            el('span', { class: 'count' }, el('b', {}, `${overview.completed}/${overview.tasks}`), el('span', { class: 'label' }, 'done')),
-        ];
-        if (overview.live) {
-            parts.push(el('span', { class: 'count live' }, el('span', { class: 'spinner', 'aria-hidden': 'true' }), el('b', {}, String(overview.live)), el('span', { class: 'label' }, 'running')));
-        }
-        const waiting = overview.counts['awaiting-review'] ?? 0;
-        if (waiting) {
-            parts.push(el('span', { class: 'count warn' }, el('b', {}, String(waiting)), el('span', { class: 'label' }, 'to review')));
-        }
-        if (overview.proposed_decisions) {
-            const button = el('button', { class: 'count warn as-button', type: 'button' }, el('b', {}, String(overview.proposed_decisions)), el('span', { class: 'label' }, 'decisions'));
-            button.addEventListener('click', () => this.go({ view: 'decisions' }));
-            parts.push(button);
-        }
+        const done = percent(overview.completed, overview.tasks);
         const failed = overview.counts.failed ?? 0;
-        if (failed) {
-            parts.push(el('span', { class: 'count bad' }, el('b', {}, String(failed)), el('span', { class: 'label' }, 'failed')));
+        const waiting = overview.counts['awaiting-review'] ?? 0;
+        const line = (kind, value, label) => value ? el('li', { class: classes('side-count', kind) }, el('b', { class: 'tnum' }, String(value)), label) : null;
+        this.counts.replaceChildren(el('div', { class: 'side-progress' }, el('div', { class: 'side-progress-line' }, el('span', {}, 'Progress'), el('b', { class: 'tnum' }, `${overview.completed}/${overview.tasks}`)), el('div', { class: 'meter thin' }, el('div', { class: 'meter-fill', style: `width:${done}%` }))), el('ul', { class: 'side-counts' }, line('live', overview.live, 'running'), line('warn', waiting, 'to review'), line('warn', overview.proposed_decisions, 'to rule on'), line('bad', failed, 'failed')));
+        const badges = {
+            tasks: [failed, 'bad'],
+            runs: [overview.live, 'live'],
+            decisions: [overview.proposed_decisions, 'warn'],
+            plan: [overview.plan.blocking, 'bad'],
+        };
+        for (const button of this.nav.querySelectorAll('.nav-item')) {
+            const badge = button.querySelector('.nav-badge');
+            if (!badge)
+                continue;
+            const [value, kind] = badges[button.dataset.view] ?? [0, ''];
+            badge.className = classes('nav-badge', kind, !value && 'hidden');
+            badge.textContent = value ? String(value) : '';
         }
-        this.counts.replaceChildren(...parts);
     }
     paintView(snapshot) {
         const handlers = {
             onTask: (id) => this.go({ view: this.route.view, task: id }),
             onRun: (id) => this.go({ view: this.route.view, run: id }),
+            onDecision: (id) => this.go({ view: this.route.view, decision: id }),
             onGoto: (view) => this.go({ view: view }),
             onSelect: (id) => this.go({ view: this.route.view, task: id }),
             onStep: (id) => this.go({ view: this.route.view, step: id }),
         };
+        const query = this.queries[this.route.view] ?? '';
         switch (this.route.view) {
             case 'overview': {
                 // Not `.grid`: the overview lays out its own regions, and an auto-fit
                 // grid here would treat those regions as cards and column them.
                 const holder = el('div', { class: 'overview' });
                 renderOverview(holder, snapshot, handlers);
-                this.body.replaceChildren(holder);
+                this.body.replaceChildren(this.pageHead(snapshot), holder);
                 break;
             }
             case 'tasks': {
@@ -1773,41 +1975,36 @@ class App {
                 const list = el('div', { class: 'list-holder' });
                 renderTaskList(list, snapshot.tasks, {
                     filter: this.taskFilter,
-                    query: this.query,
+                    query,
                     selected: this.route.task ?? null,
                 }, { onSelect: handlers.onSelect, onRun: handlers.onRun });
-                this.body.replaceChildren(el('section', { class: 'task-graph', 'aria-label': 'dependency graph' }, el('div', { class: 'muted small graph-caption' }, `${plural(snapshot.graph.nodes.length, 'task')} · ${snapshot.graph.levels} levels deep · a column can run at once`), graph), this.toolbar(this.filterBar(Object.keys(FILTERS), this.taskFilter, (name) => {
+                this.body.replaceChildren(this.pageHead(snapshot), el('section', { class: 'card task-graph', 'aria-label': 'dependency graph' }, el('header', { class: 'card-head' }, el('h2', {}, 'Dependency graph'), el('span', { class: 'muted small' }, `${plural(snapshot.graph.nodes.length, 'task')} · ${snapshot.graph.levels} levels · a column can run at once`)), graph), el('section', { class: 'card flush' }, this.toolbar(this.filterBar(Object.keys(FILTERS), this.taskFilter, (name) => {
                     this.taskFilter = name;
                     this.render();
-                }), this.search()), list);
+                }, (name) => snapshot.tasks.filter(FILTERS[name]).length), this.search('filter by id or title')), list));
                 fitTitles(graph);
-                break;
-            }
-            case 'milestones': {
-                const holder = el('div', { class: 'grid one' });
-                renderMilestones(holder, snapshot.milestones, snapshot.tasks, handlers);
-                this.body.replaceChildren(holder);
                 break;
             }
             case 'runs': {
                 const list = el('div', { class: 'list-holder' });
                 renderRunList(list, snapshot.runs, {
                     filter: this.runFilter,
+                    query,
                     selected: this.route.run ?? null,
                 }, { onSelect: handlers.onRun, onTask: handlers.onTask });
-                this.body.replaceChildren(this.toolbar(this.filterBar(Object.keys(RUN_FILTERS), this.runFilter, (name) => {
+                this.body.replaceChildren(this.pageHead(snapshot), el('section', { class: 'card flush' }, this.toolbar(this.filterBar(Object.keys(RUN_FILTERS), this.runFilter, (name) => {
                     this.runFilter = name;
                     this.render();
-                }), el('span', { class: 'muted small' }, `${plural(snapshot.runs.length, 'run')}, newest first`)), list);
+                }, (name) => snapshot.runs.filter(RUN_FILTERS[name]).length), this.search('filter by task or run id')), list));
                 break;
             }
             case 'plan': {
                 const holder = el('div', { class: 'grid one' });
                 renderPlan(holder, snapshot.overview.plan, snapshot.findings, snapshot.coverage, snapshot.repairs, { filter: this.findingFilter, phase: snapshot.phase, step: this.route.step ?? null }, { onTask: handlers.onTask, onStep: handlers.onStep });
-                this.body.replaceChildren(this.toolbar(this.filterBar(Object.keys(FINDING_FILTERS), this.findingFilter, (name) => {
+                this.body.replaceChildren(this.pageHead(snapshot, el('span', { class: classes('pill', snapshot.overview.plan.status) }, snapshot.overview.plan.status), el('span', { class: 'muted small' }, `revision ${snapshot.overview.plan.revision}`)), this.toolbar(el('span', { class: 'toolbar-label' }, 'Findings'), this.filterBar(Object.keys(FINDING_FILTERS), this.findingFilter, (name) => {
                     this.findingFilter = name;
                     this.render();
-                }), el('span', { class: 'muted small' }, `revision ${snapshot.overview.plan.revision}`)), holder);
+                }, (name) => snapshot.findings.filter(FINDING_FILTERS[name]).length)), holder);
                 // After it is in the document: `getComputedTextLength` is zero for an SVG
                 // that has not been laid out, so clipping before the swap would measure
                 // nothing and clip nothing.
@@ -1815,9 +2012,16 @@ class App {
                 break;
             }
             case 'decisions': {
-                const holder = el('div', { class: 'grid one' });
-                renderDecisions(holder, snapshot.decisions);
-                this.body.replaceChildren(holder);
+                const list = el('div', { class: 'list-holder' });
+                renderDecisions(list, snapshot.decisions, {
+                    filter: this.decisionFilter,
+                    query,
+                    selected: this.route.decision ?? null,
+                }, { onSelect: handlers.onDecision, onTask: handlers.onTask });
+                this.body.replaceChildren(this.pageHead(snapshot), el('section', { class: 'card flush' }, this.toolbar(this.filterBar(Object.keys(DECISION_FILTERS), this.decisionFilter, (name) => {
+                    this.decisionFilter = name;
+                    this.render();
+                }, (name) => snapshot.decisions.filter(DECISION_FILTERS[name]).length), this.search('filter by id, title or task')), list));
                 break;
             }
         }
@@ -1825,25 +2029,31 @@ class App {
     toolbar(...children) {
         return el('div', { class: 'toolbar' }, ...children.filter(Boolean));
     }
-    filterBar(names, active, pick) {
+    /**
+     * A segmented control of filters, each with how many it would show, so a
+     * reader can see there are three failures before choosing to look at them.
+     */
+    filterBar(names, active, pick, count) {
         const bar = el('div', { class: 'filters', role: 'group' });
         for (const name of names) {
-            const button = el('button', { class: classes('filter', name === active && 'active'), type: 'button' }, name);
+            const n = count ? count(name) : null;
+            const button = el('button', { class: classes('filter', name === active && 'active', n === 0 && 'none'), type: 'button' }, name, n !== null ? el('span', { class: 'filter-count tnum' }, String(n)) : null);
             button.addEventListener('click', () => pick(name));
             bar.append(button);
         }
         return bar;
     }
-    search() {
+    search(placeholder) {
+        const view = this.route.view;
         const input = el('input', {
             class: 'search',
             type: 'search',
-            placeholder: 'filter by id or title',
-            value: this.query,
-            'aria-label': 'filter tasks',
+            placeholder,
+            value: this.queries[view] ?? '',
+            'aria-label': placeholder,
         });
         input.addEventListener('input', () => {
-            this.query = input.value;
+            this.queries[view] = input.value;
             this.render();
             // Re-rendering replaces the input, so put the cursor back where it was.
             const fresh = this.body.querySelector('.search');
@@ -1859,8 +2069,8 @@ class App {
      * during a run — its criteria fill in as the agent reports them.
      */
     paintDrawer() {
-        const { task, run, step } = this.route;
-        if (!task && !run && !step) {
+        const { task, run, step, decision } = this.route;
+        if (!task && !run && !step && !decision) {
             this.stopFollowing();
             this.drawer.classList.remove('open');
             this.drawer.replaceChildren();
@@ -1881,6 +2091,18 @@ class App {
         };
         if (step) {
             this.paintStep(step, close);
+            return;
+        }
+        if (decision) {
+            // Already in the snapshot, whole: nothing to fetch.
+            const found = this.store.current?.decisions.find((entry) => entry.id === decision);
+            if (!found) {
+                this.drawer.replaceChildren(close, el('p', { class: 'muted' }, `No decision ${decision}.`));
+                return;
+            }
+            const holder = el('div', { class: 'detail' });
+            renderDecisionDetail(holder, found, { onSelect: () => undefined, onTask: handlers.onTask });
+            this.drawer.replaceChildren(close, holder);
             return;
         }
         if (run) {
@@ -2028,7 +2250,7 @@ class App {
     onKey(event) {
         if (event.target instanceof HTMLInputElement)
             return;
-        if (event.key === 'Escape' && (this.route.task || this.route.run || this.route.step)) {
+        if (event.key === 'Escape' && this.detailKey() !== null) {
             this.dismiss();
             return;
         }
@@ -2058,6 +2280,8 @@ function parseHash(hash) {
         return { view: known, run: decodeURIComponent(id) };
     if (kind === 'step' && id)
         return { view: known, step: decodeURIComponent(id) };
+    if (kind === 'decision' && id)
+        return { view: known, decision: decodeURIComponent(id) };
     return { view: known };
 }
 function toHash(route) {
@@ -2067,6 +2291,8 @@ function toHash(route) {
         return `#/${route.view}/run/${encodeURIComponent(route.run)}`;
     if (route.step)
         return `#/${route.view}/step/${encodeURIComponent(route.step)}`;
+    if (route.decision)
+        return `#/${route.view}/decision/${encodeURIComponent(route.decision)}`;
     return `#/${route.view}`;
 }
 void new App().start();

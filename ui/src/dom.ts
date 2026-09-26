@@ -8,6 +8,8 @@
  * a task title containing `<script>` is text, not markup.
  */
 
+import { duration, elapsed, serverNow } from './format.js';
+
 type Attrs = Record<string, string | number | boolean | undefined>;
 type Child = Node | string | null | undefined | false;
 
@@ -79,4 +81,52 @@ export function replace(node: Element, ...children: Child[]): void {
   node.replaceChildren(
     ...children.filter((child): child is Node | string => child !== null && child !== undefined && child !== false),
   );
+}
+
+/**
+ * Make a row open something on click, Enter or Space.
+ *
+ * `opens` is the detail key the drawer hands focus back to when it closes; see
+ * `findOpener` in app.ts for why it is looked up rather than remembered.
+ */
+export function activate(node: HTMLElement | SVGElement, opens: string | null, run: () => void): void {
+  node.setAttribute('tabindex', '0');
+  node.setAttribute('role', 'button');
+  if (opens) node.setAttribute('data-opens', opens);
+  node.addEventListener('click', run);
+  node.addEventListener('keydown', (event) => {
+    const key = (event as KeyboardEvent).key;
+    if (key === 'Enter' || key === ' ') {
+      event.preventDefault();
+      run();
+    }
+  });
+}
+
+/**
+ * A duration that keeps counting while its run is live.
+ *
+ * `base` is the seconds already spent, `since` the start of the run still going
+ * (or null). The figure is written now and then refreshed by `tickClocks` every
+ * second, in place, so a live task's time moves without a snapshot having to
+ * arrive — and without a repaint that would cost a reader their scroll or focus.
+ */
+export function liveClock(base: number | null, since: string | null, empty = '—'): HTMLElement {
+  const node = el('span', { class: classes('clock', !!since && 'ticking') });
+  if (since) {
+    node.dataset.tickBase = String(base ?? 0);
+    node.dataset.tickSince = since;
+  }
+  const seconds = since ? elapsed(base ?? 0, since, serverNow()) : base;
+  node.textContent = seconds ? duration(seconds) : since ? '<1s' : empty;
+  return node;
+}
+
+/** Refresh every live clock under `root`. SVG text works the same way. */
+export function tickClocks(root: ParentNode): void {
+  const now = serverNow();
+  for (const node of root.querySelectorAll<HTMLElement | SVGElement>('[data-tick-since]')) {
+    const base = Number(node.dataset.tickBase ?? 0);
+    node.textContent = duration(elapsed(base, node.dataset.tickSince, now)) || '<1s';
+  }
 }

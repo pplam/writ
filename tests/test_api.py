@@ -68,11 +68,6 @@ def test_task_detail_matches_the_typescript_interface(worked):
     assert set(api.task(data, "M01-001")) == declared_fields("Task")
 
 
-def test_milestone_row_matches_the_typescript_interface(worked):
-    data = state.load(worked)
-    assert set(api.milestones(data)[0]) == declared_fields("MilestoneRow")
-
-
 def test_graph_matches_the_typescript_interface(worked):
     data = state.load(worked)
     graph = api.graph(data)

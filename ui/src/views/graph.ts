@@ -8,7 +8,7 @@
  */
 
 import { classes, clear, svg } from '../dom.js';
-import { isLive, mark, ratio } from '../format.js';
+import { duration, elapsed, isLive, mark, ratio, serverNow } from '../format.js';
 import type { Graph, GraphEdge, GraphNode } from '../types.js';
 
 const W = 200;
@@ -74,12 +74,16 @@ function drawNode(
   group.append(svg('rect', { class: 'box', width: W, height: H, rx: 8 }));
   group.append(svg('text', { class: 'node-mark', x: 11, y: 19 }, mark(node.status)));
   group.append(svg('text', { class: 'node-id', x: 26, y: 19 }, node.id));
-  group.append(
-    svg('text', { class: 'node-count', x: W - 11, y: 19, 'text-anchor': 'end' },
-      ratio(node.passed, node.total)),
-  );
+  group.append(timeLabel(node));
   group.append(svg('text', { class: 'node-title', x: 11, y: 38 }, node.title));
-  group.append(svg('text', { class: 'node-status', x: 11, y: 54 }, node.status));
+  const criteria = ratio(node.passed, node.total);
+  group.append(
+    svg('text', { class: 'node-status', x: 11, y: 54 },
+      node.kind === 'gate' ? `gate · ${node.status}` : node.status),
+  );
+  if (criteria) {
+    group.append(svg('text', { class: 'node-count', x: W - 11, y: 54, 'text-anchor': 'end' }, criteria));
+  }
 
   if (node.total) {
     group.append(svg('rect', { class: 'track', x: 11, y: H - 7, width: W - 22, height: 3, rx: 1.5 }));
@@ -107,8 +111,35 @@ function drawNode(
   return group;
 }
 
+/**
+ * Time agents have spent on the task, top right where the eye lands after the id.
+ *
+ * A live one carries the same data attributes as `liveClock`, so the app's
+ * one-second ticker counts it up in place rather than it jumping at each snapshot.
+ */
+function timeLabel(node: GraphNode): SVGElement {
+  const text = svg('text', {
+    class: classes('node-time', node.live_since !== null && 'ticking'),
+    x: W - 11,
+    y: 19,
+    'text-anchor': 'end',
+  });
+  if (node.live_since) {
+    text.dataset.tickBase = String(node.agent_seconds);
+    text.dataset.tickSince = node.live_since;
+    text.textContent = duration(elapsed(node.agent_seconds, node.live_since, serverNow())) || '<1s';
+  } else {
+    text.textContent = node.agent_seconds ? duration(node.agent_seconds) : '';
+  }
+  return text;
+}
+
 function tooltip(node: GraphNode): string {
   const lines = [`${node.id}  ${node.title}`, node.status];
+  if (node.agent_seconds || node.live_since) {
+    const spent = elapsed(node.agent_seconds, node.live_since, serverNow());
+    lines.push(`${duration(spent)} in agents over ${node.runs} run${node.runs === 1 ? '' : 's'}`);
+  }
   if (node.total) lines.push(`${node.passed}/${node.total} acceptance criteria`);
   if (node.depends_on.length) lines.push(`after: ${node.depends_on.join(', ')}`);
   if (node.blocked_by.length) lines.push(`waiting on: ${node.blocked_by.join(', ')}`);

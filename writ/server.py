@@ -162,8 +162,6 @@ class _Handler(BaseHTTPRequestHandler):
             return api.runs(data)
         if parts == ["decisions"]:
             return api.decisions(data)
-        if parts == ["milestones"]:
-            return api.milestones(data)
         if parts == ["graph"]:
             return api.graph(data)
         if parts == ["phase"]:
@@ -172,8 +170,6 @@ class _Handler(BaseHTTPRequestHandler):
             return api.activity(data)
         if len(parts) == 2 and parts[0] == "task":
             return api.task(data, parts[1])
-        if len(parts) == 2 and parts[0] == "milestone":
-            return api.milestone(data, parts[1])
         # A run id is its folder, `FT-002/02-review`, so the client encodes the
         # slash and it arrives as one segment to unquote.
         if len(parts) == 2 and parts[0] == "run":

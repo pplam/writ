@@ -12,7 +12,7 @@ from that snapshot, so a page cannot paint a task as running from one read and
 its run as finished from another.
 
 **Derived state is derived here, not in the browser.** `ready` is computed from
-dependencies, milestone progress from its tasks, durations from timestamps. The
+dependencies, durations from timestamps. The
 alternative is reimplementing writ's rules in TypeScript and having them drift.
 """
 
@@ -41,7 +41,6 @@ from .model import (
     blocked_on,
     blocking_dependencies,
     effective_status,
-    milestone_tasks,
     open_rework,
     rework_attempts,
 )
@@ -93,7 +92,6 @@ def overview(data: dict[str, Any]) -> dict[str, Any]:
         "tasks": len(tasks),
         "completed": counts.get("completed", 0),
         "live": counts.get("running", 0) + counts.get("reviewing", 0),
-        "milestones": [_milestone_row(data, m) for m in _sorted_milestones(data)],
         "active_runs": [_run_row(run) for run in sorted(active, key=_run_key)],
         "proposed_decisions": sum(
             1 for d in data.get("decisions", []) if d.get("status") == "proposed"
@@ -285,47 +283,6 @@ def _median(values: list[float]) -> float:
     return (ordered[middle - 1] + ordered[middle]) / 2
 
 
-# ---------------------------------------------------------------- milestones
-
-
-def milestones(data: dict[str, Any]) -> list[dict[str, Any]]:
-    return [_milestone_row(data, m) for m in _sorted_milestones(data)]
-
-
-def milestone(data: dict[str, Any], milestone_id: str) -> dict[str, Any]:
-    found = data["milestones"].get(milestone_id)
-    if found is None:
-        raise KeyError(milestone_id)
-    row = _milestone_row(data, found)
-    row["tasks"] = [
-        task_row(data, task) for task in milestone_tasks(data, milestone_id)
-    ]
-    row["design_section"] = found.get("design_section") or ""
-    row["notes"] = found.get("notes") or ""
-    return row
-
-
-def _sorted_milestones(data: dict[str, Any]) -> list[dict[str, Any]]:
-    return sorted(data["milestones"].values(), key=lambda m: m["id"])
-
-
-def _milestone_row(data: dict[str, Any], found: dict[str, Any]) -> dict[str, Any]:
-    tasks = milestone_tasks(data, found["id"])
-    done = sum(1 for task in tasks if task["status"] == "completed")
-    statuses: dict[str, int] = {}
-    for task in tasks:
-        status = _status(data, task)
-        statuses[status] = statuses.get(status, 0) + 1
-    return {
-        "id": found["id"],
-        "title": found.get("title", ""),
-        "status": found.get("status", ""),
-        "done": done,
-        "total": len(tasks),
-        "counts": statuses,
-    }
-
-
 # ---------------------------------------------------------------- tasks
 
 
@@ -342,12 +299,11 @@ def task_row(data: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": task["id"],
         "title": task.get("title", ""),
-        "milestone": task.get("milestone", ""),
         "status": _status(data, task),
         "stored_status": task["status"],
         # `task` or `gate`. A reader almost always wants one or the other, and a
-        # graph that drew them identically would hide the fact that the node
-        # holding up the milestone writes no code.
+        # graph that drew them identically would hide the fact that a node
+        # holding up the plan writes no code.
         "kind": task.get("kind", "task"),
         "requirement_ids": task.get("requirement_ids", []),
         "passed": counts["passed"],
@@ -366,7 +322,40 @@ def task_row(data: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
         # situation, and the row is where that has to show.
         "rework_attempts": rework_attempts(task),
         "awaiting_rework": open_rework(task) is not None,
+        **_timing(data, task),
     }
+
+
+def _timing(data: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
+    """How long agents have spent on a task, split so a page can keep counting.
+
+    `agent_seconds` is the finished runs only. A live run is reported by when it
+    started instead, because a figure computed here goes stale the moment it is
+    sent: the page adds the time since `live_since` itself, every second, so a
+    running task's clock moves between snapshots rather than jumping at each one.
+    """
+    found = [data["runs"][run_id] for run_id in task.get("runs", []) if run_id in data["runs"]]
+    finished = 0.0
+    live_since = None
+    for item in found:
+        if item["status"] in runner.ACTIVE_RUN_STATUSES:
+            if item.get("started_at") and (live_since is None or item["started_at"] < live_since):
+                live_since = item["started_at"]
+            continue
+        finished += _duration(item) or 0.0
+    starts = [item["started_at"] for item in found if item.get("started_at")]
+    ends = [item["finished_at"] for item in found if item.get("finished_at")]
+    return {
+        "agent_seconds": round(finished, 1),
+        "live_since": live_since,
+        "started_at": min(starts) if starts else None,
+        "finished_at": max(ends) if ends and live_since is None else None,
+    }
+
+
+#: What each run role is called on a page. `agent` is the implementer, and
+#: "dispatch" is the word the terminal already uses for sending one.
+ROLE_LABELS = {"agent": "dispatch", "reviewer": "review", "gate": "gate", "repair": "repair"}
 
 
 def task(data: dict[str, Any], task_id: str) -> dict[str, Any]:
@@ -919,7 +908,7 @@ def activity(data: dict[str, Any], *, limit: int = 60) -> list[dict[str, Any]]:
     """
     events: list[dict[str, Any]] = []
     for run in data["runs"].values():
-        verb = "review" if run.get("role") == "reviewer" else "dispatch"
+        verb = ROLE_LABELS.get(run.get("role", "agent"), run.get("role", "agent"))
         if run.get("started_at"):
             events.append(
                 {
@@ -928,6 +917,7 @@ def activity(data: dict[str, Any], *, limit: int = 60) -> list[dict[str, Any]]:
                     "text": f"{verb} {run['task']}",
                     "task": run.get("task", ""),
                     "run": run["id"],
+                    "role": run.get("role", "agent"),
                     "status": "running",
                 }
             )
@@ -941,6 +931,7 @@ def activity(data: dict[str, Any], *, limit: int = 60) -> list[dict[str, Any]]:
                     "text": f"{run['task']} {outcome}",
                     "task": run.get("task", ""),
                     "run": run["id"],
+                    "role": run.get("role", "agent"),
                     "status": outcome,
                     "summary": reported.get("summary", ""),
                     "exit_code": run.get("exit_code"),
@@ -976,7 +967,6 @@ def everything(root: Path) -> dict[str, Any]:
     data = state.load(root)
     return {
         "overview": overview(data),
-        "milestones": milestones(data),
         "tasks": tasks(data),
         "runs": runs(data),
         "decisions": decisions(data),

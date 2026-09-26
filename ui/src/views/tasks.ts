@@ -7,9 +7,9 @@
  * supposed to prove, and what has it proved so far".
  */
 
-import { classes, code, el, replace } from '../dom.js';
-import { ago, isLive, mark, ratio, statusWeight } from '../format.js';
-import type { Acceptance, Task, TaskRow } from '../types.js';
+import { activate, classes, code, el, liveClock, replace } from '../dom.js';
+import { ago, isLive, mark, percent, ratio, roleLabel, stamp, statusWeight } from '../format.js';
+import type { Acceptance, RunRow, Task, TaskRow } from '../types.js';
 
 export interface TaskHandlers {
   onSelect(id: string): void;
@@ -44,45 +44,89 @@ export function renderTaskList(
     )
     .sort((a, b) => statusWeight(a.status) - statusWeight(b.status) || a.id.localeCompare(b.id));
 
+  if (!rows.length) {
+    replace(host, el('p', { class: 'empty' }, tasks.length ? 'No tasks match.' : 'No tasks yet.'));
+    return;
+  }
   replace(host,
-    rows.length
-      ? el('ul', { class: 'task-list' }, ...rows.map((t) => taskRow(t, t.id === options.selected, handlers)))
-      : el('p', { class: 'empty' }, 'No tasks match.'),
+    el(
+      'table',
+      { class: 'data-table task-table' },
+      el(
+        'thead',
+        {},
+        el(
+          'tr',
+          {},
+          el('th', { class: 'col-mark' }),
+          el('th', { class: 'col-id' }, 'Task'),
+          el('th', {}, 'Title'),
+          el('th', { class: 'col-status' }, 'Status'),
+          el('th', { class: 'col-criteria' }, 'Criteria'),
+          el('th', { class: 'col-num' }, 'Runs'),
+          el('th', { class: 'col-num' }, 'Agent time'),
+          el('th', { class: 'col-when' }, 'Last run'),
+        ),
+      ),
+      el('tbody', {}, ...rows.map((t) => taskRow(t, t.id === options.selected, handlers))),
+    ),
   );
 }
 
 function taskRow(task: TaskRow, isSelected: boolean, handlers: TaskHandlers): HTMLElement {
+  const live = isLive(task.status);
   const row = el(
-    'li',
-    {
-      class: classes('task-row', task.status, isLive(task.status) && 'live', isSelected && 'selected'),
-      tabindex: 0,
-      role: 'button',
-      // What this row opens. The drawer hands focus back here when dismissed, and
-      // it cannot hold the element itself: opening re-renders the list, so the
-      // node that was clicked is gone by the time the drawer is on screen.
-      'data-opens': `task:${task.id}`,
-    },
-    el('span', { class: 'mark' }, mark(task.status)),
-    code(task.id),
-    el('span', { class: 'title' }, task.title),
-    el('span', { class: 'grow' }),
-    task.blocked_by.length
-      ? el('span', { class: 'muted small', title: `waiting on ${task.blocked_by.join(', ')}` },
-          `waits on ${task.blocked_by.length}`)
-      : null,
-    el('span', { class: 'muted mono' }, ratio(task.passed, task.total)),
-    el('span', { class: classes('pill', task.status) }, task.status),
+    'tr',
+    { class: classes('task-row', task.status, live && 'live', isSelected && 'selected') },
+    el('td', { class: 'col-mark' }, live
+      ? el('span', { class: 'spinner', 'aria-hidden': 'true' })
+      : el('span', { class: classes('mark', task.status) }, mark(task.status))),
+    el('td', { class: 'col-id' }, code(task.id)),
+    el(
+      'td',
+      { class: 'col-title' },
+      el(
+        'div',
+        { class: 'cell-title' },
+        el('span', { class: 'clip' }, task.title),
+        task.kind === 'gate' ? el('span', { class: 'tag' }, 'gate') : null,
+        task.rework_attempts
+          ? el('span', { class: 'tag warn', title: 'times a reviewer sent it back' },
+              `rework ${task.rework_attempts}`)
+          : null,
+        task.blocked_by.length
+          ? el('span', { class: 'tag', title: `waiting on ${task.blocked_by.join(', ')}` },
+              `waits on ${task.blocked_by.length}`)
+          : null,
+      ),
+    ),
+    el('td', { class: 'col-status' }, el('span', { class: classes('pill', task.status) }, task.status)),
+    el('td', { class: 'col-criteria' }, criteriaMeter(task.passed, task.total)),
+    el('td', { class: 'col-num tnum' }, task.runs ? String(task.runs) : '—'),
+    el('td', { class: 'col-num tnum' }, liveClock(task.agent_seconds, task.live_since)),
+    el(
+      'td',
+      { class: 'col-when muted', title: task.finished_at ?? task.started_at ?? '' },
+      task.live_since ? 'now' : ago(task.finished_at ?? task.started_at) || '—',
+    ),
   );
-  const select = () => handlers.onSelect(task.id);
-  row.addEventListener('click', select);
-  row.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter' || event.key === ' ') {
-      event.preventDefault();
-      select();
-    }
-  });
+  // What this row opens. The drawer hands focus back here when dismissed, and
+  // it cannot hold the element itself: opening re-renders the list, so the
+  // node that was clicked is gone by the time the drawer is on screen.
+  activate(row, `task:${task.id}`, () => handlers.onSelect(task.id));
   return row;
+}
+
+/** A small bar and the count beside it, so a column of them reads at a glance. */
+function criteriaMeter(passed: number, total: number): HTMLElement {
+  if (!total) return el('span', { class: 'muted' }, '—');
+  return el(
+    'div',
+    { class: 'mini-meter' },
+    el('div', { class: 'meter thin' },
+      el('div', { class: 'meter-fill', style: `width:${percent(passed, total)}%` })),
+    el('span', { class: 'tnum' }, ratio(passed, total)),
+  );
 }
 
 export function renderTaskDetail(
@@ -204,7 +248,7 @@ function section(
 
 /**
  * Where this task came from. Rendered as discrete labelled items: these used to
- * be bare spans separated only by a flex gap, so a milestone id ran straight
+ * be bare spans separated only by a flex gap, so a task's kind ran straight
  * into a design section and then into a file path with nothing to show where
  * one ended and the next began.
  */
@@ -220,7 +264,11 @@ function metaRow(task: Task): HTMLElement {
     );
 
   const bits: HTMLElement[] = [];
-  if (task.milestone) bits.push(item('milestone', code(task.milestone)));
+  bits.push(item('kind', task.kind));
+  if (task.agent_seconds || task.live_since) {
+    bits.push(item('agent time', liveClock(task.agent_seconds, task.live_since)));
+  }
+  if (task.started_at) bits.push(item('started', stamp(task.started_at)));
   if (task.design_section) bits.push(item('section', task.design_section));
   if (task.design_doc) bits.push(item('design', basename(task.design_doc), true));
   bits.push(item('updated', ago(task.updated_at)));
@@ -325,35 +373,49 @@ function dependencySection(task: Task): HTMLElement | null {
   );
 }
 
+/**
+ * Every run on this task, oldest first, as a timeline.
+ *
+ * Oldest first because the order is the story: a dispatch, its review, a
+ * rejection, the rework, the review that accepted it. Each row says which of
+ * those it was, so the reviews are findable from the task they judged.
+ */
 function runSection(task: Task, handlers: TaskHandlers): HTMLElement {
   if (!task.run_list.length) {
     return section('Runs', null, el('p', { class: 'blank' }, 'Never dispatched.'));
   }
+  const reviews = task.run_list.filter((run) => run.role === 'reviewer').length;
   return section(
     'Runs',
-    String(task.run_list.length),
+    `${task.run_list.length}${reviews ? ` · ${reviews} review${reviews === 1 ? '' : 's'}` : ''}`,
+    el('ol', { class: 'timeline' }, ...task.run_list.map((run) => timelineRow(run, handlers))),
+  );
+}
+
+function timelineRow(run: RunRow, handlers: TaskHandlers): HTMLElement {
+  const live = isLive(run.status);
+  const outcome = run.decision || (run.status === 'completed' ? run.resulting_status : run.status);
+  const row = el(
+    'li',
+    { class: classes('timeline-row', run.status, live && 'live') },
+    el('span', { class: classes('role', run.role) }, roleLabel(run.role)),
     el(
-      'ul',
-      { class: 'run-list' },
-      ...[...task.run_list].reverse().map((run) => {
-        const row = el(
-          'li',
-          {
-            class: classes('run-row', run.status, isLive(run.status) && 'live', 'clickable'),
-            'data-opens': `run:${run.id}`,
-          },
-          el('span', { class: classes('mark', run.status) }, mark(run.status)),
-          el('span', { class: 'verb' }, run.role === 'reviewer' ? 'review' : 'dispatch'),
-          el('span', { class: 'grow' }),
-          run.decision ? el('span', { class: classes('pill', run.decision) }, run.decision) : null,
-          el('span', { class: 'muted mono small clip' }, run.model || run.command),
-          el('span', { class: 'muted small tnum', title: run.started_at ?? '' }, ago(run.started_at)),
-        );
-        row.addEventListener('click', () => handlers.onRun(run.id));
-        return row;
-      }),
+      'div',
+      { class: 'timeline-body' },
+      el(
+        'div',
+        { class: 'timeline-line' },
+        outcome ? el('span', { class: classes('pill', outcome) }, outcome) : null,
+        el('span', { class: 'muted mono small clip' }, run.model || run.command),
+        el('span', { class: 'grow' }),
+        el('span', { class: 'tnum small' }, liveClock(live ? 0 : run.duration, live ? run.started_at : null)),
+        el('span', { class: 'muted small tnum', title: run.started_at ?? '' }, stamp(run.started_at)),
+      ),
+      run.summary ? el('p', { class: 'timeline-summary' }, run.summary) : null,
     ),
   );
+  activate(row, `run:${run.id}`, () => handlers.onRun(run.id));
+  return row;
 }
 
 /**

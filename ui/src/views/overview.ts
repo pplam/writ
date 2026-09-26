@@ -1,13 +1,10 @@
 /**
  * The overview: where the project stands, what is happening now, what it cost.
  *
- * Laid out as two regions rather than a bag of equal cards, because the cards
- * are not equal shapes. Progress, live agents, decisions and throughput are
- * fixed-height summaries; milestones and activity are lists that grow with the
- * project. Flowing all six through one `auto-fit` grid gave the timeline a
- * third of the width and made it eight hundred pixels tall while two thirds of
- * the row sat empty. So: a summary band across the top, then a two-column split
- * with the lists side by side.
+ * A strip of headline figures across the top, then a two-column split: the
+ * volatile things on the left (agents working now, what is waiting on a human)
+ * and the record on the right (activity). Each figure in the strip links to the
+ * view that explains it, so the overview is also the way into everything else.
  *
  * Ordered by what a reader needs first. Live agents come before totals because
  * during a run that is the only volatile thing on the page; proposed decisions
@@ -15,13 +12,14 @@
  * clear, so a project can sit there quietly blocked on a human.
  */
 
-import { classes, code, el, replace } from '../dom.js';
-import { ago, clock, duration, isLive, mark, percent, plural, ratio } from '../format.js';
-import type { ActivityEvent, MilestoneRow, Overview, RunRow, Snapshot } from '../types.js';
+import { activate, classes, code, el, liveClock, replace } from '../dom.js';
+import { ago, clock, duration, isLive, mark, percent, plural, roleLabel } from '../format.js';
+import type { ActivityEvent, Overview, RunRow, Snapshot } from '../types.js';
 
 export interface OverviewHandlers {
   onTask(id: string): void;
   onRun(id: string): void;
+  onDecision(id: string): void;
   onGoto(view: string): void;
 }
 
@@ -45,23 +43,76 @@ export function renderOverview(
   const { overview } = snapshot;
   replace(
     host,
-    el(
-      'div',
-      { class: 'ov-band' },
-      progressCard(overview),
-      liveCard(overview, handlers),
-      attentionCard(overview, handlers),
-    ),
+    kpiStrip(overview, handlers),
     el(
       'div',
       { class: 'ov-split' },
       el(
         'div',
         { class: 'ov-column' },
-        milestonesCard(overview, handlers),
-        throughputCard(overview),
+        liveCard(overview, handlers),
+        attentionCard(overview, handlers),
+        statusBreakdown(overview),
       ),
       activityCard(snapshot.activity, handlers),
+    ),
+  );
+}
+
+/**
+ * The headline figures. Each is a button to the view that holds the detail
+ * behind it: the number is the question, the view is the answer.
+ */
+function kpiStrip(overview: Overview, handlers: OverviewHandlers): HTMLElement {
+  const t = overview.throughput;
+  const done = percent(overview.completed, overview.tasks);
+  const kpi = (
+    label: string,
+    value: Node | string,
+    note: Node | string | null,
+    view: string,
+    kind?: string,
+  ) => {
+    const node = el(
+      'button',
+      { class: classes('kpi', kind), type: 'button' },
+      el('span', { class: 'kpi-label' }, label),
+      el('span', { class: 'kpi-value' }, value),
+      note ? el('span', { class: 'kpi-note' }, note) : null,
+    );
+    node.addEventListener('click', () => handlers.onGoto(view));
+    return node;
+  };
+  return el(
+    'div',
+    { class: 'kpis' },
+    kpi(
+      'Progress',
+      `${done}%`,
+      el(
+        'span',
+        { class: 'kpi-meter' },
+        el('span', { class: 'meter thin' }, el('span', { class: 'meter-fill', style: `width:${done}%` })),
+        `${overview.completed}/${overview.tasks} tasks`,
+      ),
+      'tasks',
+    ),
+    kpi('Working now', String(overview.live), overview.live ? 'agents running' : 'idle', 'runs', overview.live ? 'live' : undefined),
+    kpi(
+      'To rule on',
+      String(overview.proposed_decisions),
+      'proposed decisions',
+      'decisions',
+      overview.proposed_decisions ? 'warn' : undefined,
+    ),
+    kpi('Runs', String(t.runs), `${t.reviews} review${t.reviews === 1 ? '' : 's'} · ${t.rejected} rejected`, 'runs'),
+    kpi('Agent time', duration(t.agent_seconds) || '0s', `median run ${duration(t.median_seconds) || '—'}`, 'runs'),
+    kpi(
+      'Failures',
+      String(t.failures),
+      t.failures ? 'runs that failed' : 'none',
+      'runs',
+      t.failures ? 'bad' : undefined,
     ),
   );
 }
@@ -89,41 +140,6 @@ function countedCard(
   );
 }
 
-function progressCard(overview: Overview): HTMLElement {
-  const done = percent(overview.completed, overview.tasks);
-  return el(
-    'section',
-    { class: 'card ov-progress' },
-    el('h2', {}, 'Progress'),
-    el(
-      'div',
-      { class: 'headline' },
-      el('span', { class: 'big' }, `${done}%`),
-      el(
-        'span',
-        { class: 'muted' },
-        `${overview.completed} of ${plural(overview.tasks, 'task')} complete`,
-      ),
-    ),
-    el('div', { class: 'meter' }, el('div', { class: 'meter-fill', style: `width:${done}%` })),
-    el(
-      'ul',
-      { class: 'chips' },
-      ...STATUS_ORDER.filter(
-        (status) => overview.counts[status as keyof typeof overview.counts],
-      ).map((status) =>
-        el(
-          'li',
-          { class: classes('chip', status) },
-          el('span', { class: 'chip-mark' }, mark(status)),
-          el('b', {}, String(overview.counts[status as keyof typeof overview.counts])),
-          el('span', { class: 'chip-label' }, status),
-        ),
-      ),
-    ),
-  );
-}
-
 function liveCard(overview: Overview, handlers: OverviewHandlers): HTMLElement {
   const rows = overview.active_runs;
   return countedCard(
@@ -140,13 +156,13 @@ function liveRow(run: RunRow, handlers: OverviewHandlers): HTMLElement {
     'li',
     { class: 'run-row live' },
     el('span', { class: 'spinner', 'aria-hidden': 'true' }),
-    el('button', { class: 'link', type: 'button', 'data-opens': `task:${run.task}` }, run.task),
-    el('span', { class: 'verb' }, run.role === 'reviewer' ? 'review' : 'dispatch'),
+    el('span', { class: classes('role', run.role) }, roleLabel(run.role)),
+    code(run.task),
     el('span', { class: 'grow' }),
     el('span', { class: 'muted mono small clip' }, run.model || run.command),
-    el('span', { class: 'muted tnum', title: run.started_at ?? '' }, duration(run.duration)),
+    el('span', { class: 'tnum' }, liveClock(0, run.started_at)),
   );
-  row.querySelector('button')?.addEventListener('click', () => handlers.onTask(run.task));
+  activate(row, `run:${run.id}`, () => handlers.onRun(run.id));
   return row;
 }
 
@@ -194,72 +210,39 @@ function attentionCard(overview: Overview, handlers: OverviewHandlers): HTMLElem
   );
 }
 
-function throughputCard(overview: Overview): HTMLElement {
-  const t = overview.throughput;
-  const stat = (label: string, value: string, hint?: string) =>
-    el(
-      'div',
-      { class: 'stat' },
-      el('span', { class: 'stat-value' }, value),
-      el('span', { class: 'stat-label' }, label),
-      hint ? el('span', { class: 'stat-hint' }, hint) : null,
-    );
+/** How the tasks divide by status, as one stacked bar and its legend. */
+function statusBreakdown(overview: Overview): HTMLElement {
+  const present = STATUS_ORDER.filter((status) => overview.counts[status as keyof typeof overview.counts]);
+  const count = (status: string) => overview.counts[status as keyof typeof overview.counts] ?? 0;
   return card(
-    'Agent work',
+    'Tasks by status',
+    overview.tasks
+      ? el(
+          'div',
+          { class: 'stack-bar' },
+          ...present.map((status) =>
+            el('span', {
+              class: classes('stack-seg', status),
+              title: `${count(status)} ${status}`,
+              style: `width:${percent(count(status), overview.tasks)}%`,
+            }),
+          ),
+        )
+      : null,
     el(
-      'div',
-      { class: 'stats' },
-      stat('runs', String(t.runs)),
-      stat('in agents', duration(t.agent_seconds)),
-      stat('median run', duration(t.median_seconds)),
-      stat('reviews', String(t.reviews), t.reviews ? `${t.rejected} rejected` : undefined),
-      stat('failed', String(t.failures)),
+      'ul',
+      { class: 'chips' },
+      ...present.map((status) =>
+        el(
+          'li',
+          { class: classes('chip', status) },
+          el('span', { class: 'chip-mark' }, mark(status)),
+          el('b', {}, String(count(status))),
+          el('span', { class: 'chip-label' }, status),
+        ),
+      ),
     ),
   );
-}
-
-function milestonesCard(overview: Overview, handlers: OverviewHandlers): HTMLElement {
-  const button = el('button', { class: 'link small', type: 'button' }, 'all milestones');
-  button.addEventListener('click', () => handlers.onGoto('milestones'));
-  return el(
-    'section',
-    { class: 'card' },
-    el('h2', {}, 'Milestones', el('span', { class: 'grow' }), button),
-    overview.milestones.length
-      ? el(
-          'ul',
-          { class: 'milestone-list' },
-          ...overview.milestones.map((m) => milestoneRow(m, handlers)),
-        )
-      : el('p', { class: 'blank' }, 'No milestones.'),
-  );
-}
-
-/**
- * A milestone as a grid row, not a flex line. The parts have wildly different
- * widths — a two-word title next to a long one — and flex-wrap turned that into
- * a ragged block per milestone. A grid keeps id, bar and count in a column.
- */
-function milestoneRow(m: MilestoneRow, handlers: OverviewHandlers): HTMLElement {
-  const done = percent(m.done, m.total);
-  const row = el(
-    'li',
-    { class: classes('milestone', m.status, 'clickable'), tabindex: 0, role: 'button' },
-    el('span', { class: classes('mark', m.status) }, mark(m.status)),
-    code(m.id),
-    el('span', { class: 'title clip' }, m.title),
-    el('div', { class: 'meter thin' }, el('div', { class: 'meter-fill', style: `width:${done}%` })),
-    el('span', { class: 'muted mono tnum' }, ratio(m.done, m.total)),
-  );
-  const open = () => handlers.onGoto('milestones');
-  row.addEventListener('click', open);
-  row.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter' || event.key === ' ') {
-      event.preventDefault();
-      open();
-    }
-  });
-  return row;
 }
 
 function activityCard(events: ActivityEvent[], handlers: OverviewHandlers): HTMLElement {
@@ -289,7 +272,10 @@ function activityRow(event: ActivityEvent, handlers: OverviewHandlers): HTMLElem
       el(
         'div',
         { class: 'event-line' },
-        el('span', { class: 'what' }, event.text),
+        event.role ? el('span', { class: classes('role', event.role) }, roleLabel(event.role)) : null,
+        // The badge already says what kind of run it was, so a start reads as
+        // "review · FT-002 started" rather than repeating the verb.
+        el('span', { class: 'what' }, event.kind === 'run-started' ? `${event.task} started` : event.text),
         el('span', { class: 'grow' }),
         el('span', { class: 'when muted', title: event.at }, ago(event.at)),
       ),
@@ -298,9 +284,9 @@ function activityRow(event: ActivityEvent, handlers: OverviewHandlers): HTMLElem
   );
   row.setAttribute('title', `${clock(event.at)} · ${event.text}`);
   if (event.run) {
-    row.classList.add('clickable');
-    row.setAttribute('data-opens', `run:${event.run}`);
-    row.addEventListener('click', () => handlers.onRun(event.run as string));
+    activate(row, `run:${event.run}`, () => handlers.onRun(event.run as string));
+  } else if (event.decision) {
+    activate(row, `decision:${event.decision}`, () => handlers.onDecision(event.decision as string));
   }
   return row;
 }
