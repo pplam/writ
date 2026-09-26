@@ -1,4 +1,4 @@
-/* built from ui/src (c4b5e6adf002) */
+/* built from ui/src (434712eb28d0) */
 /*
  * writ dashboard — compiled from ui/src by ui/build.mjs.
  * Do not edit: change the TypeScript and rebuild.
@@ -1429,7 +1429,7 @@ function findingsCard(shown, all, filter) {
 function findingRow(finding) {
     const open = finding.disposition === 'open';
     return el('article', { class: classes('finding', finding.severity, !open && 'answered') }, el('header', {}, code(finding.id), el('span', { class: classes('pill', finding.severity) }, finding.severity), finding.where ? code(finding.where) : null, el('span', { class: 'muted small' }, finding.category), 
-    // Who raised it. `writ` is a deterministic check, `critic:fidelity` an
+    // Who raised it. `writ` is a deterministic check, `critic:coverage` an
     // independent reader, `gate:G-M01` the milestone's own review — different
     // kinds of claim, and the reader weighs them differently.
     el('span', { class: 'muted small' }, finding.source), !open ? el('span', { class: classes('pill', finding.disposition) }, finding.disposition) : null), el('p', { class: 'prose' }, finding.message), finding.suggested_action ? el('p', { class: 'muted small' }, '→ ', finding.suggested_action) : null, finding.reason ? el('p', { class: 'muted small' }, `${finding.disposition}: ${finding.reason}`) : null, open && finding.severity === 'error'
@@ -1519,7 +1519,6 @@ function dismissesOnFocus(context) {
 const VIEWS = [
     { name: 'overview', label: 'Overview' },
     { name: 'plan', label: 'Plan' },
-    { name: 'graph', label: 'Graph' },
     { name: 'tasks', label: 'Tasks' },
     { name: 'milestones', label: 'Milestones' },
     { name: 'runs', label: 'Runs' },
@@ -1763,26 +1762,25 @@ class App {
                 this.body.replaceChildren(holder);
                 break;
             }
-            case 'graph': {
-                const holder = el('div', { class: 'graph-holder', 'data-scroll-key': 'graph' });
-                renderGraph(holder, snapshot.graph, this.route.task ?? null, {
+            case 'tasks': {
+                // The graph above the list, on one page: the graph answers what can run
+                // and what waits on what, the list answers everything else about the same
+                // tasks, and one selection opens the same drawer from either.
+                const graph = el('div', { class: 'graph-holder', 'data-scroll-key': 'graph' });
+                renderGraph(graph, snapshot.graph, this.route.task ?? null, {
                     onSelect: handlers.onSelect,
                 });
-                this.body.replaceChildren(this.toolbar(el('span', { class: 'muted small' }, `${plural(snapshot.graph.nodes.length, 'task')} · ${snapshot.graph.levels} levels deep · a column can run at once`)), holder);
-                fitTitles(holder);
-                break;
-            }
-            case 'tasks': {
                 const list = el('div', { class: 'list-holder' });
                 renderTaskList(list, snapshot.tasks, {
                     filter: this.taskFilter,
                     query: this.query,
                     selected: this.route.task ?? null,
                 }, { onSelect: handlers.onSelect, onRun: handlers.onRun });
-                this.body.replaceChildren(this.toolbar(this.filterBar(Object.keys(FILTERS), this.taskFilter, (name) => {
+                this.body.replaceChildren(el('section', { class: 'task-graph', 'aria-label': 'dependency graph' }, el('div', { class: 'muted small graph-caption' }, `${plural(snapshot.graph.nodes.length, 'task')} · ${snapshot.graph.levels} levels deep · a column can run at once`), graph), this.toolbar(this.filterBar(Object.keys(FILTERS), this.taskFilter, (name) => {
                     this.taskFilter = name;
                     this.render();
                 }), this.search()), list);
+                fitTitles(graph);
                 break;
             }
             case 'milestones': {
@@ -2050,7 +2048,10 @@ function parseHash(hash) {
     if (!clean)
         return { view: 'overview' };
     const [view, kind, id] = clean.split('/');
-    const known = VIEWS.some((v) => v.name === view) ? view : 'overview';
+    // `graph` was its own page before it moved above the task list; old links
+    // still land on the graph.
+    const named = view === 'graph' ? 'tasks' : view;
+    const known = VIEWS.some((v) => v.name === named) ? named : 'overview';
     if (kind === 'task' && id)
         return { view: known, task: decodeURIComponent(id) };
     if (kind === 'run' && id)

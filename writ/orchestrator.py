@@ -740,6 +740,7 @@ def run(
     agent_args: list[str] | None = None,
     max_rework: int | None = None,
     max_infra_retries: int | None = None,
+    verify: str | None = None,
     on_event: Callable[[str, dict[str, Any]], None] | None = None,
     stream: bool = False,
     lock: threading.Lock | None = None,
@@ -813,6 +814,7 @@ def run(
                 cwd=cwd,
                 agent_args=agent_args or [],
                 max_rework=max_rework,
+                verify=verify,
             )
         except WritError as exc:
             # Claiming the task failed, so there is no run to reconcile — nothing
@@ -964,6 +966,7 @@ def _prepare(
     cwd: str | None,
     agent_args: list[str],
     max_rework: int | None = None,
+    verify: str | None = None,
 ) -> tuple[str, agents.ResolvedAgent]:
     """Claim the task by marking it running, and write its prompt.
 
@@ -992,6 +995,7 @@ def _prepare(
         force=False,
         role=job.role,
         max_rework=max_rework,
+        verify=verify,
     )
     return run_id, resolved
 
@@ -1076,7 +1080,9 @@ def _execute(
         category=category,
         retryable=retryable,
         failure_reason=failures.describe(recorded),
-        infra_attempt=runner.infrastructure_attempts(task) if retryable else 0,
+        infra_attempt=(
+            runner.infrastructure_attempts(task, role=job.role) if retryable else 0
+        ),
     )
 
 
@@ -1419,7 +1425,7 @@ def _stalled(data: dict[str, Any]) -> list[str]:
     return sorted(
         task_id
         for task_id in poisoned
-        if tasks[task_id]["status"] == "planned"
+        if tasks[task_id]["status"] not in ("failed", "blocked", "completed")
     )
 
 
@@ -1479,7 +1485,7 @@ def _gate_lines(data: dict[str, Any], session: Session) -> list[str]:
 
 
 def _behind(data: dict[str, Any], stoppers: set[str]) -> set[str]:
-    """Unstarted tasks that transitively depend on any of `stoppers`."""
+    """Unfinished tasks that transitively depend on any of `stoppers`."""
     tasks = data["tasks"]
     reached = set(stoppers)
     changed = True
@@ -1494,8 +1500,62 @@ def _behind(data: dict[str, Any], stoppers: set[str]) -> set[str]:
     return {
         task_id
         for task_id in reached - stoppers
-        if tasks[task_id]["status"] == "planned"
+        if tasks[task_id]["status"] not in ("failed", "completed")
     }
+
+
+def unfinished(
+    data: dict[str, Any], session: Session, *, budgeted: bool
+) -> list[str]:
+    """Why this session should not report success, one reason per line.
+
+    The exit code used to look only at failures and errors. A run that ended
+    with a gate held for a human, a task out of infrastructure retries, or the
+    walk simply over with work left that nothing will pick up exited 0 — and a
+    script, or a CI job, running `writ run` read that as "the project is done".
+
+    A session capped by `--max-tasks` or stopped by the operator was asked to
+    leave work behind, so for those only the things that need a person count.
+    """
+    reasons = []
+    if session.infra_blocked:
+        reasons.append(
+            "out of infrastructure retries: "
+            + ", ".join(sorted(set(session.infra_blocked)))
+        )
+    left_behind = sorted(
+        task_id
+        for task_id in {*session.dispatched, *session.reviewed, *session.gated}
+        if task_id in data["tasks"]
+        and data["tasks"][task_id]["status"] not in ("completed", "failed", "blocked")
+        and task_id not in session.infra_blocked
+    )
+    if left_behind and not (session.stopped or session.aborted):
+        # Started here and neither finished nor failed: a review that could not
+        # be had, an attempt returned to the queue after the session's own
+        # ledger had spent it. A budget caps what is started, not what is left
+        # half-done, so this counts even under `--max-tasks`.
+        reasons.append(
+            "started this session and left unfinished: " + ", ".join(left_behind)
+        )
+    held = held_gates(data)
+    if held:
+        reasons.append(
+            "gates held: "
+            + ", ".join(f"{gate} ({why})" for gate, why in sorted(held.items()))
+        )
+    if not budgeted and not (session.stopped or session.aborted):
+        left = sorted(
+            task_id
+            for task_id, task in data["tasks"].items()
+            if task["status"] != "completed" and task_id not in held
+        )
+        if left and not reasons and not session.failed:
+            reasons.append(
+                f"{len(left)} task{'s' if len(left) != 1 else ''} not complete and "
+                f"nothing left this run could start: {', '.join(left)}"
+            )
+    return reasons
 
 
 def _elapsed(session: Session) -> str:

@@ -179,7 +179,11 @@ def test_a_spawn_failure_settles_the_run_and_the_task(planned, writ, project):
     assert code == 2 and "not found" in err
     run = only_run(project)
     assert run["status"] == "failed" and run["exit_code"] == 127
-    assert state.load(project)["tasks"]["M01-001"]["status"] == "failed"
+    # nothing ran, so nothing failed on its merits: the task waits, unspent
+    task = state.load(project)["tasks"]["M01-001"]
+    assert task["status"] == "planned"
+    assert run["failure"]["category"] == "unavailable"
+    assert not task.get("rework")
 
 
 def test_a_single_shot_dispatch_settles_its_run_when_the_agent_raises(

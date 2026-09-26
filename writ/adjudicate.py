@@ -39,6 +39,7 @@ being a way to make a bad plan pass:
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import shutil
@@ -62,6 +63,15 @@ WORKING_DIRNAME = "plan"
 #: the words a round's error starts with when writ, not the agent, failed it
 PROMOTION_FAILED = "the working copy could not be promoted"
 
+#: what the adjudicator is told in autonomous mode, where nobody will answer
+AUTONOMOUS_NOTE = """\
+Writ is running autonomously: no person will answer a question. A finding that
+tells you to decide it is yours to decide. Choose the reading that best serves
+the design and its requirements (prefer the simplest one that satisfies them
+all), change the plan to follow it, answer it `accepted`, and state the choice
+in `decision` as a ruling later agents will build to. Raise a question only
+when no reading can satisfy the requirements, and give your `recommendation`."""
+
 RESPONSE_SCHEMA = """\
 {
   "analysis": "what was actually wrong, in a few lines",
@@ -69,7 +79,8 @@ RESPONSE_SCHEMA = """\
     {
       "finding_id": "F-0007",
       "disposition": "accepted",
-      "change": "M01-002: replaced the vague criterion with a runnable check"
+      "change": "M01-002: replaced the vague criterion with a runnable check",
+      "decision": "only for a finding you were told to decide: what you decided"
     },
     {
       "finding_id": "F-0009",
@@ -81,7 +92,8 @@ RESPONSE_SCHEMA = """\
     {
       "finding_id": "F-0011",
       "question": "only when a finding cannot be closed without a human ruling",
-      "context": "what the two readings are and what each would change"
+      "context": "what the two readings are and what each would change",
+      "recommendation": "the answer you would give, stated as the decision"
     }
   ]
 }"""
@@ -131,7 +143,9 @@ Rules:
 8. Every finding in to-fix.json needs an answer in the response: `accepted`
    with `change` naming what you edited, or `declined` with `reason` giving the
    evidence that the finding is wrong. A finding that needs a product decision
-   goes in `questions` with its `finding_id` instead; do not guess.
+   goes in `questions` with its `finding_id` and your `recommendation` instead;
+   do not guess. A finding whose `suggested_action` gives a ruling is already
+   decided: apply the ruling and answer it `accepted`.
 9. A response that edits nothing and asks nothing is refused: an unchanged plan
    draws the same findings again. If every finding is wrong, raise a question.
 
@@ -176,7 +190,9 @@ Rules:
 8. Every finding in to-fix.json needs an answer in the response: `accepted`
    with `change` naming what you edited, or `declined` with `reason` giving the
    evidence that the finding is wrong. A finding that needs a product decision
-   goes in `questions` with its `finding_id` instead; do not guess.
+   goes in `questions` with its `finding_id` and your `recommendation` instead;
+   do not guess. A finding whose `suggested_action` gives a ruling is already
+   decided: apply the ruling and answer it `accepted`.
 9. A response that edits nothing and asks nothing is refused: an unchanged plan
    draws the same findings again. If every finding is wrong, raise a question.
 
@@ -195,6 +211,9 @@ class Round:
     refused: list[Finding] = field(default_factory=list)
     applied: dict[str, Any] = field(default_factory=dict)
     questions: list[dict[str, Any]] = field(default_factory=list)
+    #: the questions still waiting for a person; in autonomous mode, the ones
+    #: that could not be answered with their own recommendation
+    unanswered: list[str] = field(default_factory=list)
     blocking_before: int = 0
     blocking_after: int = 0
 
@@ -237,6 +256,7 @@ def build_prompt(
     previous: Path | None = None,
     extra: Iterable[Ref] = (),
     features: bool = False,
+    autonomous: bool = False,
 ) -> str:
     """Compose the adjudicator's prompt: what to read, what to edit, where to answer.
 
@@ -304,6 +324,7 @@ def build_prompt(
         "",
         CONTRACT_RULES if features else RULES,
         "",
+        *([AUTONOMOUS_NOTE, ""] if autonomous else []),
         *prompts.output(root, "response", directory / RESPONSE_FILENAME),
         "",
         "The file must contain JSON only — no prose, no code fence.",
@@ -335,6 +356,7 @@ def loop(
     stream: bool = False,
     on_round: Callable[[Round], None] | None = None,
     on_start: Callable[[int, agents.ResolvedAgent], None] | None = None,
+    autonomous: bool = False,
 ) -> Result:
     """Run the bounded adjudication loop until the plan is clean or it stops.
 
@@ -357,6 +379,11 @@ def loop(
     it prints, and it belongs to whoever asked for the loop. Without it the loop
     still re-runs the deterministic checks, which is the cheaper half of the same
     idea.
+
+    `autonomous` is for a run nobody is watching: a `needs-decision` finding goes
+    to the adjudicator to decide rather than to a person, and a question it raises
+    with a recommendation is answered with it. Both still land in the decision
+    log, confirmed by `autonomous`, so what was decided on whose word is kept.
     """
     resolved = agents.resolve(agent, [], model, events=True)
     directory.mkdir(parents=True, exist_ok=True)
@@ -384,15 +411,28 @@ def loop(
         # A finding that asks for a ruling is not the adjudicator's to answer:
         # repairing around it is a guess. It goes to the decision log, and only
         # what a repair can close is handed on.
+        # Once a person has ruled, the finding is an ordinary repair: the plan
+        # has to be changed to say what they decided. Without this the ruling was
+        # recorded and nothing ever acted on it, so the finding stood forever.
+        # A ruling on any other finding is one the adjudicator asked for earlier;
+        # it is handed back with the finding for the same reason.
         decide = [f for f in blocking if f.category == DECISION_CATEGORY]
-        if decide:
-            _route_decisions(root, decide)
-        blocking = [f for f in blocking if f.category != DECISION_CATEGORY]
+        ruled = [_with_ruling(data, f) for f in decide]
+        waiting = [f for f, answer in zip(decide, ruled) if answer is None]
+        if waiting:
+            _route_decisions(root, waiting)
+        blocking = [
+            _with_ruling(data, f) or f
+            for f in blocking
+            if f.category != DECISION_CATEGORY
+        ] + [answer for answer in ruled if answer is not None]
+        if autonomous:
+            # Nobody is coming to rule, so the adjudicator does. The question
+            # stays in the log and gets its answer from the response.
+            blocking += [_to_decide(f) for f in waiting]
+            waiting = []
         if not blocking:
-            result.stopped = (
-                f"{len(decide)} finding(s) need a human decision rather than a "
-                "repair; they are in the decision log (writ decisions)."
-            )
+            result.stopped = awaiting_ruling(state.load(root), waiting)
             break
         if landed >= budget:
             result.stopped = (
@@ -419,10 +459,19 @@ def loop(
             blocking=blocking,
             stream=stream,
             on_start=on_start,
+            autonomous=autonomous,
         )
         result.rounds.append(round_)
         if on_round is not None:
             on_round(round_)
+        if round_.questions and autonomous and not round_.unanswered:
+            # Every question came with a recommendation and was answered with it;
+            # the next round repairs the plan to follow those answers.
+            if round_.progressed:
+                landed += 1
+                if recheck is not None:
+                    recheck()
+            continue
         if round_.questions:
             result.stopped = (
                 f"the adjudicator raised {len(round_.questions)} question(s) it "
@@ -461,6 +510,10 @@ def loop(
                 # finding on evidence rather than on the response's word.
                 recheck()
     data = state.load(root)
+    if data.get("decisions"):
+        from . import decisions
+
+        decisions.sync_markdown(root, data)
     still_open = _blocking_ids(data)
     result.resolved = len(opened - still_open)
     result.remaining = len(still_open)
@@ -489,6 +542,7 @@ def _one_round(
     blocking: list[Finding],
     stream: bool,
     on_start: Callable[[int, agents.ResolvedAgent], None] | None,
+    autonomous: bool = False,
 ) -> Round:
     """One attempt: prepare the round, run the agent, validate, promote or refuse."""
     directory.mkdir(parents=True, exist_ok=True)
@@ -529,6 +583,7 @@ def _one_round(
         previous=previous,
         extra=extra,
         features=features,
+        autonomous=autonomous,
     )
     if on_start is not None:
         on_start(number, resolved)
@@ -597,16 +652,22 @@ def _one_round(
             questions = response["questions"]
             if _no_edits(diff):
                 round_.questions = list(questions)
-                _raise_questions(data, questions, request)
+                round_.unanswered = _raise_questions(
+                    data, questions, request, autonomous=autonomous
+                )
                 return round_
             round_.applied = promote(
                 data, request, proposed, diff, response, actor="adjudicator"
             )
+            if autonomous:
+                _record_rulings(data, response)
             if questions:
                 # Edits and questions together: the edits land, and the questions
                 # still stop the loop for the human who has to answer them.
                 round_.questions = list(questions)
-                _raise_questions(data, questions, request, status="applied")
+                round_.unanswered = _raise_questions(
+                    data, questions, request, status="applied", autonomous=autonomous
+                )
             # Deterministic checks run against the promoted plan immediately. A copy
             # that closed one finding and opened another says so here, before the
             # critics are spent on it.
@@ -1445,6 +1506,95 @@ def _rederive_edges(data: dict[str, Any]) -> None:
         task["depends_on"] = stated + [dep for dep in deps if dep not in stated]
 
 
+def _with_ruling(data: dict[str, Any], finding: Finding) -> Finding | None:
+    """This `needs-decision` finding restated as the change its ruling asks for."""
+    from . import decisions
+
+    record = decisions.ruling(data, finding.id)
+    if record is None:
+        return None
+    who = (
+        "Writ decided this autonomously"
+        if record.get("confirmed_by") == decisions.AUTONOMOUS
+        else "A person has ruled on this"
+    )
+    return dataclasses.replace(
+        finding,
+        suggested_action=(
+            f"{who} ({record['id']}): {record['decision']} "
+            "Change the plan so it follows this ruling; do not raise it as a "
+            "question again."
+        ),
+    )
+
+
+def _to_decide(finding: Finding) -> Finding:
+    """A `needs-decision` finding handed to the adjudicator to settle itself."""
+    return dataclasses.replace(
+        finding,
+        suggested_action=(
+            "Nobody will rule on this: decide it yourself (see the note on "
+            "autonomous runs), change the plan to follow your decision, answer "
+            "`accepted`, and state it in `decision`."
+            + (
+                f" The critic suggested: {finding.suggested_action}"
+                if finding.suggested_action
+                else ""
+            )
+        ),
+    )
+
+
+def _record_rulings(data: dict[str, Any], response: dict[str, Any]) -> list[str]:
+    """Answer each question the adjudicator just decided, from its response.
+
+    The question was put in the log when the finding was routed; this fills in
+    what was chosen, so an autonomous plan's rulings are as findable as a
+    person's. `change` stands in for a `decision` the adjudicator left out:
+    it says what the plan now does, which is the ruling in effect. A declined
+    finding is a ruling too: that the plan's reading stands, and why.
+    """
+    from . import decisions
+
+    answered = []
+    for entry in response.get("dispositions", []):
+        finding_id = str(entry.get("finding_id", ""))
+        record = decisions.asked(data, finding_id) if finding_id else None
+        if record is None:
+            continue
+        disposition = str(entry.get("disposition", "")).lower()
+        if disposition == "accepted":
+            ruling = str(entry.get("decision") or entry.get("change") or "").strip()
+        elif disposition == "declined" and str(entry.get("reason", "")).strip():
+            ruling = f"The plan stands as written: {str(entry['reason']).strip()}"
+        else:
+            continue
+        if not ruling:
+            continue
+        decisions.answer(data, record["id"], ruling)
+        answered.append(record["id"])
+    return answered
+
+
+def awaiting_ruling(data: dict[str, Any], findings: list[Finding]) -> str:
+    """Why the loop stopped for a person, naming what to answer and how."""
+    from . import decisions
+
+    lines = [
+        f"{len(findings)} finding(s) need your ruling rather than a repair. Answer "
+        "each with `writ set D-NNNN active --decision \"...\"` and run the "
+        "repair again (`writ build` or `writ adjudicate`); or, to build the plan "
+        "as it stands, `writ set F-NNNN accepted --reason ...`:"
+    ]
+    for finding in findings:
+        record = decisions.asked(data, finding.id)
+        lines.append(
+            f"    {record['id'] if record else '?'} for {finding.id} "
+            f"[{finding.where}]: {finding.message[:100]}"
+        )
+    return "\n".join(lines)
+
+
 def _route_decisions(root: Path, findings: list[Finding]) -> None:
     """Put each `needs-decision` finding in the decision log, once."""
     from . import decisions
@@ -1457,7 +1607,7 @@ def _route_decisions(root: Path, findings: list[Finding]) -> None:
             record = decisions.propose(
                 data,
                 title=finding.message[:72] or "a plan decision",
-                decision="Undecided: a critic found the plan needs a ruling here.",
+                decision=decisions.UNDECIDED,
                 context=(
                     f"{finding.id} ({finding.source}, {finding.where}): "
                     f"{finding.message}"
@@ -1504,25 +1654,52 @@ def _raise_questions(
     request: dict[str, Any],
     *,
     status: str = "proposed",
-) -> None:
-    """Put what the adjudicator could not settle into the decision log."""
+    autonomous: bool = False,
+) -> list[str]:
+    """Put what the adjudicator could not settle into the decision log.
+
+    Returns the ids of the questions left for a person. In autonomous mode a
+    question is answered with its own recommendation, but only once per finding:
+    a finding asked about again after it was answered is going round in a
+    circle, and a person is the way out of that.
+    """
     from . import decisions
 
+    waiting: list[str] = []
     for question in questions:
-        decisions.propose(
-            data,
-            title=str(question.get("question", ""))[:72] or "adjudication question",
-            decision=(
-                "Undecided: the adjudicator could not close the finding without a "
-                "ruling."
-            ),
-            context=str(question.get("context", question.get("question", ""))),
-            consequences="The plan stays unapproved until this is settled.",
-            proposed_by="adjudicator",
-            tasks=[],
+        finding_id = str(question.get("finding_id") or "").strip()
+        recommendation = str(question.get("recommendation") or "").strip()
+        record = decisions.asked(data, finding_id) if finding_id else None
+        if record is None:
+            record = decisions.propose(
+                data,
+                title=str(question.get("question", ""))[:72]
+                or "adjudication question",
+                decision=(
+                    "Undecided: the adjudicator could not close the finding "
+                    "without a ruling."
+                ),
+                context=str(question.get("context", question.get("question", "")))
+                + (f" Recommended: {recommendation}" if recommendation else ""),
+                consequences="The plan stays unapproved until this is settled.",
+                proposed_by="adjudicator",
+                tasks=[],
+            )
+            if finding_id:
+                record["finding"] = finding_id
+        answerable = (
+            autonomous
+            and recommendation
+            and finding_id
+            and decisions.ruling(data, finding_id) is None
         )
+        if answerable:
+            decisions.answer(data, record["id"], recommendation)
+        else:
+            waiting.append(record["id"])
     request["status"] = status
     request["questions"] = list(questions)
+    return waiting
 
 
 def _reopen(root: Path, request_id: str) -> None:

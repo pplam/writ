@@ -30,7 +30,8 @@ from tests.test_plans import PLAN
 #: The edit is a JSON spec in WRIT_TEST_EDIT: `revise` merges fields into existing
 #: feature files, `add` creates new ones, `remove` deletes them, and `analysis`,
 #: `dispositions` and `questions` go into the response. Unless the spec says
-#: `_auto_dispositions: false`, every finding in to-fix.json is accepted. A list
+#: `_auto_dispositions: false`, every finding in to-fix.json is accepted, with
+#: `_decision` as the ruling when the spec gives one. A list
 #: is one spec per round, so a test can be refused and then succeed.
 ADJUDICATOR = """
 import json, os, re, sys
@@ -56,7 +57,10 @@ for ref in spec.get("remove", []):
 response = {k: spec[k] for k in ("analysis", "dispositions", "questions") if k in spec}
 if spec.get("_auto_dispositions", True) and to_fix:
     response.setdefault("dispositions", [
-        {"finding_id": f, "disposition": "accepted", "change": "fixed it"}
+        dict(
+            {"finding_id": f, "disposition": "accepted", "change": "fixed it"},
+            **({"decision": spec["_decision"]} if "_decision" in spec else {}),
+        )
         for f in to_fix
     ])
 path.write_text(json.dumps(response))
@@ -910,6 +914,66 @@ def test_a_question_stops_the_loop_and_reaches_the_decision_log(
     assert data["decisions"], data
     assert "per shard" in data["decisions"][0]["title"]
     assert code == 1
+
+
+def _per_shard(project):
+    """A question about the fixture's finding, with the answer the asker would give."""
+    [finding] = [
+        f
+        for f in plans.findings(state.load(project), open_only=True)
+        if f.severity == "error"
+    ]
+    return {
+        "_auto_dispositions": False,
+        "questions": [
+            {
+                "finding_id": finding.id,
+                "question": "Is queue depth per shard or per cluster?",
+                "recommendation": "Per shard: the operator view is per shard.",
+            }
+        ],
+    }
+
+
+def test_autonomous_mode_answers_a_question_with_its_recommendation(
+    objected, project, monkeypatch
+):
+    patched(monkeypatch, [_per_shard(project), ADDS_THE_TASK])
+    code, out, err = _run(objected, "--autonomous")
+    assert code == 0, out + err
+    assert "with their recommendations (autonomous)" in out
+    data = state.load(project)
+    record = data["decisions"][0]
+    assert record["status"] == "active"
+    assert record["decision"] == "Per shard: the operator view is per shard."
+    assert record["confirmed_by"] == "autonomous"
+    assert _added(data)
+    # the ruling is handed to the next round with the finding it settles
+    rounds = sorted(_rounds(project).glob("*/round-*"))
+    handed = json.loads((rounds[-1] / "to-fix.json").read_text())
+    assert "Writ decided this autonomously" in handed[0]["suggested_action"]
+
+
+def test_autonomous_mode_still_holds_a_question_without_a_recommendation(
+    objected, project, monkeypatch
+):
+    spec = {
+        "_auto_dispositions": False,
+        "questions": [{"finding_id": "F-0001", "question": "Per shard?"}],
+    }
+    patched(monkeypatch, spec)
+    code, _, _ = _run(objected, "--autonomous")
+    assert code == 1
+    assert state.load(project)["decisions"][0]["status"] == "proposed"
+
+
+def test_the_same_question_twice_goes_to_a_person(objected, project, monkeypatch):
+    """One autonomous answer per finding: asked again, it is going in circles."""
+    patched(monkeypatch, [_per_shard(project)] * 2)
+    code, _, _ = _run(objected, "--autonomous")
+    assert code == 1
+    statuses = [item["status"] for item in state.load(project)["decisions"]]
+    assert statuses == ["active", "proposed"]
 
 
 def test_edits_and_a_question_both_land(objected, project, monkeypatch):

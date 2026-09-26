@@ -105,7 +105,9 @@ PATCH_SCHEMA = """\
   "questions": [
     {
       "id": "Q-001",
-      "question": "only when a finding cannot be repaired without a human ruling"
+      "question": "only when a finding cannot be repaired without a human ruling",
+      "context": "the readings, and what each would change",
+      "recommendation": "the answer you would give, stated as the decision"
     }
   ]
 }"""
@@ -130,7 +132,8 @@ Rules for the patch:
    defect is one a reviewer can actually check.
 7. If a finding cannot be closed without a product decision — the design is
    ambiguous, or two requirements contradict — do not guess. Put it in
-   `questions` and leave the finding open.
+   `questions` with your `recommendation`, and leave the finding open. A ruling
+   listed in this prompt settles its question: repair to it.
 
 Write no code and change no file other than the patch JSON. You are planning a
 repair."""

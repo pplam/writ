@@ -62,13 +62,17 @@ def test_successful_dispatch_records_a_run(planned, writ, project):
     assert any("without a usable verdict" in item["text"] for item in task["evidence"])
 
 
-def test_failing_agent_marks_the_task_failed(planned, writ, project):
+def test_a_crashing_agent_spends_a_rework_attempt_not_the_task(planned, writ, project):
     code, _, _ = writ("dispatch", "M01-001", "--agent", FAIL)
     assert code == 3
     data = state.load(project)
     run = next(iter(data["runs"].values()))
     assert run["status"] == "failed" and run["exit_code"] == 3
-    assert data["tasks"]["M01-001"]["status"] == "failed"
+    task = data["tasks"]["M01-001"]
+    assert task["status"] == "planned"
+    assert task["rework"]["reason"] == (
+        "the previous attempt exited 3 without a usable verdict"
+    )
     assert "boom" in (state.run_dir(project, run["id"]) / "stderr.log").read_text()
 
 
@@ -330,5 +334,5 @@ def test_streamed_dispatch_still_records_failure(planned, writ, project):
     data = state.load(project)
     run = next(iter(data["runs"].values()))
     assert run["status"] == "failed" and run["exit_code"] == 3
-    assert data["tasks"]["M01-001"]["status"] == "failed"
+    assert data["tasks"]["M01-001"]["status"] == "planned"
     assert "boom" in (state.run_dir(project, run["id"]) / "stderr.log").read_text()

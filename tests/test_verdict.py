@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from writ import model, state, verdict
+from writ import model, runner, state, verdict
 from writ.state import WritError
 
 
@@ -154,13 +154,36 @@ def test_criteria_record_who_judged_them_and_on_what_evidence(planned, writ, pro
     assert first["judged_by"].startswith("agent(")
 
 
-def test_a_partial_verdict_fails_the_task_and_keeps_the_detail(planned, writ, project):
+def test_a_partial_verdict_returns_the_task_and_keeps_the_detail(
+    planned, writ, project
+):
     code, out, _ = writ("dispatch", "M01-001", "--agent", agent_reporting(partial()))
     assert code == 0  # the process succeeded; the work did not
-    assert "M01-001 -> failed" in out
+    assert "M01-001 -> planned" in out
+    task = state.load(project)["tasks"]["M01-001"]
+    assert task["status"] == "planned"
+    assert [a["status"] for a in task["acceptances"]] == ["passed", "failed", "failed"]
+    # counted against the rework budget, with what it left open
+    assert task["rework"]["kind"] == "unfinished"
+    assert task["rework"]["unmet"] == [2, 3]
+
+
+def test_an_unfinished_task_fails_once_its_rework_budget_is_spent(
+    planned, writ, project
+):
+    for _ in range(model.DEFAULT_MAX_REWORK + 1):
+        writ("dispatch", "M01-001", "--agent", agent_reporting(partial()))
     task = state.load(project)["tasks"]["M01-001"]
     assert task["status"] == "failed"
-    assert [a["status"] for a in task["acceptances"]] == ["passed", "failed", "failed"]
+    assert task["rework"]["exhausted"]
+
+
+def test_the_next_attempt_is_told_where_the_last_one_stopped(planned, writ, project):
+    writ("dispatch", "M01-001", "--agent", agent_reporting(partial()))
+    section = runner._rework_section(state.load(project)["tasks"]["M01-001"])
+    assert "DID NOT FINISH" in section
+    assert "REVIEW REJECTED" not in section
+    assert "got part way" in section
 
 
 def test_a_blocked_verdict_records_what_stopped_it(planned, writ, project):
@@ -256,8 +279,8 @@ def test_a_contradicted_claim_keeps_the_evidence_under_it(planned, writ, project
     code, _, err = writ("dispatch", "M01-001", "--agent", agent_reporting(payload))
     assert code == 0
     task = state.load(project)["tasks"]["M01-001"]
-    # the claim was lowered, so the task is failed rather than awaiting review
-    assert task["status"] == "failed"
+    # the claim was lowered, so the task goes round again rather than to review
+    assert task["status"] == "planned"
     # and the evidence for the bar that was met survived
     assert task["acceptances"][0]["status"] == "passed"
     assert task["acceptances"][0]["evidence"] == "pytest tests/a.py"
@@ -268,7 +291,7 @@ def test_a_contradicted_claim_keeps_the_evidence_under_it(planned, writ, project
     run = next(iter(state.load(project)["runs"].values()))
     # applied, not rejected: this is not the unusable-verdict path
     assert not run.get("verdict_error")
-    assert run["resulting_status"] == "failed"
+    assert run["resulting_status"] == "planned"
     assert "writ recorded 'incomplete'" in run["verdict_downgraded"]
 
 
@@ -302,7 +325,10 @@ def test_a_nonzero_exit_with_a_verdict_still_uses_the_verdict(planned, writ, pro
         agent_reporting(partial(passed=2), exit_code=1),
     )
     task = state.load(project)["tasks"]["M01-001"]
-    assert task["status"] == "failed"
+    assert task["status"] == "planned"
+    assert task["rework"]["reason"] == (
+        "the previous attempt reported its own work incomplete"
+    )
     # the criteria it did meet are still credited
     assert [a["status"] for a in task["acceptances"]] == ["passed", "passed", "failed"]
 
@@ -802,6 +828,16 @@ def test_a_verdict_can_propose_a_decision(planned, writ, project):
     assert records[0]["consequences"].startswith("Payloads may contain")
 
 
+def test_an_autonomous_run_confirms_a_proposal_as_it_lands(planned, writ, project):
+    with state.transaction(project) as data:
+        data["autonomous"] = True
+    writ("dispatch", "M01-001", "--agent", agent_reporting(with_decisions(GOOD)))
+    [record] = state.load(project)["decisions"]
+    assert record["status"] == "active"
+    assert record["confirmed_by"] == "autonomous"
+    assert record["proposed_by"]
+
+
 def test_a_proposed_decision_is_linked_to_its_task(planned, writ, project):
     writ("dispatch", "M01-001", "--agent", agent_reporting(with_decisions(GOOD)))
     assert state.load(project)["decisions"][0]["tasks"] == ["M01-001"]
@@ -1086,10 +1122,84 @@ def test_a_repair_request_with_no_findings_is_refused():
     with pytest.raises(WritError, match="no findings"):
         verdict.parse(
             gate_payload(decision="needs-repair", criteria=[
-                {"number": 1, "status": "failed", "evidence": "x"},
+                {"number": 1, "status": "passed", "evidence": "x"},
             ]),
             role="gate",
         )
+
+
+def test_a_repair_request_over_failed_criteria_makes_them_the_findings():
+    result = verdict.parse(
+        gate_payload(decision="needs-repair", criteria=[
+            {"number": 1, "status": "failed", "evidence": "suite red"},
+        ]),
+        role="gate",
+    )
+    assert [(f.summary, f.severity) for f in result.findings] == [
+        ("gate criterion 1 is not met: failed", "blocking")
+    ]
+
+
+def test_failed_criteria_under_only_advisory_findings_still_block():
+    """Advisory findings over a failed bar used to complete the gate."""
+    result = verdict.parse(
+        gate_payload(
+            decision="needs-repair",
+            criteria=[{"number": 1, "status": "failed", "evidence": "suite red"}],
+            findings=[{"summary": "naming is odd", "severity": "minor"}],
+        ),
+        role="gate",
+    )
+    assert [f.severity for f in result.findings] == ["advisory", "blocking"]
+    assert result.blocking_findings
+
+
+@pytest.mark.parametrize(
+    "written, read",
+    [
+        ("high", "blocking"),
+        ("major", "blocking"),
+        ("critical", "blocking"),
+        ("something-new", "blocking"),
+        ("low", "advisory"),
+        ("nit", "advisory"),
+        ("warning", "advisory"),
+    ],
+)
+def test_gate_severities_are_read_fail_closed(written, read):
+    result = verdict.parse(
+        gate_payload(
+            decision="needs-repair",
+            criteria=[{"number": 1, "status": "passed", "evidence": "x"}],
+            findings=[{"summary": "a thing", "severity": written}],
+        ),
+        role="gate",
+    )
+    assert result.findings[0].severity == read
+
+
+@pytest.mark.parametrize(
+    "status, read",
+    [("pass", "passed"), ("OK", "passed"), ("fail", "failed"), ("unmet", "failed"),
+     ("unchecked", "pending")],
+)
+def test_common_spellings_of_a_criterion_status_are_accepted(status, read):
+    payload = json.dumps(
+        {
+            "outcome": "incomplete",
+            "criteria": [{"number": 1, "status": status, "evidence": "ran it"}],
+        }
+    )
+    assert verdict.parse(payload).criteria[0].status == read
+
+
+def test_common_spellings_of_a_headline_are_accepted():
+    assert verdict.parse(
+        json.dumps({"outcome": "done", "criteria": []})
+    ).outcome == "complete"
+    assert verdict.parse(
+        json.dumps({"decision": "approved", "criteria": []}), role="reviewer"
+    ).decision == "accept"
 
 
 def test_a_decision_request_with_no_questions_is_refused():

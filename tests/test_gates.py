@@ -799,7 +799,8 @@ def test_a_gate_claiming_a_pass_while_checking_nothing_is_not_believed(
     code, out, _ = looping(
         "run", "--agent", agent(SILENT_GATE), "--reviewer", agent(SILENT_GATE)
     )
-    assert code == 0, out
+    # the plan is not complete, and the exit code no longer says it is
+    assert code == 1, out
     data = state.load(project)
     ran = [gate for gate in gates.gates(data) if gates.attempts(gate)]
     assert ran, {g["id"]: g["status"] for g in gates.gates(data)}
@@ -819,3 +820,115 @@ def test_a_gate_claiming_a_pass_while_checking_nothing_is_not_believed(
     ]
     assert findings, plans.finding_records(data)
     assert "nothing confirmed it" in findings[0]["message"]
+
+
+# --------------------------------------------------------------------------
+# autonomous mode: a gate's question answered with its own recommendation
+
+
+def _asks(recommendation="Per request: the design times each call."):
+    from writ import verdict
+
+    question = {"question": "Is the timeout per request or per operation?"}
+    if recommendation:
+        question["recommendation"] = recommendation
+    return verdict.parse(
+        json.dumps({
+            "decision": "needs-decision",
+            "summary": "the documents do not say",
+            "criteria": [{"number": 1, "status": "passed", "evidence": "ran it"}],
+            "questions": [question],
+        }),
+        role="gate",
+    )
+
+
+def _judge(project, parsed, *, autonomous=True):
+    from writ import verdict
+
+    with state.transaction(project) as data:
+        data["autonomous"] = autonomous
+        gate = data["tasks"]["G-M02"]
+        gate["status"] = "running"
+        return verdict.apply(data, gate, parsed, actor="gate")
+
+
+def test_an_autonomous_gate_is_judged_again_against_its_ruling(approved, project):
+    from writ import runner
+
+    assert _judge(project, _asks()) == "planned"
+    data = state.load(project)
+    [record] = data["decisions"]
+    assert record["status"] == "active" and record["confirmed_by"] == "autonomous"
+    assert record["decision"] == "Per request: the design times each call."
+    assert record["tasks"] == ["G-M02"]
+    assert "held" not in data["tasks"]["G-M02"]
+    prompt = runner.build_gate_prompt(data, data["tasks"]["G-M02"], project)
+    assert "Per request: the design times each call." in prompt
+
+
+def test_an_autonomous_gate_that_keeps_asking_is_held(approved, project):
+    for _ in range(3):
+        status = _judge(project, _asks())
+    assert status == "blocked"
+    data = state.load(project)
+    assert data["tasks"]["G-M02"]["held"]["reason"] == "needs-decision"
+    statuses = [item["status"] for item in data["decisions"]]
+    assert statuses == ["active", "active", "proposed"]
+
+
+def test_a_gate_question_without_a_recommendation_is_held(approved, project):
+    assert _judge(project, _asks(recommendation=None)) == "blocked"
+    assert state.load(project)["decisions"][0]["status"] == "proposed"
+
+
+def test_without_autonomy_a_gate_question_waits_for_a_person(approved, writ, project):
+    assert _judge(project, _asks(), autonomous=False) == "blocked"
+    [record] = state.load(project)["decisions"]
+    assert record["status"] == "proposed"
+    assert "Recommended: Per request" in record["context"]
+    code, _, err = writ("set", record["id"], "active")
+    assert code != 0 and "--decision" in err
+
+
+def _asked_by_the_planner(project, tmp_path, *, autonomous):
+    from writ import runner
+
+    _request(project)
+    (tmp_path / runner.PATCH_FILENAME).write_text(json.dumps({
+        "base_revision": plans.revision(state.load(project)),
+        "questions": [{
+            "question": "Should the seam retry or fail fast?",
+            "recommendation": "Fail fast: the design wants errors surfaced.",
+        }],
+    }))
+    with state.transaction(project) as data:
+        data["autonomous"] = autonomous
+        runner._finish_repair(
+            data, {"id": "R-1"}, data["tasks"]["G-M02"], tmp_path, "repair-planner"
+        )
+    return state.load(project)
+
+
+def test_an_autonomous_repair_question_is_answered_and_planned_again(
+    approved, project, tmp_path
+):
+    from writ import runner
+
+    data = _asked_by_the_planner(project, tmp_path, autonomous=True)
+    [record] = data["decisions"]
+    assert record["status"] == "active" and record["confirmed_by"] == "autonomous"
+    assert repair.request_for_gate(data, "G-M02")["status"] == "open"
+    assert "held" not in data["tasks"]["G-M02"]
+    assert "Fail fast" in " ".join(runner._rulings(data, "G-M02"))
+
+
+def test_a_repair_question_otherwise_waits_with_its_recommendation(
+    approved, project, tmp_path
+):
+    data = _asked_by_the_planner(project, tmp_path, autonomous=False)
+    [record] = data["decisions"]
+    assert record["status"] == "proposed"
+    assert "Recommended: Fail fast" in record["context"]
+    assert data["tasks"]["G-M02"]["held"]["reason"] == "needs-decision"
+

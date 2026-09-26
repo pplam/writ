@@ -90,6 +90,27 @@ class _Parser(argparse.ArgumentParser):
         raise WritError(message)
 
 
+
+def _autonomy(p) -> None:
+    """`--autonomous`/`--no-autonomous`, the same on every command that decides."""
+    p.add_argument(
+        "--autonomous",
+        action="store_true",
+        default=None,
+        help=(
+            "make every decision without a person: answer the plan's questions, "
+            "confirm agents' decisions, rule on what a gate asks. Each lands in "
+            "the decision log as confirmed by `autonomous`, to review or overturn "
+            "later (default: decisions.autonomous)"
+        ),
+    )
+    p.add_argument(
+        "--no-autonomous",
+        dest="autonomous",
+        action="store_false",
+        help="stop for a person at every question",
+    )
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(
         prog="writ",
@@ -233,12 +254,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--parallel-stages",
         action="store_true",
-        default=None,
-        help=(
-            "run the analysis stages that need nothing from each other at once "
-            "(requirements beside inventory). Costs the inventory its coverage "
-            "claims, which need the requirement ids it will not have yet"
-        ),
+        help=argparse.SUPPRESS,  # now always so; kept so old invocations still work
     )
     p.add_argument(
         "--stage-agent",
@@ -254,6 +270,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="S",
         help="seconds before an analysis stage is killed (default: --timeout)",
     )
+    _autonomy(p)
     p.add_argument(
         "--auto-approve",
         action="store_true",
@@ -278,12 +295,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--parallel-critics",
         action="store_true",
-        default=None,
-        help=(
-            "run all the critics at once rather than one after another: two agent "
-            "runs' wall-clock for one. Only one of them runs the test suite, and "
-            "the rest are told to leave it alone"
-        ),
+        help=argparse.SUPPRESS,  # now always so; kept so old invocations still work
     )
     p.add_argument(
         "--critic-agent",
@@ -402,6 +414,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="plan a design the existing plan does not cover onto its graph",
     )
+    _autonomy(group)
     group = p.add_argument_group("running")
     group.add_argument(
         "--agent", help="implementing agent (default: agents.implementer, else pi)"
@@ -428,6 +441,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     group.add_argument(
         "--max-rework", type=int, metavar="N", help="re-dispatches of a rejected task"
+    )
+    group.add_argument(
+        "--verify",
+        metavar="CMD",
+        help="the command that builds and tests the project, named in every "
+        "agent's prompt (default: the one planning found)",
     )
     group.add_argument(
         "--order", choices=ORDERS, help="which ready task to start first"
@@ -525,6 +544,7 @@ def build_parser() -> argparse.ArgumentParser:
             "critics; cheaper, and blind to anything only a critic can see"
         ),
     )
+    _autonomy(p)
     p.add_argument(
         "--quiet",
         "-q",
@@ -559,12 +579,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--parallel-critics",
         action="store_true",
-        default=None,
-        help=(
-            "run all the critics at once rather than one after another: two agent "
-            "runs' wall-clock for one. Only one of them runs the test suite, and "
-            "the rest are told to leave it alone"
-        ),
+        help=argparse.SUPPRESS,  # now always so; kept so old invocations still work
     )
     p.add_argument(
         "--quiet",
@@ -677,6 +692,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--proposed",
         action="store_true",
         help="only decisions an agent proposed and nobody has ruled on",
+    )
+    p.add_argument(
+        "--autonomous",
+        action="store_true",
+        help="only decisions writ made itself in autonomous mode, to review",
     )
     p.add_argument(
         "--open",
@@ -844,6 +864,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--supersedes", help="when confirming a decision, the id it replaces"
     )
     p.add_argument(
+        "--decision",
+        metavar="TEXT",
+        help="when confirming a decision, what was decided: required for one a "
+        "critic raised as a question, which the plan is then repaired to follow",
+    )
+    p.add_argument(
         "--force", action="store_true", help="bypass the dependency gate"
     )
     p.set_defaults(func=commands.cmd_set)
@@ -986,6 +1012,7 @@ def build_parser() -> argparse.ArgumentParser:
             "prefers the task the most others wait on"
         ),
     )
+    _autonomy(p)
     p.add_argument(
         "--agent", help="agent command (default: agents.implementer, else pi)"
     )

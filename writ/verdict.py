@@ -45,6 +45,24 @@ GATE_DECISIONS = ("pass", "needs-repair", "needs-decision")
 #: severities a gate may attach to a finding, worst first
 FINDING_SEVERITIES = ("blocking", "advisory")
 
+#: severities a gate writes in its own vocabulary, read as the two writ knows.
+#: Anything not listed here reads as blocking: a gate is the last check before
+#: "done", so an unfamiliar word must hold the graph rather than wave it through.
+#: `high` and `major` used to fall to advisory, which let a `needs-repair` whose
+#: every finding was serious complete the gate as if nothing had been found.
+SEVERITY_ALIASES = {
+    **dict.fromkeys(
+        ("error", "critical", "high", "major", "severe", "blocker", "must-fix",
+         "must", "fatal"),
+        "blocking",
+    ),
+    **dict.fromkeys(
+        ("warning", "warn", "low", "minor", "info", "informational", "nit",
+         "suggestion", "note", "optional", "trivial", "cosmetic"),
+        "advisory",
+    ),
+}
+
 CRITERION_STATUSES = ("passed", "failed", "pending")
 
 
@@ -170,7 +188,8 @@ GATE_SCHEMA = """\
   "questions": [
     {
       "question": "only for decision needs-decision: what a human has to rule on",
-      "context": "what makes it undecidable from the documents"
+      "context": "what makes it undecidable from the documents",
+      "recommendation": "the answer you would give, stated as the decision"
     }
   ],
   "notes": "risks, or anything the next gate attempt should know"
@@ -199,7 +218,9 @@ Rules for a gate review:
    only your findings, so a finding with no evidence produces a guess.
 6. `needs-decision` is for a question no amount of implementation answers: the
    design is ambiguous, or two requirements contradict. Do not pick a reading and
-   pass.
+   pass. Give each question your `recommendation`: the reading you would choose.
+   A ruling already listed in this prompt settles its question; judge the work
+   against it rather than asking again.
 7. Do not modify the repository. You are reading and running, not fixing. Work you
    think is needed goes in `findings`, not in the working tree.
 8. Be specific about what you are *not* saying. A finding names one defect; a
@@ -296,6 +317,8 @@ class GateQuestion:
 
     question: str
     context: str = ""
+    #: the answer the gate would give, which an autonomous run rules with
+    recommendation: str = ""
 
 
 def _shorten(text: str, limit: int = 160) -> str:
@@ -624,19 +647,15 @@ def _gate_verdict(
             # the finding. Synthesised rather than rejected, because the criteria
             # it did report are real evidence and refusing the verdict would
             # discard them.
-            findings = [
-                GateFinding(
-                    category="unmet-gate-criterion",
-                    summary=(
-                        f"gate criterion {criterion.number} is not met: "
-                        f"{criterion.status}"
-                    ),
-                    evidence=criterion.evidence,
-                    required_outcome="the criterion passes on the integrated code",
-                )
-                for criterion in criteria
-                if criterion.status != "passed"
-            ]
+            findings = _unmet_findings(criteria)
+    if decision == "needs-repair" and unmet and not any(
+        finding.severity == "blocking" for finding in findings
+    ):
+        # Failed criteria, but every finding written was advisory. Left alone,
+        # `_apply_gate` sees nothing blocking and completes the gate — a gate
+        # that said its own bar was not met, passed. The unmet criteria are the
+        # blocking finding it did not write.
+        findings = list(findings) + _unmet_findings(criteria)
     if decision == "needs-repair" and not findings:
         raise WritError(
             f"{where}: decision is 'needs-repair' but no findings were reported. "
@@ -660,6 +679,21 @@ def _gate_verdict(
         findings=findings,
         questions=questions,
     )
+
+
+def _unmet_findings(criteria: list[Criterion]) -> list[GateFinding]:
+    return [
+        GateFinding(
+            category="unmet-gate-criterion",
+            summary=(
+                f"gate criterion {criterion.number} is not met: {criterion.status}"
+            ),
+            evidence=criterion.evidence,
+            required_outcome="the criterion passes on the integrated code",
+        )
+        for criterion in criteria
+        if criterion.status != "passed"
+    ]
 
 
 GATE_FINDING_ALIASES = {
@@ -693,7 +727,7 @@ def _gate_findings(value: Any, where: str) -> list[GateFinding]:
             _text(_pick(raw, GATE_FINDING_ALIASES["severity"])) or "blocking"
         ).lower()
         if severity not in FINDING_SEVERITIES:
-            severity = "blocking" if severity in ("error", "critical") else "advisory"
+            severity = SEVERITY_ALIASES.get(severity, "blocking")
         location = _pick(raw, GATE_FINDING_ALIASES["where"])
         if isinstance(location, list):
             location = ", ".join(str(item) for item in location)
@@ -740,7 +774,13 @@ def _gate_questions(value: Any, where: str) -> list[GateQuestion]:
         if not text:
             raise WritError(f"{at}.question is required")
         questions.append(
-            GateQuestion(question=text, context=_text(raw.get("context")))
+            GateQuestion(
+                question=text,
+                context=_text(raw.get("context")),
+                recommendation=_text(
+                    _pick(raw, ("recommendation", "recommended", "suggestion"))
+                ),
+            )
         )
     return questions
 
@@ -853,11 +893,45 @@ def _criteria(value: Any, where: str) -> list[Criterion]:
     return sorted(out, key=lambda c: c.number)
 
 
+#: words agents reach for in place of the exact enum value, per field. An agent
+#: that did the work and wrote `"status": "pass"` used to lose its whole verdict
+#: over the spelling, and a lost verdict throws the task back to `planned` with
+#: nothing learned. Only unambiguous synonyms: nothing here can raise a claim.
+_ALIASES: dict[tuple[str, ...], dict[str, str]] = {
+    CRITERION_STATUSES: {
+        **dict.fromkeys(("pass", "ok", "met", "done", "yes", "true", "satisfied",
+                         "complete", "completed", "success"), "passed"),
+        **dict.fromkeys(("fail", "unmet", "not met", "no", "false", "failure",
+                         "not-met"), "failed"),
+        **dict.fromkeys(("unchecked", "unknown", "skipped", "not checked",
+                         "untested", "partial", "todo"), "pending"),
+    },
+    OUTCOMES: {
+        **dict.fromkeys(("completed", "done", "success"), "complete"),
+        **dict.fromkeys(("partial", "in-progress", "in progress"), "incomplete"),
+    },
+    DECISIONS: {
+        **dict.fromkeys(("accepted", "approve", "approved", "pass"), "accept"),
+        **dict.fromkeys(("rejected", "request-changes", "changes-requested",
+                         "fail"), "reject"),
+    },
+    GATE_DECISIONS: {
+        **dict.fromkeys(("passed", "ok"), "pass"),
+        **dict.fromkeys(("repair", "needs_repair", "fail", "failed"),
+                        "needs-repair"),
+        **dict.fromkeys(("needs_decision", "decision"), "needs-decision"),
+    },
+}
+
+
 def _one_of(value: Any, allowed: tuple[str, ...], field_name: str, where: str) -> str:
-    if not isinstance(value, str) or value.strip().lower() not in allowed:
+    word = value.strip().lower() if isinstance(value, str) else None
+    if word is not None and word not in allowed:
+        word = _ALIASES.get(allowed, {}).get(word, word)
+    if word is None or word not in allowed:
         listed = ", ".join(allowed)
         raise WritError(f"{where}: {field_name} must be one of {listed} (got {value!r})")
-    return value.strip().lower()
+    return word
 
 
 def _text(value: Any) -> str:
@@ -981,7 +1055,6 @@ def apply(
     holds, carrying the rejection with it — see `_send_back`. Past that budget,
     and for an implementer that reports its own work incomplete, the task fails.
     """
-    from . import decisions as decision_log
     from .model import DEFAULT_MAX_REWORK, add_evidence, refresh_milestones
 
     if max_rework is None:
@@ -1019,16 +1092,7 @@ def apply(
             add_evidence(task, verdict.downgraded, actor="writ")
         if verdict.notes:
             add_evidence(task, f"notes: {verdict.notes}", actor=actor)
-        for proposal in verdict.decisions:
-            decision_log.propose(
-                data,
-                title=proposal.title,
-                decision=proposal.decision,
-                context=proposal.context,
-                consequences=proposal.consequences,
-                proposed_by=actor,
-                tasks=[task["id"]],
-            )
+        _log_proposals(data, task, verdict, actor=actor)
         refresh_milestones(data)
         return status
 
@@ -1045,7 +1109,27 @@ def apply(
             claimed_verdict=claimed_verdict,
         )
     elif verdict.outcome == "incomplete":
-        status = "failed"
+        # The implementer says itself that it did not finish. That used to fail
+        # the task on the spot — the only path to `failed` that spent no budget —
+        # so one agent running out of turns ended a task a second attempt would
+        # likely have closed. It gets the same bounded retry a rejection does,
+        # carrying what it said it managed and what it did not.
+        status = send_back_unfinished(
+            task,
+            reason="the previous attempt reported its own work incomplete",
+            summary=verdict.summary,
+            notes=verdict.notes or "",
+            findings=[
+                {
+                    "number": criterion.number,
+                    "status": criterion.status,
+                    "evidence": criterion.evidence,
+                }
+                for criterion in verdict.criteria
+                if criterion.status != "passed"
+            ],
+            max_rework=max_rework,
+        )
     elif verdict.role == "reviewer" or not review_required:
         status = "completed"
         # The work was accepted, so whatever it was last sent back for has been
@@ -1082,16 +1166,7 @@ def apply(
         add_evidence(task, f"notes: {verdict.notes}", actor=actor)
     if verdict.blocked_on:
         add_evidence(task, f"blocked on: {verdict.blocked_on}", actor=actor)
-    for proposal in verdict.decisions:
-        decision_log.propose(
-            data,
-            title=proposal.title,
-            decision=proposal.decision,
-            context=proposal.context,
-            consequences=proposal.consequences,
-            proposed_by=actor,
-            tasks=[task["id"]],
-        )
+    _log_proposals(data, task, verdict, actor=actor)
     refresh_milestones(data)
     return status
 
@@ -1147,6 +1222,20 @@ def _apply_gate(
         return "completed"
 
     if verdict.decision == "needs-decision":
+        ruled = _rule_for_gate(data, gate, verdict.questions, actor=actor)
+        if ruled is not None:
+            # Autonomous: the recommendations are the rulings, and the gate
+            # judges the work again against them. If that work does not follow
+            # them, its next verdict is `needs-repair`, which is the usual path.
+            add_evidence(
+                gate,
+                f"decided autonomously ({', '.join(ruled)}): "
+                + "; ".join(question.question for question in verdict.questions)
+                + "; judging the work again against the rulings",
+                actor="writ",
+            )
+            gate.pop("held", None)
+            return "planned"
         for question in verdict.questions:
             decision_log_propose_question(data, gate, question, actor=actor)
         add_evidence(
@@ -1230,6 +1319,80 @@ def _gate_finding_ids(data: dict[str, Any], scope: str) -> list[str]:
     ]
 
 
+def _log_proposals(
+    data: dict[str, Any], task: dict[str, Any], verdict: "Verdict", *, actor: str
+) -> None:
+    """Put the decisions an agent reported in the log: proposed, or in autonomous
+    mode confirmed at once, since nobody is going to confirm them later."""
+    from . import decisions as decision_log
+
+    record = decision_log.decide if decision_log.autonomous(data) else decision_log.propose
+    for proposal in verdict.decisions:
+        record(
+            data,
+            title=proposal.title,
+            decision=proposal.decision,
+            context=proposal.context,
+            consequences=proposal.consequences,
+            proposed_by=actor,
+            tasks=[task["id"]],
+        )
+
+
+#: how many times an autonomous run answers a gate's questions before it holds
+#: the gate for a person: a gate that asks again after its answer is going round
+AUTONOMOUS_RULINGS = 2
+
+
+def _rule_for_gate(
+    data: dict[str, Any], gate: dict[str, Any], questions: list[Any], *, actor: str
+) -> list[str] | None:
+    """Answer a gate's questions with their recommendations, autonomously.
+
+    `questions` are `GateQuestion`s or a repair planner's question objects. The
+    answers are logged against the gate, which is where its prompt and the
+    repair planner's look for them. Returns the decision ids, or `None` when
+    writ may not answer: not autonomous, a question without a recommendation,
+    or the gate's allowance of answered rounds spent.
+    """
+    from . import decisions as decision_log
+
+    if not decision_log.autonomous(data) or not questions:
+        return None
+    asked = [_question_parts(question) for question in questions]
+    if any(not recommendation for _, _, recommendation in asked):
+        return None
+    if int(gate.get("autonomous_rulings", 0)) >= AUTONOMOUS_RULINGS:
+        return None
+    gate["autonomous_rulings"] = int(gate.get("autonomous_rulings", 0)) + 1
+    made = []
+    for question, context, recommendation in asked:
+        record = decision_log.decide(
+            data,
+            title=_shorten(question, 72),
+            decision=recommendation,
+            context=f"{gate['id']} asked: {question}"
+            + (f" ({context})" if context else ""),
+            consequences=f"{gate['id']} is judged again against this ruling.",
+            proposed_by=actor,
+            tasks=[gate["id"]],
+        )
+        made.append(record["id"])
+    return made
+
+
+def _question_parts(question: Any) -> tuple[str, str, str]:
+    """(question, context, recommendation) from a `GateQuestion` or a plain dict."""
+    if isinstance(question, GateQuestion):
+        return question.question, question.context, question.recommendation
+    raw = question if isinstance(question, dict) else {"question": question}
+    return (
+        _text(raw.get("question")),
+        _text(raw.get("context")),
+        _text(_pick(raw, ("recommendation", "recommended", "suggestion"))),
+    )
+
+
 def decision_log_propose_question(
     data: dict[str, Any], gate: dict[str, Any], question: "GateQuestion", *, actor: str
 ) -> None:
@@ -1250,7 +1413,12 @@ def decision_log_propose_question(
             "Undecided: the gate could not rule on this from the documents and "
             "stopped rather than guess."
         ),
-        context=question.context or question.question,
+        context=(question.context or question.question)
+        + (
+            f" Recommended: {question.recommendation}"
+            if question.recommendation
+            else ""
+        ),
         consequences=(
             f"{gate['id']} cannot pass until this is settled; work behind it is held."
         ),
@@ -1340,6 +1508,67 @@ def _send_back(
         task,
         f"sent back for rework ({attempt} of {budget}) after {actor} "
         "rejected it; the next agent on this task is given the rejection",
+        actor="writ",
+    )
+    return "planned"
+
+
+def send_back_unfinished(
+    task: dict[str, Any],
+    *,
+    reason: str,
+    max_rework: int,
+    summary: str = "",
+    notes: str = "",
+    findings: list[dict[str, Any]] | None = None,
+) -> str:
+    """Return a task whose implementation did not finish, out of the rework budget.
+
+    For the two ways an implementation ends without a judgement to answer: the
+    agent said it was incomplete, or it exited non-zero without reporting at all
+    and nothing classified that as the machinery's fault. Neither is a reviewer's
+    rejection, but both are an attempt at the work that came to nothing, so both
+    are counted where attempts at the work are counted — the rework budget —
+    rather than failing the task on the first occurrence or retrying it without
+    bound. `kind` tells the next prompt which of the two it is answering.
+    """
+    from .model import add_evidence
+
+    prior = task.get("rework") or {}
+    attempt = int(prior.get("attempt", 0)) + 1
+    allowance = int(prior.get("allowance", 0))
+    budget = max_rework + allowance
+    exhausted = attempt > budget
+    task["rework"] = {
+        "attempt": attempt,
+        "max": max_rework,
+        "allowance": allowance,
+        "budget": budget,
+        "at": utcnow(),
+        "kind": "unfinished",
+        "reviewer": "writ",
+        "reason": reason,
+        "summary": summary,
+        "notes": notes,
+        "unmet": [item["number"] for item in findings or []],
+        "findings": list(findings or []),
+        "claimed": [],
+        "claimed_by": "",
+        "claimed_summary": "",
+        "exhausted": exhausted,
+    }
+    if exhausted:
+        add_evidence(
+            task,
+            f"{reason}, for the {_ordinal(attempt)} time; the rework budget of "
+            f"{budget} is spent, so the task is left failed for a human to look at",
+            actor="writ",
+        )
+        return "failed"
+    add_evidence(
+        task,
+        f"{reason}; returned to the queue ({attempt} of {budget}) and the next "
+        "agent is told where the last one stopped",
         actor="writ",
     )
     return "planned"

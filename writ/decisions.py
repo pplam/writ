@@ -28,6 +28,18 @@ STATUSES = ("proposed", "active", "superseded", "rejected")
 #: confirming a replacement, not something you assert directly
 SETTABLE_DECISION_STATUSES = ("active", "rejected")
 
+#: the statement a decision carries while it waits for a person to rule. A
+#: decision raised from a `needs-decision` finding is a question, not a proposal:
+#: confirming this text as written would make "undecided" binding.
+UNDECIDED = "Undecided: a critic found the plan needs a ruling here."
+
+#: how every question's placeholder opens, whoever raised it: a critic, the
+#: adjudicator, a gate or a repair planner
+UNDECIDED_PREFIX = "Undecided:"
+
+#: who confirms a decision writ made without a person (`decisions.autonomous`)
+AUTONOMOUS = "autonomous"
+
 
 def _next_id(data: dict[str, Any]) -> str:
     counters = data.setdefault("counters", {})
@@ -118,6 +130,82 @@ def reject(
     record["confirmed_by"] = actor
     record["confirmed_at"] = utcnow()
     return record
+
+
+def undecided(record: dict[str, Any]) -> bool:
+    """Whether this decision is a question still waiting for its answer."""
+    return record.get("decision", "").startswith(UNDECIDED_PREFIX)
+
+
+def autonomous(data: dict[str, Any]) -> bool:
+    """Whether writ makes decisions itself rather than stopping for a person.
+
+    Stored in the state by the command that resolved it (`--autonomous`, else
+    `decisions.autonomous` in the config), because what applies a verdict is
+    several calls away from the arguments that said so.
+    """
+    return bool(data.get("autonomous"))
+
+
+def answer(
+    data: dict[str, Any], decision_id: str, ruling: str, *, actor: str = AUTONOMOUS
+) -> dict[str, Any]:
+    """Settle a question with its answer, keeping the question on the record."""
+    record = get(data, decision_id)
+    if not ruling.strip():
+        raise WritError(f"{decision_id} needs an answer, not an empty one")
+    if record["status"] != "proposed":
+        raise WritError(f"{decision_id} is {record['status']}; its text is settled")
+    record["decision"] = ruling.strip()
+    return confirm(data, decision_id, actor=actor)
+
+
+def decide(
+    data: dict[str, Any],
+    *,
+    title: str,
+    decision: str,
+    context: str = "",
+    consequences: str = "",
+    proposed_by: str,
+    tasks: list[str] | None = None,
+) -> dict[str, Any]:
+    """Record a decision writ made on its own: proposed and confirmed at once.
+
+    Nothing is skipped on the way. It is the same record a person would have
+    confirmed, marked `confirmed_by: autonomous`, so the log still says who
+    proposed what, and `writ set D-NNNN rejected` still overturns it.
+    """
+    record = propose(
+        data,
+        title=title,
+        decision=decision,
+        context=context,
+        consequences=consequences,
+        proposed_by=proposed_by,
+        tasks=tasks,
+    )
+    return confirm(data, record["id"], actor=AUTONOMOUS)
+
+
+def ruling(data: dict[str, Any], finding_id: str) -> dict[str, Any] | None:
+    """The active decision a person gave in answer to this finding, if any."""
+    for item in data["decisions"]:
+        if (
+            item.get("finding") == finding_id
+            and item["status"] == "active"
+            and not undecided(item)
+        ):
+            return item
+    return None
+
+
+def asked(data: dict[str, Any], finding_id: str) -> dict[str, Any] | None:
+    """The decision raised for this finding that nobody has answered yet."""
+    for item in data["decisions"]:
+        if item.get("finding") == finding_id and item["status"] == "proposed":
+            return item
+    return None
 
 
 def proposed(data: dict[str, Any]) -> list[dict[str, Any]]:

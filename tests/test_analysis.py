@@ -413,7 +413,7 @@ def test_parallel_stages_produce_the_same_plan(writ, project, design):
     agent happened to finish first.
     """
     writ("init")
-    code, out, _ = writ("plan", str(design), "--parallel-stages", *staged())
+    code, out, _ = writ("plan", str(design), *staged())
     assert code == 0
     assert _work(state.load(project)) == ["M01-001", "M01-002", "M02-001"]
     reported = [
@@ -432,7 +432,7 @@ def test_parallel_stages_say_what_the_inventory_gives_up(writ, project, design):
     place the trade can be seen is the run that made it.
     """
     writ("init")
-    code, out, _ = writ("plan", str(design), "--parallel-stages", *staged())
+    code, out, _ = writ("plan", str(design), *staged())
     assert code == 0
     assert "at once: requirements, inventory" in out
     assert "claim no existing coverage" in out
@@ -483,7 +483,7 @@ def test_a_blind_inventory_citing_an_id_it_invented_fails_the_stage(
         {"requirement_id": "REQ-099", "status": "full", "evidence": "tests/test_x.py"}
     ]
     code, out, err = writ(
-        "plan", str(design), "--parallel-stages", *staged(inventory=invented)
+        "plan", str(design), *staged(inventory=invented)
     )
     assert code == 1
     assert "REQ-099" in out + err
@@ -612,7 +612,8 @@ def test_a_failed_stage_stops_before_synthesis(writ, project, design):
     silent = f"{shlex.quote(sys.executable)} -c {shlex.quote('pass')}"
     code, out, err = writ("plan", str(design), "--agent", silent, "--quiet")
     assert code == 1
-    assert "the requirements stage produced no usable artifact" in err
+    # Both analyses ran at once, so both fail, and the message names them both.
+    assert "the requirements and inventory stages produced no usable artifact" in err
     assert "wrote no artifact" in err
     assert state.load(project)["tasks"] == {}
     # and it names the resume path rather than making the operator reconstruct it

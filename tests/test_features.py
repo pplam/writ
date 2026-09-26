@@ -12,7 +12,17 @@ import json
 
 import pytest
 
-from writ import adjudicate, contracts, gates, plancheck, plans, planning, runner, state
+from writ import (
+    adjudicate,
+    config,
+    contracts,
+    gates,
+    plancheck,
+    planning,
+    plans,
+    runner,
+    state,
+)
 
 from tests.test_adjudicate import ADJUDICATOR, agent, patched
 
@@ -366,9 +376,249 @@ def test_a_needs_decision_finding_goes_to_a_human_not_the_adjudicator(
     assert len([i for i in state.load(project)["decisions"] if i.get("finding")]) == 1
 
 
+@pytest.fixture
+def asked(committed, writ, project, monkeypatch):
+    """A plan held on a `needs-decision` finding the loop has put to a person."""
+    with state.transaction(project) as data:
+        plans.record_findings(
+            data,
+            [
+                plancheck.Finding(
+                    severity="error",
+                    category="needs-decision",
+                    message="the design allows two retention policies",
+                    where="FT-002",
+                    source="critic:fidelity",
+                )
+            ],
+            scope="critic:fidelity",
+        )
+    patched(monkeypatch, {"revise": {"FT-002": {"notes": "retention: keep 30 days"}}})
+    code, out, _ = _adjudicate(writ)
+    assert code == 1
+    assert "need your ruling" in out and "D-0001 for F-" in out
+    assert "next: writ set D-NNNN active --decision" in out
+    return writ
+
+
+def _to_fix(project):
+    folder = state.load(project)["plan"]["id"]
+    rounds = sorted((project / ".writ" / "plans").glob(f"{folder}*/rounds/*/round-*"))
+    return json.loads((rounds[-1] / "to-fix.json").read_text())
+
+
+def test_a_held_plan_names_the_decision_to_answer(asked, project):
+    message = plans.not_runnable_message(state.load(project))
+    assert "D-0001 (for F-" in message and "--decision" in message
+
+
+def test_a_question_cannot_be_confirmed_without_its_answer(asked):
+    code, _, err = asked("set", "D-0001", "active")
+    assert code != 0 and "--decision" in err
+
+
+def test_a_ruling_is_repaired_into_the_plan(asked, project):
+    code, out, err = asked(
+        "set", "D-0001", "active", "--decision", "Keep 30 days of events."
+    )
+    assert code == 0, err
+    record = state.load(project)["decisions"][0]
+    assert record["status"] == "active"
+    assert record["decision"] == "Keep 30 days of events."
+    assert "next: writ build" in out
+    code, _, err = _adjudicate(asked)
+    assert code == 0, err
+    assert state.load(project)["tasks"]["FT-002"]["notes"] == "retention: keep 30 days"
+    handed = _to_fix(project)
+    assert handed[0]["category"] == "needs-decision"
+    assert "Keep 30 days of events." in handed[0]["suggested_action"]
+
+
+def test_building_again_applies_the_ruling_and_approves(asked, project):
+    asked("set", "D-0001", "active", "--decision", "Keep 30 days of events.")
+    code, out, err = asked(
+        "build", "--critic", agent(ADJUDICATOR), "--repair", "--max-tasks", "0"
+    )
+    assert "repairing the plan to follow the ruling on F-" in out, err
+    data = state.load(project)
+    assert data["tasks"]["FT-002"]["notes"] == "retention: keep 30 days"
+    assert plans.runnable(data)
+
+
+def _retention_question(project):
+    with state.transaction(project) as data:
+        plans.record_findings(
+            data,
+            [
+                plancheck.Finding(
+                    severity="error",
+                    category="needs-decision",
+                    message="the design allows two retention policies",
+                    where="FT-002",
+                    suggested_action="Keep 30 days of events.",
+                    source="critic:fidelity",
+                )
+            ],
+            scope="critic:fidelity",
+        )
+
+
+def test_autonomous_mode_has_the_adjudicator_decide_and_logs_it(
+    committed, writ, project, monkeypatch
+):
+    _retention_question(project)
+    patched(
+        monkeypatch,
+        {
+            "revise": {"FT-002": {"notes": "retention: keep 30 days"}},
+            "_decision": "Keep 30 days of events.",
+        },
+    )
+    code, out, err = writ(
+        "adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics", "--autonomous"
+    )
+    assert code == 0, out + err
+    data = state.load(project)
+    assert data["tasks"]["FT-002"]["notes"] == "retention: keep 30 days"
+    [record] = [item for item in data["decisions"] if item.get("finding")]
+    assert record["status"] == "active"
+    assert record["decision"] == "Keep 30 days of events."
+    assert record["confirmed_by"] == "autonomous"
+    handed = _to_fix(project)
+    assert "decide it yourself" in handed[0]["suggested_action"]
+    assert "Keep 30 days" in handed[0]["suggested_action"]
+    # the log says who ruled, and can be narrowed to what writ decided alone
+    code, out, _ = writ("list", "decisions", "--autonomous")
+    assert code == 0 and record["id"] in out and "autonomous" in out
+
+
+def test_autonomous_mode_can_be_set_once_in_the_config(
+    committed, writ, project, monkeypatch
+):
+    _retention_question(project)
+    config.config_file(project).write_text("decisions:\n  autonomous: true\n")
+    patched(
+        monkeypatch,
+        {
+            "revise": {"FT-002": {"notes": "retention: keep 30 days"}},
+            "_decision": "Keep 30 days of events.",
+        },
+    )
+    code, out, err = _adjudicate(writ)
+    assert code == 0, out + err
+    [record] = [i for i in state.load(project)["decisions"] if i.get("finding")]
+    assert record["confirmed_by"] == "autonomous"
+    # and a flag still wins over it
+    _retention_question(project)
+    code, _, _ = writ(
+        "adjudicate", "--agent", agent(ADJUDICATOR), "--no-critics", "--no-autonomous"
+    )
+    assert code == 1
+
+
+def test_building_autonomously_repairs_and_approves(
+    committed, writ, project, monkeypatch
+):
+    _retention_question(project)
+    patched(
+        monkeypatch,
+        {
+            "revise": {"FT-002": {"notes": "retention: keep 30 days"}},
+            "_decision": "Keep 30 days of events.",
+        },
+    )
+    code, out, err = writ(
+        "build", "--critic", agent(ADJUDICATOR), "--autonomous", "--max-tasks", "0"
+    )
+    assert "(autonomous)" in out, out + err
+    data = state.load(project)
+    assert data["tasks"]["FT-002"]["notes"] == "retention: keep 30 days"
+    assert plans.runnable(data)
+    assert data["autonomous"] is True
+
+
 def test_the_adjudicator_is_told_edges_come_from_contracts(tmp_path):
     prompt = adjudicate.build_prompt(
         root=tmp_path, doc=None, directory=tmp_path / "round-1", blocking=1, features=True
     )
     assert "writ derives it from the contracts" in " ".join(prompt.split())
     assert '"owns"' in prompt
+
+
+# --------------------------------------------------------------------------
+# what execution prompts carry: decisions and the verify command
+
+
+def _decision(number, task_id, title, text, status="accepted"):
+    return {
+        "id": f"D-{number:03d}",
+        "tasks": [task_id],
+        "title": title,
+        "decision": text,
+        "status": status,
+    }
+
+
+def test_the_final_gate_sees_decisions_through_milestone_gates(committed, project):
+    data = committed
+    data["tasks"]["G-M1"] = {
+        **data["tasks"]["G-FINAL"],
+        "id": "G-M1",
+        "depends_on": ["FT-001", "FT-002"],
+    }
+    data["tasks"]["G-FINAL"]["depends_on"] = ["G-M1", "FT-003", "FT-004"]
+    data["decisions"] = [
+        _decision(1, "FT-001", "Settings format", "TOML, one file per project."),
+        _decision(2, "FT-002", "Log encoding", "x" * 1000),
+        _decision(3, "FT-002", "Abandoned idea", "use sqlite", status="rejected"),
+    ]
+    prompt = runner.build_gate_prompt(data, data["tasks"]["G-FINAL"], project)
+    assert "Settings format" in prompt  # reached only through G-M1
+    assert "Log encoding" in prompt and "x" * 300 not in prompt  # abridged
+    assert "Abandoned idea" not in prompt
+    assert "abridged; the full text" in prompt
+
+
+def test_the_implementer_sees_what_upstream_work_decided(committed, project):
+    data = committed
+    data["decisions"] = [
+        _decision(1, "FT-001", "Settings format", "TOML, one file per project."),
+        _decision(2, "FT-003", "Not upstream", "irrelevant to FT-002"),
+    ]
+    prompt = runner.build_prompt(data, data["tasks"]["FT-002"], project)
+    assert "Decisions the work you build on already made" in prompt
+    assert "Settings format: TOML, one file per project." in prompt
+    assert "Not upstream" not in prompt
+
+
+def test_every_execution_prompt_names_the_verify_command(committed, project):
+    data = committed
+    data.setdefault("plan", {}).setdefault("pipeline", {})["baseline"] = {
+        "commands": ["make test"]
+    }
+    task, gate = data["tasks"]["FT-002"], data["tasks"]["G-FINAL"]
+    for prompt in (
+        runner.build_prompt(data, task, project),
+        runner.build_review_prompt(data, task, project),
+        runner.build_gate_prompt(data, gate, project),
+    ):
+        assert "  make test" in prompt
+    overridden = runner.build_prompt(data, task, project, verify="uv run pytest")
+    assert "  uv run pytest" in overridden and "make test" not in overridden
+
+
+def test_a_greenfield_plan_names_no_verify_command(committed, project):
+    prompt = runner.build_prompt(committed, committed["tasks"]["FT-002"], project)
+    assert "Verify with (" not in prompt
+
+
+def test_the_configured_verify_command_wins_over_planning(committed, project):
+    data = committed
+    data.setdefault("plan", {}).setdefault("pipeline", {})["baseline"] = {
+        "commands": ["make test"]
+    }
+    config.config_file(project).write_text(
+        "run:\n  verify: just check\n", encoding="utf-8"
+    )
+    assert runner.verify_commands(data, project) == ["just check"]
+    assert runner.verify_commands(data, project, "tox") == ["tox"]
