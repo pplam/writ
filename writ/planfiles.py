@@ -1,14 +1,16 @@
 """The committed plan on disk: a small index plus one file per feature.
 
-`state.json` is the source of truth. These files are its plan-phase projection,
+The store (`.writ/store.db`) is the source of truth. These files are its plan-phase projection,
 written so that an agent (a critic, the adjudicator) can be pointed at them and
 read what it needs, instead of having the whole graph pasted into its prompt.
 
     .writ/plans/<plan-id>/
         plan.json               the index: requirements, milestones, one row per feature
         features/<task-id>.json one dispatchable unit in full
-        reviews/r<rev>/         critic reports for a revision
-        rounds/r<rev>/          plan-repair attempts against a revision
+        rounds/r<rev>/          everything done against a revision:
+            known-findings.json what writ already found, for the critics
+            <critic>/           each critic's report and transcript
+            adjudicate-<n>/     each plan-repair attempt
 
 Every path recorded here or shown to an agent is relative to the repository
 root; see `rel`.
@@ -27,7 +29,6 @@ from . import contracts, plans, state
 INDEX_FILENAME = "plan.json"
 DRAFT_FILENAME = "draft.json"
 FEATURES_DIRNAME = "features"
-REVIEWS_DIRNAME = "reviews"
 ROUNDS_DIRNAME = "rounds"
 
 #: the fields a feature file carries, in the order they are written. `id`,
@@ -117,11 +118,6 @@ def index_path(root, data) -> Path:
 
 def features_dir(root, data) -> Path:
     return directory(root, data) / FEATURES_DIRNAME
-
-
-def reviews_dir(root, data, revision: int | None = None) -> Path:
-    rev = plans.revision(data) if revision is None else revision
-    return directory(root, data) / REVIEWS_DIRNAME / f"r{rev}"
 
 
 def rounds_dir(root, data, revision: int | None = None) -> Path:
@@ -219,22 +215,129 @@ def dump(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def write_features(folder: Path, tasks: dict[str, dict[str, Any]]) -> None:
-    """Write one file per task into `folder`, removing files for tasks that are gone."""
+def _render(payload: Any) -> str:
+    return json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+
+
+def _put(path: Path, payload: Any) -> bool:
+    """Write `payload` unless the file already holds exactly it. True if written."""
+    text = _render(payload)
+    try:
+        if path.read_text(encoding="utf-8") == text:
+            return False
+    except (OSError, UnicodeDecodeError):
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return True
+
+
+def write_features(folder: Path, tasks: dict[str, dict[str, Any]]) -> list[Path]:
+    """Write one file per task into `folder`, removing files for tasks that are gone.
+
+    A file that already says what it should is left alone, so refreshing the
+    view after every commit costs a read per feature, not a write. Returns the
+    files it wrote or removed.
+    """
     folder.mkdir(parents=True, exist_ok=True)
+    touched: list[Path] = []
     for stale in folder.glob("*.json"):
         if stale.stem not in tasks:
             stale.unlink()
+            touched.append(stale)
     for task_id, task in tasks.items():
-        dump(folder / f"{task_id}.json", feature(task))
+        path = folder / f"{task_id}.json"
+        if _put(path, feature(task)):
+            touched.append(path)
+    return touched
 
 
 def export(root: str | os.PathLike[str], data: dict[str, Any]) -> Path:
     """Write the index and every feature file for the current revision."""
     write_features(features_dir(root, data), data.get("tasks", {}))
     path = index_path(root, data)
-    dump(path, index(root, data))
+    _put(path, index(root, data))
     return path
+
+
+def refresh(root: str | os.PathLike[str], data: dict[str, Any]) -> list[Path]:
+    """Bring an exported plan's files up to date. Returns what had to change.
+
+    Only a plan that has been exported: before that there is nothing to keep
+    current, and exporting would mint an id for a plan still being drafted.
+    """
+    if not current_id(data) or not directory(root, data).is_dir():
+        return []
+    touched = write_features(features_dir(root, data), data.get("tasks", {}))
+    path = index_path(root, data)
+    if _put(path, index(root, data)):
+        touched.append(path)
+    return touched
+
+
+def drift(root: str | os.PathLike[str], data: dict[str, Any]) -> list[Path]:
+    """The plan files that no longer say what the store says: edited by hand, or
+    by an agent that wrote outside its output. Nothing is changed."""
+    if not current_id(data) or not directory(root, data).is_dir():
+        return []
+    expected = {
+        features_dir(root, data) / f"{task_id}.json": feature(task)
+        for task_id, task in data.get("tasks", {}).items()
+    }
+    expected[index_path(root, data)] = index(root, data)
+    found = [
+        path
+        for path, payload in expected.items()
+        if not path.exists() or path.read_text(encoding="utf-8", errors="replace") != _render(payload)
+    ]
+    found.extend(
+        path for path in features_dir(root, data).glob("*.json") if path not in expected
+    )
+    return sorted(found)
+
+
+#: fields of a feature file that are progress, not plan: a changeset leaves them out
+PROGRESS_FIELDS = ("status",)
+
+_ABSENT = object()
+
+
+def field_changes(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """Field by field, what differs: `before` and `after`, either missing if the
+    field was added or deleted."""
+    fields: dict[str, Any] = {}
+    for key in sorted(set(before) | set(after)):
+        if before.get(key, _ABSENT) == after.get(key, _ABSENT):
+            continue
+        change: dict[str, Any] = {}
+        if key in before:
+            change["before"] = before[key]
+        if key in after:
+            change["after"] = after[key]
+        fields[key] = change
+    return fields
+
+
+def changeset(
+    before: dict[str, dict[str, Any]], after: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    """What changed between two task maps, as feature files: added, removed, modified."""
+    def plan_of(task: dict[str, Any]) -> dict[str, Any]:
+        entry = feature(task)
+        for key in PROGRESS_FIELDS:
+            entry.pop(key, None)
+        return entry
+
+    modified = {}
+    for task_id in sorted(set(before) & set(after)):
+        fields = field_changes(plan_of(before[task_id]), plan_of(after[task_id]))
+        if fields:
+            modified[task_id] = fields
+    return {
+        "added": {task_id: plan_of(after[task_id]) for task_id in sorted(set(after) - set(before))},
+        "removed": sorted(set(before) - set(after)),
+        "modified": modified,
+    }
 
 
 def ensure(root: str | os.PathLike[str], data: dict[str, Any]) -> Path:

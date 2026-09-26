@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from writ import orchestrator, runner, state
+from writ import orchestrator, planfiles, runner, state
 
 
 # --------------------------------------------------------------------------
@@ -785,6 +785,28 @@ def test_the_claim_makes_a_task_unselectable(planned, writ, project):
     assert orchestrator.next_job(data, busy=[], budget=None, started=[]) is None
 
 
+def test_a_run_folder_names_its_task_order_and_role(planned, writ, project):
+    """`runs/<task>/<nn>-<role>/`, with the run's record mirrored beside it."""
+    writ("dispatch", "M01-001", "--agent", agent(IMPLEMENTER))
+    writ("review", "M01-001", "--agent", agent(REVIEWER))
+    data = state.load(project)
+    assert data["tasks"]["M01-001"]["runs"] == ["M01-001/01-implement", "M01-001/02-review"]
+    folder = state.run_dir(project, "M01-001/02-review")
+    assert folder == state.runs_dir(project) / "M01-001" / "02-review"
+    meta = json.loads((folder / runner.META_FILENAME).read_text())
+    assert meta["id"] == "M01-001/02-review" and meta["role"] == "reviewer"
+    assert meta["status"] == data["runs"]["M01-001/02-review"]["status"]
+    assert meta["finished_at"] and meta["exit_code"] == 0
+
+
+def test_a_run_number_skips_a_folder_already_taken():
+    taken = ["T-1/01-implement", "T-1/02-review", "T-2/01-implement"]
+    assert runner.new_run_id("T-1", "agent", taken) == "T-1/03-implement"
+    assert runner.new_run_id("T-3", "gate", taken) == "T-3/01-gate"
+    # An old timestamped id does not count toward the sequence.
+    assert runner.new_run_id("T-1", "repair", ["T-1-20260101T000000"]) == "T-1/01-repair"
+
+
 def test_a_task_running_elsewhere_is_not_selected(planned, writ, project):
     """A detached `writ dispatch` and a `writ run` must not collide."""
     writ("dispatch", "M01-001", "--agent", "true", "--detach")
@@ -1473,3 +1495,38 @@ def test_a_run_that_ends_with_work_left_exits_non_zero(planned, writ, project):
                         "--reviewer", agent(REJECTOR), "--max-rework", "0")
     assert code == 1
     assert state.load(project)["tasks"]["M01-001"]["status"] == "failed"
+
+
+def test_a_verdict_names_the_run_that_wrote_it(planned, writ, project):
+    """The task carries a summary of its last verdict and where the rest is."""
+    writ("dispatch", "M01-001", "--agent", agent(IMPLEMENTER))
+    last = state.load(project)["tasks"]["M01-001"]["last_verdict"]
+    assert last["run"] == "M01-001/01-implement"
+    assert (state.run_dir(project, last["run"]) / "verdict.json").exists()
+
+
+def test_an_agent_that_edits_the_plan_files_is_undone_and_named(
+    planned, writ, project, monkeypatch
+):
+    """The plan's files are views: an edit to one is put back, and said out loud."""
+    data = state.load(project)
+    feature = planfiles.features_dir(project, data) / "M01-001.json"
+    original = feature.read_text()
+    monkeypatch.setenv("WRIT_TEST_VANDAL", str(feature))
+    vandal = (
+        "import os\n"
+        "open(os.environ['WRIT_TEST_VANDAL'], 'w').write('{\"title\": \"mine now\"}')\n"
+        + IMPLEMENTER
+    )
+    writ("dispatch", "M01-001", "--agent", agent(vandal))
+    task = state.load(project)["tasks"]["M01-001"]
+    assert any(
+        "writ restored them" in item["text"] and "M01-001.json" in item["text"]
+        for item in task["evidence"]
+    )
+    restored = json.loads(feature.read_text())
+    assert restored["title"] == json.loads(original)["title"]
+
+
+def test_the_implementer_is_told_to_leave_writs_files_alone():
+    assert ".writ/" in runner.GUARDRAILS

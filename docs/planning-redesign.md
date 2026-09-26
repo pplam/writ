@@ -45,10 +45,10 @@ One directory per plan holds everything about it:
   synthesis/                the synthesizer's transcript
   plan.json                 INDEX of the committed plan at its current revision
   features/<task-id>.json   one file per task (gates included), committed ids
-  reviews/r<rev>/
+  rounds/r<rev>/             everything done against one revision
     known-findings.json     what writ already found, pre-filtered for critics
     <critic>/findings.json  each critic's report, plus its transcript
-  rounds/r<rev>/round-<n>/  one plan-repair attempt (see §2)
+    adjudicate-<n>/         one plan-repair attempt (see §2)
 ```
 
 - `plan.json` is small. It holds the plan id, revision, design document, the
@@ -87,7 +87,8 @@ Plan-phase repair and execution-phase repair are now different operations:
 
 ### A round
 
-For each attempt, writ prepares `rounds/r<rev>/round-<n>/`:
+For each attempt, writ prepares `rounds/r<rev>/adjudicate-<n>/`, next to the
+critic reports it answers:
 
 ```
 to-fix.json      the blocking findings this round must answer, and nothing else
@@ -99,7 +100,7 @@ response.json    written by the agent: analysis, dispositions, questions
 
 `r<rev>` is the revision the loop started at. Every attempt in that run of the
 loop goes under it, including those after a promoted round bumped the revision,
-and `round-<n>` numbering continues from what is already on disk. That way a
+and `adjudicate-<n>` numbering continues from what is already on disk. That way a
 resumed `writ adjudicate` never overwrites a working copy that an earlier refusal
 left behind.
 
@@ -195,7 +196,7 @@ reports.
 Writ pre-filters what it hands over, so "read this file" is never "read this
 and ignore most of it":
 
-- critics get `reviews/r<rev>/known-findings.json`: writ's open blocking and
+- critics get `rounds/r<rev>/known-findings.json`: writ's open blocking and
   advisory findings, not notes, not other critics' reports;
 - the adjudicator gets `to-fix.json`: blocking findings only;
 
@@ -311,5 +312,9 @@ requirements), approval on the record, gates, and the human disposition path.
   draft format, not the index.
 - `.writ/reviews/` and `.writ/adjudication/` from older projects are left where
   they are. New ones are written under the plan directory.
+- Plans written before critics and repairs shared `rounds/r<rev>/` keep their
+  `reviews/` and `rounds/r<rev>/round-<n>/` directories. Nothing reads the old
+  reports again, and old round numbers still count, so a resumed loop numbers
+  its next attempt after them.
 - Execution-phase repair (`repair.py`, gate `patch.json`) is unchanged apart
   from losing `revise_tasks`, which it always refused.

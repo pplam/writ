@@ -403,7 +403,7 @@ def asked(committed, writ, project, monkeypatch):
 
 def _to_fix(project):
     folder = state.load(project)["plan"]["id"]
-    rounds = sorted((project / ".writ" / "plans").glob(f"{folder}*/rounds/*/round-*"))
+    rounds = sorted((project / ".writ" / "plans").glob(f"{folder}*/rounds/*/adjudicate-*"))
     return json.loads((rounds[-1] / "to-fix.json").read_text())
 
 
@@ -539,7 +539,7 @@ def test_building_autonomously_repairs_and_approves(
 
 def test_the_adjudicator_is_told_edges_come_from_contracts(tmp_path):
     prompt = adjudicate.build_prompt(
-        root=tmp_path, doc=None, directory=tmp_path / "round-1", blocking=1, features=True
+        root=tmp_path, doc=None, directory=tmp_path / "adjudicate-1", blocking=1, features=True
     )
     assert "writ derives it from the contracts" in " ".join(prompt.split())
     assert '"owns"' in prompt

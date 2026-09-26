@@ -16,6 +16,7 @@ Four fixes, in the order of the review that asked for them:
 """
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -276,54 +277,70 @@ def test_a_stranded_run_is_still_recoverable_when_reconciling_cannot_write(
 
 
 def test_a_committed_write_is_flushed(project, monkeypatch):
-    synced: list[str] = []
-    real = os.fsync
-    monkeypatch.setattr(os, "fsync", lambda fd: synced.append(fd) or real(fd))
+    """SQLite does the flushing; writ's part is asking it for FULL durability."""
+    monkeypatch.delenv(state.FSYNC_ENV, raising=False)
     state.initialize(project)
-    with state.transaction(project) as data:
-        data["counters"]["decision"] = 1
-    assert len(synced) >= 2, "the file and its directory must both be flushed"
+    connection = state._connect(state.state_file(project))
+    try:
+        assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2  # FULL
+    finally:
+        connection.close()
 
 
 def test_fsync_can_be_turned_off_explicitly(project, monkeypatch):
     monkeypatch.setenv(state.FSYNC_ENV, "0")
-    synced: list[int] = []
-    monkeypatch.setattr(os, "fsync", lambda fd: synced.append(fd))
     state.initialize(project)
     with state.transaction(project) as data:
         data["counters"]["decision"] = 1
-    assert synced == []
     assert state.load(project)["counters"]["decision"] == 1
+    connection = state._connect(state.state_file(project))
+    try:
+        assert connection.execute("PRAGMA synchronous").fetchone()[0] == 0  # OFF
+    finally:
+        connection.close()
 
 
-def test_a_write_that_fails_before_the_replace_keeps_the_old_document(
-    project, monkeypatch
-):
-    """Better an old state than a truncated one."""
+def test_a_write_that_fails_part_way_keeps_the_old_document(project):
+    """Better an old state than a mix: every record of a commit lands, or none."""
     state.initialize(project)
     with state.transaction(project) as data:
         data["counters"]["decision"] = 5
-
-    def fail(self, target):
-        raise OSError("disk full")
-
-    monkeypatch.setattr(Path, "replace", fail)
-    with pytest.raises(OSError):
-        with state.transaction(project) as data:
-            data["counters"]["decision"] = 6
-    assert state.load(project)["counters"]["decision"] == 5
-    assert list(state.store_dir(project).glob("state.json.tmp.*")) == [], (
-        "the failed write left its temporary file behind"
+    raw = sqlite3.connect(state.state_file(project))
+    raw.execute(
+        "CREATE TRIGGER full BEFORE INSERT ON record WHEN NEW.section = 'counters' "
+        "BEGIN SELECT RAISE(ABORT, 'disk full'); END"
     )
+    raw.commit()
+    raw.close()
+    with pytest.raises(WritError, match="disk full"):
+        with state.transaction(project) as data:
+            data["design_docs"] = ["written first"]
+            data["counters"]["decision"] = 6
+    after = state.load(project)
+    assert after["counters"]["decision"] == 5
+    assert after["design_docs"] == []
 
 
-def test_a_write_that_fails_after_the_replace_is_committed(project, monkeypatch):
-    """The replace *is* the commit point; a failure after it changes nothing."""
+def test_a_commit_writes_only_the_records_it_changed(project):
     state.initialize(project)
-    monkeypatch.setattr(state, "_fsync_dir", lambda directory: None)
     with state.transaction(project) as data:
-        data["counters"]["decision"] = 9
-    assert state.load(project)["counters"]["decision"] == 9
+        for number in range(3):
+            data["tasks"][f"T-{number}"] = {"id": f"T-{number}", "status": "planned"}
+    with state.transaction(project):
+        pass  # the first reload fills in defaults, which rewrites every task once
+    changes = []
+    real = state._commit
+
+    def spy(target, data, before):
+        rows = state._shards(data)
+        changes.extend(key for key, row in rows.items() if before.get(key) != row)
+        return real(target, data, before)
+
+    import unittest.mock
+    with unittest.mock.patch.object(state, "_commit", spy):
+        with state.transaction(project) as data:
+            data["tasks"]["T-1"]["status"] = "running"
+    assert changes == [("tasks", "T-1")]
 
 
 def test_orphaned_temporary_files_are_swept_at_startup(project):

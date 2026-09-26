@@ -40,7 +40,7 @@ prompt = sys.stdin.read()
 path = Path(re.search(r'Write your response as JSON to this exact path:\\n  (\\S+)', prompt).group(1))
 round_no = int(re.search(r'Adjudication round: (\\d+)', prompt).group(1))
 folder = path.parent
-features = folder / "plan" / "features"
+features = folder / "workspace"
 to_fix = [f["id"] for f in json.loads((folder / "to-fix.json").read_text())]
 spec = json.loads(os.environ["WRIT_TEST_EDIT"])
 if isinstance(spec, list):
@@ -221,12 +221,23 @@ def _rounds(project):
     return planfiles.directory(project, data) / planfiles.ROUNDS_DIRNAME
 
 
+def test_attempts_are_numbered_past_critics_and_old_rounds(tmp_path):
+    """A revision's directory holds the critics' reports too, and a plan started
+    before the rename still has `round-<n>` attempts. Neither may be mistaken for
+    an attempt number, and the old attempts must not have their numbers reused."""
+    for name in ("fidelity", "feasibility", "round-2", "adjudicate-1", "adjudicate-x"):
+        (tmp_path / name).mkdir()
+    (tmp_path / "known-findings.json").write_text("[]")
+    assert adjudicate.rounds_on_disk(tmp_path) == 2
+    assert adjudicate.attempt_dir(tmp_path, 3) == tmp_path / "adjudicate-3"
+
+
 # --------------------------------------------------------------------------
 # the prompt
 
 
 def test_the_prompt_names_files_instead_of_pasting_them(tmp_path):
-    directory = tmp_path / ".writ" / "plans" / "p" / "rounds" / "r4" / "round-1"
+    directory = tmp_path / ".writ" / "plans" / "p" / "rounds" / "r4" / "adjudicate-1"
     prompt = adjudicate.build_prompt(
         root=tmp_path,
         doc=tmp_path / "design.md",
@@ -234,18 +245,19 @@ def test_the_prompt_names_files_instead_of_pasting_them(tmp_path):
         blocking=3,
         base_revision=4,
         round_number=1,
+        index=tmp_path / ".writ" / "plans" / "p" / "plan.json",
     )
     assert "has not been executed yet" in prompt
     assert "Plan revision: 4" in prompt
     assert f"Repository root: {tmp_path.resolve()}" in prompt
     # Relative paths, to the files the agent reads and the copy it edits.
-    assert ".writ/plans/p/rounds/r4/round-1/to-fix.json" in prompt
-    assert ".writ/plans/p/rounds/r4/round-1/plan/features" in prompt
-    assert ".writ/plans/p/rounds/r4/round-1/plan/plan.json" in prompt
+    assert ".writ/plans/p/rounds/r4/adjudicate-1/to-fix.json" in prompt
+    assert ".writ/plans/p/rounds/r4/adjudicate-1/workspace" in prompt
+    assert ".writ/plans/p/plan.json" in prompt
     assert "design.md" in prompt
     assert (
         "Write your response as JSON to this exact path:\n"
-        "  .writ/plans/p/rounds/r4/round-1/response.json"
+        "  .writ/plans/p/rounds/r4/adjudicate-1/response.json"
     ) in prompt
     # It is told the bar it will be held to.
     assert "never drop" in prompt
@@ -256,17 +268,17 @@ def test_the_prompt_names_files_instead_of_pasting_them(tmp_path):
 
 def test_a_retry_is_pointed_at_why_the_last_attempt_was_refused(tmp_path):
     """A retry is only bounded if the next attempt knows more than the last."""
-    previous = tmp_path / "rounds" / "r1" / "round-1" / "validation.json"
+    previous = tmp_path / "rounds" / "r1" / "adjudicate-1" / "validation.json"
     prompt = adjudicate.build_prompt(
         root=tmp_path,
         doc=None,
-        directory=tmp_path / "rounds" / "r1" / "round-2",
+        directory=tmp_path / "rounds" / "r1" / "adjudicate-2",
         blocking=1,
         previous=previous,
         round_number=2,
     )
     assert "REFUSED" in prompt
-    assert "rounds/r1/round-1/validation.json" in prompt
+    assert "rounds/r1/adjudicate-1/validation.json" in prompt
 
 
 # --------------------------------------------------------------------------
@@ -332,17 +344,22 @@ def test_the_plan_files_are_re_exported_at_the_new_revision(
     assert (planfiles.features_dir(project, data) / f"{added}.json").exists()
 
 
-def test_a_round_leaves_its_working_copy_and_verdict_on_disk(
+def test_a_round_leaves_its_changes_and_verdict_on_disk_and_no_copy(
     objected, project, monkeypatch
 ):
     patched(monkeypatch, ADDS_THE_TASK)
     _run(objected)
     rounds = _rounds(project)
-    [folder] = list(rounds.glob("r*/round-1"))
+    [folder] = list(rounds.glob("r*/adjudicate-1"))
     for name in ("to-fix.json", "response.json", "validation.json", "prompt.txt"):
         assert (folder / name).exists(), name
-    assert (folder / "plan" / "plan.json").exists()
-    assert (folder / "plan" / "features" / "new-queue-depth.json").exists()
+    # The workspace was temporary; what it changed is the record.
+    assert not (folder / "workspace").exists()
+    assert not (folder / "plan").exists()
+    changes = json.loads((folder / "changes.json").read_text())
+    assert list(changes["added"]) == ["new-queue-depth"]
+    assert changes["removed"] == [] and changes["by"] == "adjudicate-1"
+    assert changes["result_revision"] == changes["base_revision"] + 1
     verdict = json.loads((folder / "validation.json").read_text())
     assert verdict["accepted"] is True
     assert verdict["changes"]["added"] == ["new-queue-depth"]
@@ -645,7 +662,7 @@ def _answer(ids):
 
 
 def _add_new(directory):
-    folder = directory / "plan" / "features"
+    folder = directory / "workspace"
     (folder / "new-x.json").write_text(json.dumps(dict(NEW_FEATURE, id="new-x")))
 
 
@@ -668,22 +685,51 @@ def test_a_copy_of_an_older_revision_is_stale(prepared):
     assert "stale-copy" in [f.category for f in found]
 
 
-def test_the_requirement_inventory_is_fixed(prepared):
+def test_the_requirement_inventory_is_fixed(prepared, project):
     data, directory, ids = prepared
     _add_new(directory)
-    index_path = directory / "plan" / "plan.json"
+    index_path = planfiles.index_path(project, data)
     index = json.loads(index_path.read_text())
     index["requirements"][0]["text"] = "something easier"
     index_path.write_text(json.dumps(index))
     found, _, _ = adjudicate.validate(
-        data, directory, _answer(ids), finding_ids=ids, base_revision=plans.revision(data)
+        data, directory, _answer(ids), finding_ids=ids,
+        base_revision=plans.revision(data), root=project,
     )
     assert "requirements-edited" in [f.category for f in found]
 
 
+def test_a_changeset_replays_to_the_same_workspace(prepared, tmp_path):
+    """A refused attempt keeps only its changes; replaying them rebuilds its copy."""
+    data, directory, _ = prepared
+    work = directory / "workspace"
+    first = sorted(work.glob("*.json"))[0]
+    entry = json.loads(first.read_text())
+    entry["notes"] = "edited"
+    entry.pop("design_section", None)
+    first.write_text(json.dumps(entry))
+    sorted(work.glob("*.json"))[-1].unlink()
+    _add_new(directory)
+    (work / "broken.json").write_text("{not json")
+
+    changes = adjudicate.changes_of(data["tasks"], work, plans.revision(data))
+    assert list(changes["added"]) == ["new-x"]
+    assert changes["modified"][first.stem]["notes"]["after"] == "edited"
+    assert "after" not in changes["modified"][first.stem].get("design_section", {"x": 1})
+    assert changes["unreadable"] == {"broken.json": "{not json"}
+
+    again = tmp_path / "again"
+    planfiles.write_features(again, data["tasks"])
+    adjudicate.replay(json.loads(json.dumps(changes)), again)
+    read = lambda folder: {p.name: p.read_text() for p in folder.glob("*.json")}
+    assert {k: json.loads(v) if k != "broken.json" else v for k, v in read(again).items()} == {
+        k: json.loads(v) if k != "broken.json" else v for k, v in read(work).items()
+    }
+
+
 def test_a_mismatched_filename_is_refused(prepared):
     data, directory, ids = prepared
-    folder = directory / "plan" / "features"
+    folder = directory / "workspace"
     (folder / "new-x.json").write_text(json.dumps(dict(NEW_FEATURE, id="new-y")))
     found, _, _ = adjudicate.validate(
         data, directory, _answer(ids), finding_ids=ids, base_revision=plans.revision(data)
@@ -753,7 +799,7 @@ def test_a_refused_edit_leaves_the_request_open_for_the_next_round(
 def test_a_refusal_writes_why_next_to_the_copy(objected, project, monkeypatch):
     patched(monkeypatch, {"revise": {"M01-001": {"acceptances": ["it works"]}}})
     _run(objected)
-    [folder] = list(_rounds(project).glob("r*/round-1"))
+    [folder] = list(_rounds(project).glob("r*/adjudicate-1"))
     verdict = json.loads((folder / "validation.json").read_text())
     assert verdict["accepted"] is False
     assert "weakened-criteria" in [item["category"] for item in verdict["problems"]]
@@ -785,8 +831,8 @@ def test_a_retry_starts_from_the_refused_copy(objected, project, monkeypatch):
     assert request["status"] == "applied"
     assert repair.refusals(request) == 1
     # And the retry was told to read why the first one was refused.
-    [second] = list(_rounds(project).glob("r*/round-2"))
-    assert "round-1/validation.json" in (second / "prompt.txt").read_text()
+    [second] = list(_rounds(project).glob("r*/adjudicate-2"))
+    assert "adjudicate-1/validation.json" in (second / "prompt.txt").read_text()
     assert code == 0, out
 
 
@@ -796,17 +842,18 @@ def test_a_retry_after_a_landed_repair_starts_fresh(objected, project, monkeypat
     _run(objected)
     data = state.load(project)
     request = repair.plan_request(data)
-    [refused] = list(_rounds(project).glob("r*/round-1"))
-    assert (refused / "plan" / "features").is_dir()
+    [refused] = list(_rounds(project).glob("r*/adjudicate-1"))
+    assert (refused / "changes.json").is_file()
+    assert not (refused / "workspace").exists()
     revision = plans.revision(data)
     # Same revision: the refused copy is where the next attempt starts.
     seed, previous = adjudicate._previous_attempt(
-        project, request, revision, refused.parent / "round-99"
+        project, request, revision, refused.parent / "adjudicate-99"
     )
     assert seed is not None and previous is not None
     # A revision later, it is not.
     seed, previous = adjudicate._previous_attempt(
-        project, request, revision + 1, refused.parent / "round-99"
+        project, request, revision + 1, refused.parent / "adjudicate-99"
     )
     assert seed is None and previous is None
 
@@ -949,7 +996,7 @@ def test_autonomous_mode_answers_a_question_with_its_recommendation(
     assert record["confirmed_by"] == "autonomous"
     assert _added(data)
     # the ruling is handed to the next round with the finding it settles
-    rounds = sorted(_rounds(project).glob("*/round-*"))
+    rounds = sorted(_rounds(project).glob("*/adjudicate-*"))
     handed = json.loads((rounds[-1] / "to-fix.json").read_text())
     assert "Writ decided this autonomously" in handed[0]["suggested_action"]
 

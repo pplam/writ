@@ -53,7 +53,7 @@ LOG_TAIL_BYTES = 60_000
 
 #: Activity lines sent with a step's live output. The terminal shows every line
 #: an agent produces; a page catching up mid-run wants the recent past, not all of
-#: it, and the raw `events.jsonl` stays on disk for anyone who wants the rest.
+#: it, and the event log stays on disk for anyone who wants the rest.
 STEP_ACTIVITY_LINES = 300
 
 #: How much of an event log is rendered per request. This is polled every second
@@ -866,9 +866,7 @@ def step_output(data: dict[str, Any], root: Path, step_id: str) -> dict[str, Any
     }
     if not directory.exists():
         return payload
-    events = directory / "events.jsonl"
-    if events.exists():
-        payload["activity"] = _activity_lines(events, entry)
+    payload["activity"] = _activity_lines(directory, entry)
     # The tail regardless. Events carry what the agent did; stdout carries what it
     # wrote, and a step that produced no events at all — an agent whose event
     # shape writ does not know, or one that died before its first event — has the
@@ -885,7 +883,7 @@ def _live_status(record: dict[str, Any], step_id: str) -> str:
     return ""
 
 
-def _activity_lines(events: Path, entry: dict[str, Any]) -> list[str]:
+def _activity_lines(directory: Path, entry: dict[str, Any]) -> list[str]:
     """The step's event log as activity lines, most recent last.
 
     Rendered from the start of the file rather than from the tail, because the
@@ -902,16 +900,9 @@ def _activity_lines(events: Path, entry: dict[str, Any]) -> list[str]:
     renderer = stream.Renderer(shape)
     lines: list[str] = []
     try:
-        with events.open("rb") as handle:
-            size = handle.seek(0, 2)
-            if size > STEP_EVENT_BYTES:
-                handle.seek(size - STEP_EVENT_BYTES)
-                handle.readline()  # the partial line the seek landed inside
-            else:
-                handle.seek(0)
-            for raw in handle:
-                lines.extend(renderer.feed(raw.decode("utf-8", "replace")).activity)
-    except OSError:
+        for line in stream.event_lines(directory, tail_bytes=STEP_EVENT_BYTES):
+            lines.extend(renderer.feed(line).activity)
+    except (OSError, EOFError):
         return []
     return lines[-STEP_ACTIVITY_LINES:]
 

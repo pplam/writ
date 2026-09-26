@@ -3,7 +3,7 @@
 What these tests are really about is timing. Every other record writ keeps is
 written after the thing it describes finished, and could therefore be tested by
 running the thing and reading the record. This one has to be true *during* — so
-several tests below read `state.json` from inside a stub agent, which is the only
+several tests below read the store from inside a stub agent, which is the only
 way to assert that a step was visible as running while it was running.
 """
 from __future__ import annotations
@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from tests.test_analysis import PLAN, agent, staged, staged_agent
-from writ import api, phases, state
+from writ import api, phases, state, stream
 from writ.state import WritError
 
 
@@ -187,7 +187,7 @@ def test_stopping_at_a_named_stage_is_not_a_failure(writ, design, project):
 def test_a_step_is_visible_as_running_while_it_is_running(writ, design, project):
     """The whole point, asserted from inside the agent.
 
-    The stub reads `state.json` while it is the running step and writes what it
+    The stub reads the store while it is the running step and writes what it
     saw beside its artifact. Nothing else can prove this: by the time the command
     returns, every step has finished, and a record that only became correct at
     the end would pass every other test here.
@@ -197,7 +197,7 @@ def test_a_step_is_visible_as_running_while_it_is_running(writ, design, project)
     script = staged_agent() + f"""
 import json as _json, pathlib
 _root = pathlib.Path({str(project)!r})
-_data = _json.loads((_root / '.writ' / 'state.json').read_text())
+_data = __import__('writ.state', fromlist=['load']).load(_root)
 _phase = _data['phases'][-1]
 _live = [s['id'] for s in _phase['steps'] if s['status'] == 'running']
 _out = pathlib.Path({str(seen)!r})
@@ -232,7 +232,7 @@ def test_the_stages_are_both_recorded_running(writ, design, project):
 import json as _json, pathlib, time
 _root = pathlib.Path({str(project)!r})
 time.sleep(0.4)
-_data = _json.loads((_root / '.writ' / 'state.json').read_text())
+_data = __import__('writ.state', fromlist=['load']).load(_root)
 _phase = _data['phases'][-1]
 _live = sorted(s['id'] for s in _phase['steps'] if s['status'] == 'running')
 _out = pathlib.Path({str(seen)!r})
@@ -455,6 +455,33 @@ def test_a_step_output_is_rendered_by_writs_own_renderer(writ, design, project):
     payload = api.step_output(state.load(project), project, "stage:requirements")
     assert payload["activity"] == ["· read_file design.md"]
     assert payload["status"] == "ok"
+
+
+def test_a_finished_step_renders_from_its_compacted_log(writ, design, project):
+    """A run's live `events.jsonl` becomes `events.jsonl.gz` when it ends; the
+    page reads either, so a finished step keeps its activity."""
+    writ("init")
+    writ("plan", str(design), *staged())
+    data = state.load(project)
+    entry = phases.step(phases.current(data), "stage:requirements")
+    directory = Path(entry["directory"])
+    (directory / "events.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "tool_execution_start",
+                "toolName": "read_file",
+                "toolCallId": "1",
+                "args": {"path": "design.md"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    stream.compact(directory, "pi")
+    with state.transaction(project) as live:
+        phases.step(phases.current(live), "stage:requirements")["event_shape"] = "pi"
+    payload = api.step_output(state.load(project), project, "stage:requirements")
+    assert payload["activity"] == ["· read_file design.md"]
 
 
 def test_an_unknown_step_is_not_found_rather_than_a_path(writ, design, project):

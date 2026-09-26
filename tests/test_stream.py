@@ -239,6 +239,9 @@ emit({"type": "tool_execution_start", "toolCallId": "c1", "toolName": "bash",
 emit({"type": "tool_execution_end", "toolCallId": "c1", "toolName": "bash",
       "isError": False, "result": {"content": []}})
 emit({"type": "message_update",
+      "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0,
+                                "delta": "Survey"}})
+emit({"type": "message_update",
       "assistantMessageEvent": {"type": "text_end", "contentIndex": 0,
                                 "content": "Survey complete."}})
 emit({"type": "turn_end", "message": {"role": "assistant", "stopReason": "stop"}})
@@ -280,11 +283,56 @@ def test_the_transcript_holds_only_speech_and_the_events_are_kept(tmp_path, caps
     assert run(EVENT_AGENT, tmp_path, stop_reasons=reasons) == 0
     transcript = (tmp_path / "stdout.log").read_text()
     assert transcript == "Survey complete.\n"
-    # every event survives verbatim, beside the transcript
-    raw = (tmp_path / "events.jsonl").read_text().splitlines()
+    # every event but the streaming fragment survives verbatim, beside the
+    # transcript, and the live log is gone once the run has ended
+    assert not (tmp_path / "events.jsonl").exists()
+    raw = list(stream.event_lines(tmp_path))
     assert len(raw) == 5
     assert json.loads(raw[0])["assistantMessageEvent"]["type"] == "thinking_start"
+    assert all("text_delta" not in line for line in raw)
     assert reasons == ["stop"]
+
+
+def test_compacting_keeps_everything_a_reader_renders(tmp_path):
+    """Fragments render as nothing, so dropping them changes no activity line."""
+    events = [
+        {"type": "message_update",
+         "assistantMessageEvent": {"type": "thinking_start", "contentIndex": 0}},
+        {"type": "message_update",
+         "assistantMessageEvent": {"type": "thinking_delta", "delta": "Let"}},
+        {"type": "message_update",
+         "assistantMessageEvent": {"type": "thinking_end", "content": "Let me look."}},
+        {"type": "message_update",
+         "assistantMessageEvent": {"type": "text_delta", "delta": "Done"}},
+        {"type": "message_update",
+         "assistantMessageEvent": {"type": "text_end", "content": "Done."}},
+        {"type": "turn_end", "message": {"stopReason": "stop"}},
+    ]
+    lines = [json.dumps(event) + "\n" for event in events] + ["not json\n"]
+    (tmp_path / "events.jsonl").write_text("".join(lines))
+    before = render("pi", events)
+
+    stream.compact(tmp_path, "pi")
+
+    assert not (tmp_path / "events.jsonl").exists()
+    kept = list(stream.event_lines(tmp_path))
+    assert len(kept) == 5  # two fragments gone; the line it cannot parse is kept
+    assert "not json\n" in kept
+    assert render("pi", [json.loads(line) for line in kept[:-1]]) == before
+    assert stream.has_events(tmp_path)
+
+
+def test_an_unknown_shape_is_compressed_but_never_filtered(tmp_path):
+    line = json.dumps({"type": "message_update",
+                       "assistantMessageEvent": {"type": "text_delta"}}) + "\n"
+    (tmp_path / "events.jsonl").write_text(line)
+    stream.compact(tmp_path, "someday")
+    assert list(stream.event_lines(tmp_path)) == [line]
+
+
+def test_claude_partial_messages_are_fragments():
+    assert stream.fragment("claude", json.dumps({"type": "stream_event"}))
+    assert not stream.fragment("claude", json.dumps({"type": "assistant"}))
 
 
 def test_activity_is_mirrored_live_with_its_prefix(tmp_path, capsys):
@@ -300,7 +348,7 @@ def test_quiet_still_records_events_and_the_stop_reason(tmp_path, capsys):
     reasons: list[str] = []
     assert run(TRUNCATED_AGENT, tmp_path, stream=False, stop_reasons=reasons) == 0
     assert capsys.readouterr().out == ""
-    assert (tmp_path / "events.jsonl").read_text().strip()
+    assert stream.has_events(tmp_path)
     assert stream.truncated(reasons)
 
 

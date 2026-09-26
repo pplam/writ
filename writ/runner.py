@@ -1,6 +1,7 @@
 """Dispatching work to coding agents and tracking the resulting runs."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import signal
@@ -18,6 +19,7 @@ from . import (
     contracts,
     decisions,
     failures,
+    planfiles,
     planner,
     plans,
     procs,
@@ -25,6 +27,7 @@ from . import (
     state,
     verdict,
 )
+from . import stream as eventlog
 from .stream import Renderer
 from .model import (
     DEFAULT_MAX_REWORK,
@@ -51,6 +54,9 @@ Working rules (non-negotiable):
 5. Run the project's full verification (build, tests, vet/lint) before reporting.
 6. Do not weaken an invariant, add a dependency, or use live network data to pass a test.
 7. Do not modify components outside the allowed list.
+8. Do not edit anything under `.writ/` except the files this prompt names as
+   yours to write: the plan there is generated from writ's store, and an edit to
+   it is undone, not read.
 """
 
 
@@ -970,23 +976,56 @@ def _design_excerpt(task: dict[str, Any], root: Path, limit: int = 4000) -> str:
     return text[:limit]
 
 
-def new_run_id(task_id: str, taken: Iterable[str] = ()) -> str:
-    """A unique run id for this task.
+#: the folder name for each role's runs: what the run did, not who the state
+#: calls it. `agent` is the implementer.
+ROLE_FOLDERS = {"agent": "implement", "reviewer": "review", "gate": "gate", "repair": "repair"}
 
-    Ids are timestamped to the second and two runs of the same task can easily
-    start within one second — dispatch then review, or a quick retry — so a
-    collision is disambiguated with a suffix rather than silently overwriting
-    the earlier run's record.
+META_FILENAME = "meta.json"
+
+#: the run record's fields that `meta.json` carries: who, what, when, how it ended
+META_FIELDS = (
+    "id", "task", "role", "status", "command", "model", "cwd", "timeout",
+    "created_at", "started_at", "finished_at", "exit_code", "pid", "note",
+)
+
+
+def new_run_id(
+    task_id: str, role: str = "agent", taken: Iterable[str] = ()
+) -> str:
+    """The id of this task's next run, which is also its folder under `runs/`.
+
+    `<task>/<nn>-<role>`: the task, the run's place in the task's history, and
+    what it did. The number is the task's run count plus one, and the caller
+    allocates it inside the transaction that records the run, so two runs never
+    get the same one. `taken` guards only against a folder an older writ left.
     """
-    base = f"{task_id}-{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}"
     existing = set(taken)
-    if base not in existing:
-        return base
-    for suffix in range(2, 100):
-        candidate = f"{base}-{suffix}"
-        if candidate not in existing:
-            return candidate
-    raise WritError(f"too many runs of {task_id} in one second")
+    number = 1 + sum(1 for run_id in existing if run_id.startswith(f"{task_id}/"))
+    label = ROLE_FOLDERS.get(role, role)
+    while f"{task_id}/{number:02d}-{label}" in existing:
+        number += 1
+    return f"{task_id}/{number:02d}-{label}"
+
+
+def write_meta(run: dict[str, Any]) -> None:
+    """Mirror a run's record into its folder, so the folder is the whole story.
+
+    Best effort: the store is the record writ acts on, and a folder that cannot
+    be written to is reported by the run itself soon enough.
+    """
+    directory = run.get("dir")
+    if not directory:
+        return
+    try:
+        path = Path(directory) / META_FILENAME
+        if not path.parent.is_dir():
+            return
+        payload = {key: run.get(key) for key in META_FIELDS if key in run}
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
 
 
 TIMEOUT_NOTE = "writ: agent exceeded its timeout and was terminated"
@@ -1049,10 +1088,6 @@ def _tee(
     # Whatever the agent left without a trailing newline: a prompt it was waiting
     # on, or a progress line it never finished.
     flush_line(final=True)
-
-
-#: the agent's own event stream, kept beside the transcript it was rendered into
-EVENTS_FILENAME = "events.jsonl"
 
 
 def _pump_events(
@@ -1180,7 +1215,7 @@ def run_agent(
         # full pipe buffer would deadlock a single-threaded reader
         raw: IO[str] | None = None
         if event_shape:
-            raw = (directory / EVENTS_FILENAME).open("w", encoding="utf-8")
+            raw = (directory / eventlog.EVENTS_FILENAME).open("w", encoding="utf-8")
         try:
             if event_shape and raw is not None:
                 stdout_pump = threading.Thread(
@@ -1238,6 +1273,8 @@ def run_agent(
         finally:
             if raw is not None:
                 raw.close()
+                # The run is over, so nothing tails the live log any more.
+                eventlog.compact(directory, event_shape)
 
 
 def _timed_out(
@@ -1276,8 +1313,7 @@ def produced_output(directory: Path) -> bool:
     """
     if (directory / "silent").exists():
         return False
-    events = directory / EVENTS_FILENAME
-    if events.exists() and events.stat().st_size > 0:
+    if eventlog.has_events(directory):
         return True
     for name in ("stdout.log", "stderr.log"):
         path = directory / name
@@ -1419,7 +1455,7 @@ def prepare(
                     f"{task_id} is blocked by incomplete dependencies: "
                     f"{', '.join(blockers)} (use --force to override)"
                 )
-        run_id = new_run_id(task_id, data["runs"])
+        run_id = new_run_id(task_id, role, data["runs"])
         directory = state.run_dir(root, run_id)
         directory.mkdir(parents=True, exist_ok=True)
         verdict_path = directory / verdict.VERDICT_FILENAME
@@ -1481,6 +1517,7 @@ def prepare(
             "owner_pid": os.getpid(),
             "dir": str(directory),
         }
+        write_meta(data["runs"][run_id])
         task.setdefault("runs", []).append(run_id)
         if role == "repair":
             # A repair planner does not hold the gate; the gate is already held,
@@ -1845,6 +1882,38 @@ def _mark_running(root: Path, run_id: str, pid: int) -> None:
         run["pid"] = pid
         run["identity"] = identity.to_dict()
         run["started_at"] = utcnow()
+        write_meta(run)
+
+
+def _restore_views(
+    root: Path, data: dict[str, Any], task: dict[str, Any], actor: str
+) -> None:
+    """Say so when an agent edited the plan's files, which the commit then undoes.
+
+    `.writ/plans/<id>/` is generated from the store and rewritten from it after
+    every commit, so an edit there changes nothing writ reads. Left unmentioned it
+    would still mislead: the agent believes it amended its task, and a reader of
+    the folder sees a plan that is not the one being run.
+    """
+    from .model import add_evidence
+
+    try:
+        edited = planfiles.drift(root, data)
+    except (OSError, WritError):
+        return
+    if not edited:
+        return
+    names = ", ".join(planfiles.rel(root, path) for path in edited)
+    add_evidence(
+        task,
+        f"{actor} wrote to writ's plan files ({names}), which are generated; "
+        "writ restored them from the store",
+        actor="writ",
+    )
+    for path in edited:
+        # The commit that records this rewrites every file the plan has, so an
+        # edited one comes back and one the plan never had stays gone.
+        path.unlink(missing_ok=True)
 
 
 def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None:
@@ -1868,6 +1937,7 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
         run["finished_at"] = utcnow()
         if note:
             run["note"] = note
+        write_meta(run)
         role = run.get("role", "agent")
         task = data["tasks"].get(run["task"])
         if task is None:
@@ -1875,6 +1945,7 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
             return
         directory = Path(run["dir"])
         actor = _actor(run)
+        _restore_views(root, data, task, actor)
         if role == "repair":
             _finish_repair(data, run, task, directory, actor)
             refresh_milestones(data)
@@ -1934,6 +2005,9 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
                     actor=actor,
                     max_rework=run.get("max_rework"),
                 )
+                # A reference, not a copy: the full report stays in the run's
+                # folder, and this says which one it was.
+                task["last_verdict"]["run"] = run_id
                 run["resulting_status"] = status
                 refresh_milestones(data)
                 if reported.decisions:
@@ -2223,6 +2297,7 @@ def cancel(root: Path, run_id: str) -> None:
         supervisor = run.get("supervisor") or run.get("supervisor_pid")
         run["status"] = "cancelled"
         run["finished_at"] = utcnow()
+        write_meta(run)
         task = data["tasks"].get(run["task"])
         if task is not None and task["status"] in INTERRUPTED_STATUS:
             task["status"] = INTERRUPTED_STATUS[task["status"]]
@@ -2265,6 +2340,7 @@ def reap(root: Path) -> list[str]:
                 continue
             run["status"] = "interrupted"
             run["finished_at"] = utcnow()
+            write_meta(run)
             task = data["tasks"].get(run["task"])
             if task is not None and task["status"] in INTERRUPTED_STATUS:
                 task["status"] = INTERRUPTED_STATUS[task["status"]]
@@ -2336,6 +2412,7 @@ def reconcile(
             run["status"] = "interrupted" if failure.retryable else "failed"
             run["finished_at"] = utcnow()
             run.setdefault("note", failure.described)
+            write_meta(run)
         if task is not None:
             if settled and task["status"] in INTERRUPTED_STATUS:
                 task["status"] = INTERRUPTED_STATUS[task["status"]]

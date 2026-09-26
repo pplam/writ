@@ -12,14 +12,20 @@ This is the middle:
     check + critics → findings → adjudicator edits a working copy of the plan
     → writ validates the copy → promote → re-check → re-run the critics → repeat
 
-A round is a directory (`rounds/r<rev>/round-<n>/` under the plan directory):
-`to-fix.json` holds the blocking findings, `plan/` holds a copy of the plan
-files, and the adjudicator edits `plan/features/` in place — revising a feature
-by editing its file, adding one by creating a file, removing one by deleting
-it — then answers each finding in `response.json`. Writ reads the copy back,
-writes what it thinks of it to `validation.json`, and promotes a valid copy into
-`state.json` in one transaction. A refused copy is where the next attempt
-starts, so the sound edits in it are not redone.
+A round is a directory (`rounds/r<rev>/adjudicate-<n>/` under the plan directory,
+next to the critic reports it answers):
+`to-fix.json` holds the blocking findings, and `workspace/` holds one file per
+feature for the adjudicator to edit — revising a feature by editing its file,
+adding one by creating a file, removing one by deleting it — while it reads the
+committed plan's index for reference and answers each finding in
+`response.json`. Writ reads the workspace back, writes what it thinks of it to
+`validation.json`, and promotes a valid one into the store in one transaction.
+
+The workspace does not outlive its round. What stays is `changes.json`: the
+features it added, removed and modified against the revision it started from.
+That is the round's record, a fraction of the size of a second copy of the
+plan, and it is how a refused attempt seeds the next: replayed onto the same
+revision, it rebuilds the workspace, so the sound edits in it are not redone.
 
 This is not the gate repair of `repair.py`, and on purpose. A gate repair
 happens mid-run, around work that is done, so it may only add. Before execution
@@ -58,7 +64,17 @@ TO_FIX_FILENAME = "to-fix.json"
 RESPONSE_FILENAME = "response.json"
 VALIDATION_FILENAME = "validation.json"
 #: the working copy inside a round directory: `plan.json` and `features/`
-WORKING_DIRNAME = "plan"
+#: the adjudicator's editable copy of the feature files. It exists only while an
+#: attempt runs: what the attempt changed is kept as `changes.json`.
+WORKING_DIRNAME = "workspace"
+CHANGES_FILENAME = "changes.json"
+#: where attempts before the workspace kept their full copy, read to seed a retry
+LEGACY_COPY = Path("plan") / "features"
+#: a round directory is this plus its number, next to the critics' directories
+ATTEMPT_PREFIX = "adjudicate-"
+#: what rounds were called when they had a directory of their own; still counted,
+#: so resuming a plan started before the rename does not reuse a round number
+LEGACY_ATTEMPT_PREFIX = "round-"
 
 #: the words a round's error starts with when writ, not the agent, failed it
 PROMOTION_FAILED = "the working copy could not be promoted"
@@ -254,14 +270,15 @@ def build_prompt(
     round_number: int = 1,
     base_revision: int = 0,
     previous: Path | None = None,
+    index: Path | None = None,
     extra: Iterable[Ref] = (),
     features: bool = False,
     autonomous: bool = False,
 ) -> str:
     """Compose the adjudicator's prompt: what to read, what to edit, where to answer.
 
-    Nothing is pasted. The findings are in `to-fix.json`, the plan is the working
-    copy, and a refused attempt's reasons are its `validation.json` — which is
+    Nothing is pasted. The findings are in `to-fix.json`, the plan is the
+    committed index at `index` plus the workspace of feature files, and a refused attempt's reasons are its `validation.json` — which is
     required reading on a retry, because an adjudicator told "you dropped
     REQ-004" makes a different edit, while one told only "refused" makes the same
     one again.
@@ -277,22 +294,24 @@ def build_prompt(
         first.append(
             Ref(
                 previous,
-                "why writ REFUSED your previous attempt. The working copy still holds "
+                "why writ REFUSED your previous attempt. The workspace still holds "
                 "that attempt's edits: fix what this lists and keep the rest",
             )
         )
-    first.append(
-        Ref(
-            work / planfiles.INDEX_FILENAME,
-            "the plan at a glance: requirements, milestones, one row per feature. "
-            "Reference only; do not edit it",
+    if index is not None:
+        first.append(
+            Ref(
+                index,
+                "the committed plan at a glance: requirements, milestones, one row "
+                "per feature. Reference only; do not edit it or the files its rows "
+                "name, which are the committed plan. Edit the workspace instead",
+            )
         )
-    )
     first.extend(prompts.design_refs(doc, "the design document the plan implements"))
     as_needed = [
         Ref(
-            work / planfiles.FEATURES_DIRNAME,
-            "the working copy, one file per feature: edit these",
+            work,
+            "the workspace, one file per feature: edit these",
         ),
         *extra,
     ]
@@ -308,7 +327,7 @@ def build_prompt(
         f"Adjudication round: {round_number}",
         "",
         *prompts.references(root, first=first, as_needed=as_needed),
-        f"Edit the working copy in {planfiles.rel(root, work / planfiles.FEATURES_DIRNAME)}:",
+        f"Edit the workspace in {planfiles.rel(root, work)}:",
         "  - revise a feature by editing its file;",
         "  - add a feature by creating <new-id>.json with an id of your choosing. "
         + (
@@ -370,7 +389,7 @@ def loop(
     nothing, so spending the plan's repair allowance on it would stop the loop over
     a plan that had never been repaired once.
 
-    `directory` holds one `round-<n>/` per attempt. Numbering continues from the
+    `directory` holds one `adjudicate-<n>/` per attempt. Numbering continues from the
     rounds already there, so resuming with `writ adjudicate` never overwrites the
     working copy a refused attempt left behind.
 
@@ -451,7 +470,7 @@ def loop(
         round_ = _one_round(
             root=root,
             doc=doc,
-            directory=directory / f"round-{attempt}",
+            directory=attempt_dir(directory, attempt),
             resolved=resolved,
             timeout=timeout,
             cwd=cwd,
@@ -520,17 +539,35 @@ def loop(
     return result
 
 
+def attempt_dir(directory: Path, number: int) -> Path:
+    """Where attempt `number` of a loop over `directory` works."""
+    return directory / f"{ATTEMPT_PREFIX}{number}"
+
+
 def rounds_on_disk(directory: Path) -> int:
-    """The highest `round-<n>` already in `directory`, or 0."""
+    """The highest attempt number already in `directory`, or 0."""
     numbers = [
-        int(path.name.split("-", 1)[1])
-        for path in directory.glob("round-*")
-        if path.is_dir() and path.name.split("-", 1)[1].isdigit()
+        int(path.name[len(prefix):])
+        for prefix in (ATTEMPT_PREFIX, LEGACY_ATTEMPT_PREFIX)
+        for path in directory.glob(f"{prefix}*")
+        if path.is_dir() and path.name[len(prefix):].isdigit()
     ]
     return max(numbers, default=0)
 
 
-def _one_round(
+def _one_round(*, directory: Path, **kwargs: Any) -> Round:
+    """One attempt, and the workspace it edited gone afterwards however it ended.
+
+    What the attempt changed is in `changes.json` by then, and that is all a retry
+    or a reader needs.
+    """
+    try:
+        return _attempt(directory=directory, **kwargs)
+    finally:
+        shutil.rmtree(directory / WORKING_DIRNAME, ignore_errors=True)
+
+
+def _attempt(
     *,
     root: Path,
     doc: DesignDocs,
@@ -565,6 +602,7 @@ def _one_round(
         base_revision = plans.revision(data)
         seed, previous = _previous_attempt(root, request, base_revision, directory)
         prepare(root, data, directory, blocking, seed=seed)
+        index = planfiles.index_path(root, data)
         extra = _artifact_refs(root, data)
         features = _has_features(data)
     round_ = Round(
@@ -581,6 +619,7 @@ def _one_round(
         round_number=number,
         base_revision=base_revision,
         previous=previous,
+        index=index,
         extra=extra,
         features=features,
         autonomous=autonomous,
@@ -633,9 +672,15 @@ def _one_round(
                 response,
                 finding_ids=[f.id for f in blocking if f.id],
                 base_revision=base_revision,
+                root=root,
             )
             refused = [finding for finding in found if finding.blocking]
             _write_validation(directory, base_revision, found, diff)
+            changes = record_changes(directory, data.get("tasks", {}), base_revision)
+            # The views are regenerated whatever happened: an attempt that edited
+            # the committed index or its feature files instead of the workspace
+            # changed nothing that counts, and must not leave the view saying so.
+            planfiles.export(root, data)
             if refused:
                 round_.refused = refused
                 request["status"] = "open"
@@ -673,6 +718,8 @@ def _one_round(
             # critics are spent on it.
             plans.run_check(data, root=root.resolve())
             planfiles.export(root, data)
+            changes["result_revision"] = plans.revision(data)
+            planfiles.dump(directory / CHANGES_FILENAME, changes)
             round_.blocking_after = sum(
                 1
                 for finding in plans.findings(data, open_only=True)
@@ -699,38 +746,40 @@ def prepare(
     *,
     seed: Path | None = None,
 ) -> Path:
-    """Write `to-fix.json` and the working copy for one attempt.
+    """Write `to-fix.json` and the workspace for one attempt.
 
-    `seed` is a refused attempt's `plan/features/`. Starting from it is what makes
-    a retry a correction instead of a fresh attempt: the edits that were sound are
-    still there, and only what `validation.json` listed needs changing.
+    `seed` is a refused attempt's `changes.json`, replayed onto this revision's
+    features. Starting from it is what makes a retry a correction instead of a
+    fresh attempt: the edits that were sound are still there, and only what
+    `validation.json` listed needs changing. The index is not copied: the prompt
+    points at the committed one, which is re-exported here so it is current.
     """
     planfiles.dump(
         directory / TO_FIX_FILENAME,
         [finding.to_dict() for finding in blocking],
     )
+    planfiles.export(root, data)
     work = directory / WORKING_DIRNAME
-    features = work / planfiles.FEATURES_DIRNAME
-    if features.exists():
-        shutil.rmtree(features)
+    if work.exists():
+        shutil.rmtree(work)
+    tasks = data.get("tasks", {})
     if seed is not None and seed.is_dir():
-        shutil.copytree(seed, features)
+        shutil.copytree(seed, work)
     else:
-        planfiles.write_features(features, data.get("tasks", {}))
-    index = planfiles.index(root, data)
-    for row in index["features"]:
-        row["file"] = planfiles.rel(root, features / f"{row['id']}.json")
-    planfiles.dump(work / planfiles.INDEX_FILENAME, index)
+        planfiles.write_features(work, tasks)
+        if seed is not None and seed.is_file():
+            replay(json.loads(seed.read_text(encoding="utf-8")), work)
     return work
 
 
 def _previous_attempt(
     root: Path, request: dict[str, Any], revision: int, directory: Path
 ) -> tuple[Path | None, Path | None]:
-    """The refused working copy to start from, and its validation report.
+    """The refused attempt's changes to start from, and its validation report.
 
-    Only a refusal against this same revision counts: a copy of an older plan
-    would undo whatever landed since.
+    Only a refusal against this same revision counts: its changes replayed onto
+    a newer plan would undo whatever landed since. An attempt from before the
+    workspace kept a full copy instead, which seeds the same way.
     """
     refusals = request.get("refusals") or []
     if not refusals:
@@ -741,12 +790,100 @@ def _previous_attempt(
     folder = Path(root) / str(last["directory"])
     if folder.resolve() == directory.resolve():
         return None, None
-    seed = folder / WORKING_DIRNAME / planfiles.FEATURES_DIRNAME
+    seed = folder / CHANGES_FILENAME
+    if not seed.is_file():
+        seed = folder / LEGACY_COPY
     report = folder / VALIDATION_FILENAME
     return (
-        seed if seed.is_dir() else None,
+        seed if seed.exists() else None,
         report if report.exists() else None,
     )
+
+
+# --------------------------------------------------------------------------
+# what an attempt changed
+
+
+def _read_workspace(work: Path) -> tuple[dict[str, Any], dict[str, str]]:
+    """Every file in the workspace: parsed objects by stem, and raw text for the rest."""
+    parsed: dict[str, Any] = {}
+    raw: dict[str, str] = {}
+    for path in sorted(work.glob("*.json")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        try:
+            entry = json.loads(text)
+        except json.JSONDecodeError:
+            entry = None
+        if isinstance(entry, dict):
+            parsed[path.stem] = entry
+        else:
+            raw[path.name] = text
+    return parsed, raw
+
+
+def changes_of(
+    tasks: dict[str, dict[str, Any]], work: Path, base_revision: int, by: str = ""
+) -> dict[str, Any]:
+    """The workspace as a changeset against the features it was made from.
+
+    Field-level, before and after, so it reads as a diff and replays exactly:
+    a field an edit deleted has a `before` and no `after`. A file that is not a
+    JSON object is kept verbatim under `unreadable`, because a refused attempt
+    is replayed and the retry has to see what it is being asked to fix.
+    """
+    parsed, raw = _read_workspace(work)
+    base = {task_id: planfiles.feature(task) for task_id, task in tasks.items()}
+    present = set(parsed) | {Path(name).stem for name in raw}
+    modified: dict[str, dict[str, Any]] = {}
+    for task_id, entry in parsed.items():
+        before = base.get(task_id)
+        if before is None:
+            continue
+        fields = planfiles.field_changes(before, entry)
+        if fields:
+            modified[task_id] = fields
+    return {
+        "base_revision": base_revision,
+        "result_revision": None,
+        "by": by,
+        "added": {ref: entry for ref, entry in parsed.items() if ref not in base},
+        "removed": sorted(task_id for task_id in base if task_id not in present),
+        "modified": modified,
+        "unreadable": raw,
+    }
+
+
+def record_changes(
+    directory: Path, tasks: dict[str, dict[str, Any]], base_revision: int
+) -> dict[str, Any]:
+    """Write `changes.json` for the attempt in `directory` and return it."""
+    changes = changes_of(tasks, directory / WORKING_DIRNAME, base_revision, directory.name)
+    planfiles.dump(directory / CHANGES_FILENAME, changes)
+    return changes
+
+
+def replay(changes: dict[str, Any], work: Path) -> None:
+    """Apply a changeset to a workspace written from its base revision."""
+    for task_id in changes.get("removed") or []:
+        (work / f"{task_id}.json").unlink(missing_ok=True)
+    for task_id, fields in (changes.get("modified") or {}).items():
+        path = work / f"{task_id}.json"
+        if not path.exists():
+            continue
+        entry = json.loads(path.read_text(encoding="utf-8"))
+        for key, change in fields.items():
+            if "after" in change:
+                entry[key] = change["after"]
+            else:
+                entry.pop(key, None)
+        planfiles.dump(path, entry)
+    for ref, entry in (changes.get("added") or {}).items():
+        planfiles.dump(work / f"{ref}.json", entry)
+    for name, text in (changes.get("unreadable") or {}).items():
+        (work / name).write_text(text, encoding="utf-8")
 
 
 def _artifact_refs(root: Path, data: dict[str, Any]) -> list[Ref]:
@@ -868,9 +1005,8 @@ def read_copy(work: Path) -> tuple[dict[str, dict[str, Any]], list[Finding]]:
     """Every feature file in the working copy, and what is wrong with its shape."""
     found: list[Finding] = []
     proposed: dict[str, dict[str, Any]] = {}
-    folder = work / planfiles.FEATURES_DIRNAME
-    for path in sorted(folder.glob("*.json")):
-        where = f"{WORKING_DIRNAME}/{planfiles.FEATURES_DIRNAME}/{path.name}"
+    for path in sorted(work.glob("*.json")):
+        where = f"{WORKING_DIRNAME}/{path.name}"
         try:
             entry = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -915,18 +1051,23 @@ def validate(
     *,
     finding_ids: Iterable[str],
     base_revision: int,
+    root: Path | None = None,
 ) -> tuple[list[Finding], dict[str, dict[str, Any]], dict[str, list[str]]]:
     """Everything writ enforces about a working copy, as findings rather than a raise.
 
     A list, because a copy with three problems should say so once. Returns the
     findings, the features the copy proposes, and the diff against the committed
-    plan (`revised`, `added`, `removed`).
+    plan (`revised`, `added`, `removed`). With `root`, the committed index the
+    adjudicator was told to leave alone is checked too.
     """
     work = directory / WORKING_DIRNAME
     tasks = data.get("tasks", {})
     inventory = plans.requirements(data)
     proposed, found = read_copy(work)
-    index_where = f"{WORKING_DIRNAME}/{planfiles.INDEX_FILENAME}"
+    index_file = planfiles.index_path(root, data) if root is not None else None
+    index_where = (
+        planfiles.rel(root, index_file) if index_file is not None else WORKING_DIRNAME
+    )
 
     if plans.revision(data) != base_revision:
         found.append(
@@ -937,26 +1078,27 @@ def validate(
                 index_where,
             )
         )
-    try:
-        index = json.loads((work / planfiles.INDEX_FILENAME).read_text(encoding="utf-8"))
-        rows = index.get("requirements") if isinstance(index, dict) else None
-    except (OSError, json.JSONDecodeError):
-        rows = None
-    if rows is None or _digest(rows) != _digest(planfiles.requirement_rows(data)):
-        found.append(
-            _refuse(
-                "requirements-edited",
-                "the requirement inventory in the copied index was changed or "
-                "removed; the inventory is fixed",
-                index_where,
-                "leave plan/plan.json exactly as writ wrote it",
+    if index_file is not None:
+        try:
+            index = json.loads(index_file.read_text(encoding="utf-8"))
+            rows = index.get("requirements") if isinstance(index, dict) else None
+        except (OSError, json.JSONDecodeError):
+            rows = None
+        if rows is None or _digest(rows) != _digest(planfiles.requirement_rows(data)):
+            found.append(
+                _refuse(
+                    "requirements-edited",
+                    "the requirement inventory in the committed index was changed "
+                    "or removed; the inventory is fixed",
+                    index_where,
+                    f"leave {index_where} exactly as writ wrote it",
+                )
             )
-        )
 
     committed = {task_id: normal(planfiles.feature(task)) for task_id, task in tasks.items()}
     diff: dict[str, list[str]] = {"revised": [], "added": [], "removed": []}
     for task_id, task in tasks.items():
-        where = f"{WORKING_DIRNAME}/{planfiles.FEATURES_DIRNAME}/{task_id}.json"
+        where = f"{WORKING_DIRNAME}/{task_id}.json"
         entry = proposed.get(task_id)
         is_gate = task.get("kind") == "gate"
         if entry is None:
@@ -1027,7 +1169,7 @@ def validate(
     for ref, entry in proposed.items():
         if ref in tasks:
             continue
-        where = f"{WORKING_DIRNAME}/{planfiles.FEATURES_DIRNAME}/{ref}.json"
+        where = f"{WORKING_DIRNAME}/{ref}.json"
         if str(entry.get("kind") or "task") != "task":
             found.append(
                 _refuse("feature-shape", "a new feature must be of kind `task`", where)
@@ -1057,7 +1199,7 @@ def validate(
                 _refuse(
                     "unknown-requirement",
                     f"names requirement(s) not in the inventory: {', '.join(unknown)}",
-                    f"{WORKING_DIRNAME}/{planfiles.FEATURES_DIRNAME}/{ref}.json",
+                    f"{WORKING_DIRNAME}/{ref}.json",
                 )
             )
 
@@ -1078,7 +1220,7 @@ def validate(
             _refuse(
                 "coverage-regression",
                 f"no task covers {', '.join(sorted(lost))} any more",
-                f"{WORKING_DIRNAME}/{planfiles.FEATURES_DIRNAME}/",
+                f"{WORKING_DIRNAME}/",
                 "keep every requirement covered by some task",
             )
         )
@@ -1132,7 +1274,7 @@ def _validate_graph(
     for ref, entry in proposed.items():
         if nodes[ref]["kind"] == "gate":
             continue
-        where = f"{WORKING_DIRNAME}/{planfiles.FEATURES_DIRNAME}/{ref}.json"
+        where = f"{WORKING_DIRNAME}/{ref}.json"
         deps = normal(entry)["depends_on"]
         if contracts.is_feature(entry):
             # a feature's edges to other features are derived on promotion, so
@@ -1166,7 +1308,7 @@ def _validate_graph(
             _refuse(
                 "dependency-cycle",
                 "dependency cycle: " + " -> ".join(cycle),
-                f"{WORKING_DIRNAME}/{planfiles.FEATURES_DIRNAME}/",
+                f"{WORKING_DIRNAME}/",
                 "a gate waits for its milestone's tasks, so a task may not depend "
                 "on its own milestone's gate",
             )
@@ -1435,7 +1577,7 @@ def promote(
     request["removed_tasks"] = removed
     request["analysis"] = response["analysis"]
     request["questions"] = list(response["questions"])
-    plans.bump(data)
+    plans.bump(data, by=f"{request['id']} ({actor})")
     return {
         "tasks": added,
         "revised": revised,

@@ -133,14 +133,14 @@ def test_the_prompt_points_at_the_plan_and_forbids_rewriting(tmp_path):
         root=tmp_path,
         doc=tmp_path / "design.md",
         plan=_files(tmp_path),
-        report_path=tmp_path / ".writ/plans/p/reviews/r1/fidelity/findings.json",
+        report_path=tmp_path / ".writ/plans/p/rounds/r1/fidelity/findings.json",
     )
     assert "you are not fixing it" in prompt
     assert "Do not rewrite the plan" in prompt
     # the plan is referenced by repo-relative path, not pasted
     assert "  - .writ/plans/p/plan.json — the plan's index" in prompt
     assert "  - .writ/plans/p/features — one file per feature" in prompt
-    assert "\n  .writ/plans/p/reviews/r1/fidelity/findings.json\n" in prompt
+    assert "\n  .writ/plans/p/rounds/r1/fidelity/findings.json\n" in prompt
     # and a path the plan proposes is not a defect for not existing yet
     assert "Files that don't exist yet are expected" in prompt
     # the categories a blocker may use, and the cap, travel with the prompt

@@ -926,7 +926,7 @@ def apply_patch(
     request["questions"] = list(patch.questions)
     check_dag(data)
     refresh_milestones(data)
-    plans.bump(data)
+    plans.bump(data, by=f"{request['id']} (gate repair)")
     return {
         "tasks": added,
         "gate": gate["id"] if gate is not None else "",

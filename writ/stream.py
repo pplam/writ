@@ -27,8 +27,12 @@ degrades to the old behaviour rather than dropping the run.
 """
 from __future__ import annotations
 
+import gzip
 import json
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterator
 
 #: how much of a tool argument or a line of speech to show
 HINT = 110
@@ -188,3 +192,119 @@ TRUNCATED = {"length", "max_tokens"}
 def truncated(reasons: list[str]) -> bool:
     """Whether the last thing the agent did was run out of output budget."""
     return bool(reasons) and reasons[-1] in TRUNCATED
+
+
+# --------------------------------------------------------------------------
+# the event log at rest
+
+#: the event log while its run is live: every line, appended as it arrives, so
+#: a page watching the step can tail it
+EVENTS_FILENAME = "events.jsonl"
+#: the same log once the run has ended: streaming fragments dropped, gzipped
+COMPACT_EVENTS_FILENAME = "events.jsonl.gz"
+
+#: pi's streaming fragments. Each carries a token or two of what the matching
+#: `*_end` event then carries whole, so they are what a live view needs and
+#: nothing afterwards does — a real planning run had 14,446 of them, ~90% of its
+#: log, at ~250 bytes of envelope per few characters of text.
+PI_FRAGMENTS = {"text_delta", "thinking_delta", "toolcall_delta"}
+
+
+def fragment(shape: str, line: str) -> bool:
+    """Whether an event line only repeats, in pieces, what a later event says whole.
+
+    Only a line this is sure of counts: anything it cannot parse, or a shape it
+    does not know, is kept, because the raw log is where unknown shapes survive.
+    """
+    stripped = line.strip()
+    if not stripped.startswith("{"):
+        return False
+    try:
+        event = json.loads(stripped)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(event, dict):
+        return False
+    if shape == "pi":
+        if event.get("type") != "message_update":
+            return False
+        inner = event.get("assistantMessageEvent")
+        return isinstance(inner, dict) and inner.get("type") in PI_FRAGMENTS
+    if shape == "claude":
+        # `--include-partial-messages` streams API deltas as `stream_event`;
+        # the `assistant` event that follows holds the whole message.
+        return event.get("type") == "stream_event"
+    return False
+
+
+def compact(directory: Path, shape: str) -> Path | None:
+    """Replace a finished run's `events.jsonl` with a compacted, gzipped copy.
+
+    Nothing a reader uses is lost: rendering the compacted log gives the same
+    activity lines and stop reasons as the full one, because fragments render as
+    nothing. The copy is written beside the original and renamed into place
+    before the original goes, so a crash leaves one complete log or the other.
+    """
+    source = Path(directory) / EVENTS_FILENAME
+    if not source.exists():
+        return None
+    target = Path(directory) / COMPACT_EVENTS_FILENAME
+    partial = target.with_name(target.name + ".tmp")
+    with source.open("r", encoding="utf-8", errors="replace") as lines, gzip.open(
+        partial, "wt", encoding="utf-8"
+    ) as out:
+        for line in lines:
+            if not fragment(shape, line):
+                out.write(line if line.endswith("\n") else line + "\n")
+    os.replace(partial, target)
+    source.unlink()
+    return target
+
+
+def events_file(directory: Path) -> Path | None:
+    """The run's event log, live or compacted, or None if it has none."""
+    for name in (EVENTS_FILENAME, COMPACT_EVENTS_FILENAME):
+        path = Path(directory) / name
+        if path.exists():
+            return path
+    return None
+
+
+def has_events(directory: Path) -> bool:
+    """Whether the run left any events at all."""
+    path = events_file(directory)
+    if path is None:
+        return False
+    if path.name == EVENTS_FILENAME:
+        return path.stat().st_size > 0
+    try:
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
+            return bool(handle.read(1))
+    except (OSError, EOFError):
+        return False
+
+
+def event_lines(directory: Path, *, tail_bytes: int | None = None) -> Iterator[str]:
+    """Every line of the run's event log, live or compacted.
+
+    `tail_bytes` bounds a live log, which can be megabytes mid-run: the read
+    starts that far from the end and drops the partial line the seek lands in. A
+    compacted log is already small, and gzip cannot seek backwards cheaply, so it
+    is read whole.
+    """
+    path = events_file(directory)
+    if path is None:
+        return
+    if path.name == COMPACT_EVENTS_FILENAME:
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
+            yield from handle
+        return
+    with path.open("rb") as handle:
+        size = handle.seek(0, 2)
+        if tail_bytes is not None and size > tail_bytes:
+            handle.seek(size - tail_bytes)
+            handle.readline()  # the partial line the seek landed inside
+        else:
+            handle.seek(0)
+        for raw in handle:
+            yield raw.decode("utf-8", "replace")

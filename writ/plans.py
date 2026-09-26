@@ -100,9 +100,16 @@ def revision(data: dict[str, Any]) -> int:
     return int(plan_status(data).get("revision", 0))
 
 
-def bump(data: dict[str, Any]) -> int:
+def bump(data: dict[str, Any], by: str = "") -> int:
+    """Move the plan to its next revision.
+
+    `by` names what changed it, for the changeset the store records with the
+    revision (`state._record_revision`).
+    """
     record = plan_status(data)
     record["revision"] = int(record.get("revision", 0)) + 1
+    if by:
+        record["revised_by"] = by
     return record["revision"]
 
 

@@ -28,7 +28,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import analysis, commands, config, critics, repair
+from . import analysis, commands, config, critics, repair, retention
 from .failures import DEFAULT_MAX_INFRA_RETRIES
 from .server import DEFAULT_HOST, DEFAULT_PORT
 from .decisions import SETTABLE_DECISION_STATUSES
@@ -1120,6 +1120,52 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--agent", help="preview one agent command")
     p.add_argument("--model", help="preview with this model")
     p.set_defaults(func=commands.cmd_agents)
+
+    p = sub.add_parser(
+        "gc",
+        help="compact abandoned event logs and drop old ones",
+        description=(
+            "Every finished run's event log is compacted when it ends. This "
+            "compacts the ones that never were (older runs, runs whose writ "
+            "died) and removes compacted logs past --older-than days. Prompts, "
+            "transcripts and run outputs are never removed."
+        ),
+    )
+    p.add_argument(
+        "--older-than",
+        type=float,
+        default=retention.DEFAULT_KEEP_DAYS,
+        metavar="DAYS",
+        help=f"remove compacted event logs older than this (default {retention.DEFAULT_KEEP_DAYS})",
+    )
+    p.add_argument("--dry-run", action="store_true", help="say what would go")
+    p.set_defaults(func=commands.cmd_gc)
+
+    p = sub.add_parser(
+        "migrate",
+        help="convert an older project's state.json into the record store",
+        description=(
+            "Writ keeps a project in .writ/store.db, one record per task, run "
+            "and finding, and writes only the records a command changed. A "
+            "project from before that has a single state.json; this converts it "
+            "and leaves the old file in place, ignored, until --prune."
+        ),
+    )
+    p.add_argument(
+        "--prune",
+        action="store_true",
+        help="remove the old state.json (and any temporaries) once converted",
+    )
+    p.set_defaults(func=commands.cmd_migrate)
+
+    p = sub.add_parser("state", help="inspect the store")
+    state_sub = p.add_subparsers(
+        dest="state_command", required=True, metavar="<action>", parser_class=_Parser
+    )
+    q = state_sub.add_parser(
+        "dump", help="print the whole project as one JSON document"
+    )
+    q.set_defaults(func=commands.cmd_state_dump)
 
     p = sub.add_parser("supervise", help=argparse.SUPPRESS)
     p.add_argument("run_id")

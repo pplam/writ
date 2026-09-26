@@ -1,26 +1,36 @@
 """State storage for Writ.
 
-The store is deliberately boring: one JSON document per project, written
-atomically, guarded by an advisory lock file so a detached supervisor and an
+To every caller the project is one JSON document: `load` returns a dict,
+`transaction` hands one over and commits whatever it looks like afterwards. On
+disk it is a SQLite file of small records — one per task, run, milestone and
+requirement, one per entry of each log, one per remaining top-level field —
+so a commit writes the records that changed rather than the whole project.
+An advisory lock file still serializes writers, so a detached supervisor and an
 interactive CLI cannot clobber each other.
 
 Layout under a project root:
 
     .writ/
-        state.json        the whole project: milestones, tasks, runs, decisions
+        store.db          the whole project, as records (see `_shards`)
         state.lock        advisory lock; an OS-level `flock` where available, so
                           it is released by the kernel if a holder dies and can
                           never be taken from a holder that is merely slow
         decisions.md      human-readable, append-only mirror of the decision log
-        runs/<run-id>/    prompt.txt, stdout.log, stderr.log, meta.json
+        runs/<task>/<nn>-<role>/
+                          prompt.txt, stdout.log, stderr.log, meta.json, and the
+                          run's output; see runner.new_run_id
         plans/<plan-id>/  one plan: analysis artifacts, draft.json, the committed
-                          index (plan.json) and features/, reviews/, rounds/;
+                          index (plan.json) and features/, rounds/;
                           see planfiles.py
+
+A store from before the records (`state.json`, schema 1) is converted by
+`writ migrate`; `writ state dump` prints the document either way.
 """
 from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import threading
 import time
 from contextlib import contextmanager
@@ -35,9 +45,12 @@ try:  # pragma: no cover - platform dependent
 except ImportError:  # pragma: no cover - Windows
     fcntl = None  # type: ignore[assignment]
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+LEGACY_SCHEMA_VERSION = 1
 
 STORE_DIRNAME = ".writ"
+DB_FILENAME = "store.db"
+#: the single-document store of schema 1, read only by `migrate`
 STATE_FILENAME = "state.json"
 LOCK_FILENAME = "state.lock"
 DECISIONS_FILENAME = "decisions.md"
@@ -74,6 +87,11 @@ def store_dir(root: str | os.PathLike[str]) -> Path:
 
 
 def state_file(root: str | os.PathLike[str]) -> Path:
+    """The file that holds the project. Its mtime moves on every commit."""
+    return store_dir(root) / DB_FILENAME
+
+
+def legacy_file(root: str | os.PathLike[str]) -> Path:
     return store_dir(root) / STATE_FILENAME
 
 
@@ -132,40 +150,54 @@ def empty_state() -> dict[str, Any]:
 
 
 def is_initialized(root: str | os.PathLike[str]) -> bool:
-    return state_file(root).exists()
+    return state_file(root).exists() or legacy_file(root).exists()
 
 
 def initialize(root: str | os.PathLike[str], force: bool = False) -> Path:
     """Create the store. Refuses to overwrite unless `force`."""
-    target = state_file(root)
-    if target.exists() and not force:
+    if is_initialized(root) and not force:
         raise WritError(
             f"already initialized at {store_dir(root)} (use --force to reset)"
         )
     runs_dir(root).mkdir(parents=True, exist_ok=True)
     plans_dir(root).mkdir(parents=True, exist_ok=True)
-    _write(target, empty_state())
+    target = state_file(root)
+    target.unlink(missing_ok=True)
+    _commit(target, empty_state(), {})
     sweep_temporaries(root)
     return store_dir(root)
 
 
 def load(root: str | os.PathLike[str]) -> dict[str, Any]:
     """Read the project document. Raises if the project is not initialized."""
+    return _load(root)[0]
+
+
+def _load(root: str | os.PathLike[str]) -> tuple[dict[str, Any], dict[Key, Row]]:
+    """The document, and the records it was read from, for `transaction` to diff."""
     target = state_file(root)
     if not target.exists():
+        if legacy_file(root).exists():
+            raise WritError(
+                f"the store at {store_dir(root)} is from an older Writ "
+                f"({STATE_FILENAME}, schema {LEGACY_SCHEMA_VERSION}); "
+                "run `writ migrate` to convert it"
+            )
         raise WritError(
             f"no Writ project at {Path(root).expanduser()} (run `writ init` first)"
         )
-    try:
-        data = json.loads(target.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:  # pragma: no cover - corrupted store
-        raise WritError(f"corrupt state file {target}: {exc}") from exc
+    rows = _read_rows(target)
+    data = _assemble(rows)
     version = data.get("schema_version")
     if version != SCHEMA_VERSION:
         raise WritError(
             f"state schema {version!r} is not supported by this Writ build "
             f"(expected {SCHEMA_VERSION})"
         )
+    return _defaults(data), rows
+
+
+def _defaults(data: dict[str, Any]) -> dict[str, Any]:
     # Defaults rather than a schema bump: every one of these is additive, and a
     # project planned by an older Writ stays readable and runnable without a
     # migration step that could fail halfway.
@@ -193,7 +225,149 @@ def load(root: str | os.PathLike[str]) -> dict[str, Any]:
         # write anywhere in the codebase.
         task.setdefault("kind", "task")
         task.setdefault("requirement_ids", [])
+    data.setdefault("plan_revisions", [])
     return data
+
+
+# ------------------------------------------------------------------ records
+#
+# A record is (section, item) -> (kind, position, body). `kind` says how the
+# section is put back together: `value` is a top-level field stored whole,
+# `map` and `list` are a section stored one entry per record plus an empty
+# container record, so an empty section survives and a one-entry change writes
+# one record. Bodies are canonical JSON (sorted keys), so an unchanged entry
+# serializes to the same bytes and is not written.
+
+Key = tuple[str, str]
+Row = tuple[str, int, str]
+
+#: sections stored one record per entry, keyed by id
+MAP_SECTIONS = ("tasks", "runs", "milestones", "requirements")
+#: sections stored one record per entry, in order
+LIST_SECTIONS = ("findings", "repairs", "decisions", "phases", "plans", "plan_revisions")
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS record (
+    section  TEXT NOT NULL,
+    item     TEXT NOT NULL,
+    kind     TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    body     TEXT NOT NULL,
+    PRIMARY KEY (section, item)
+)
+"""
+
+
+def _body(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def _shards(data: dict[str, Any]) -> dict[Key, Row]:
+    """The document as records."""
+    rows: dict[Key, Row] = {}
+    for section, value in data.items():
+        if section in MAP_SECTIONS and isinstance(value, dict):
+            rows[(section, "")] = ("map", 0, "{}")
+            # Unordered, as `state.json` was: entries come back sorted by id, and
+            # removing one does not renumber, and so rewrite, all the others.
+            for item, entry in value.items():
+                rows[(section, str(item))] = ("map", 0, _body(entry))
+        elif section in LIST_SECTIONS and isinstance(value, list):
+            rows[(section, "")] = ("list", 0, "[]")
+            for position, entry in enumerate(value, start=1):
+                rows[(section, f"{position:06d}")] = ("list", position, _body(entry))
+        else:
+            rows[(section, "")] = ("value", 0, _body(value))
+    return rows
+
+
+def _assemble(rows: dict[Key, Row]) -> dict[str, Any]:
+    """Records back into the document `_shards` took apart."""
+    data: dict[str, Any] = {}
+    ordered = sorted(rows.items(), key=lambda pair: (pair[0][0], pair[1][1], pair[0][1]))
+    for (section, item), (kind, _, body) in ordered:
+        if not item:
+            data[section] = json.loads(body)
+        elif kind == "map":
+            data.setdefault(section, {})[item] = json.loads(body)
+        else:
+            data.setdefault(section, []).append(json.loads(body))
+    return data
+
+
+def _connect(target: Path) -> sqlite3.Connection:
+    """A connection in autocommit mode: every transaction here is explicit.
+
+    The rollback journal, not WAL: a reader then never writes anything — no
+    `-wal` or `-shm` files, no checkpoint on close — which is what lets
+    `writ serve` read a live project without touching it, and the file's mtime
+    still moves on every commit for the watcher.
+    """
+    connection = sqlite3.connect(target, timeout=LOCK_TIMEOUT_SECONDS, isolation_level=None)
+    connection.execute(f"PRAGMA synchronous = {'FULL' if fsync_enabled() else 'OFF'}")
+    return connection
+
+
+def _read_rows(target: Path) -> dict[Key, Row]:
+    try:
+        connection = _connect(target)
+        try:
+            cursor = connection.execute(
+                "SELECT section, item, kind, position, body FROM record"
+            )
+            return {
+                (section, item): (kind, position, body)
+                for section, item, kind, position, body in cursor
+            }
+        finally:
+            connection.close()
+    except sqlite3.DatabaseError as exc:
+        raise WritError(f"corrupt state store {target}: {exc}") from exc
+
+
+def _commit(
+    target: Path, data: dict[str, Any], before: dict[Key, Row]
+) -> dict[Key, Row]:
+    """Write the records that differ from `before`, in one transaction.
+
+    `BEGIN IMMEDIATE` takes the write lock up front and the commit is atomic and
+    durable (with `synchronous = FULL`): a crash leaves the previous project or
+    this one, never a mix of records from both.
+    """
+    rows = _shards(data)
+    changed = [
+        (section, item, *row)
+        for (section, item), row in rows.items()
+        if before.get((section, item)) != row
+    ]
+    gone = [key for key in before if key not in rows]
+    if not changed and not gone and target.exists():
+        return rows
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        connection = _connect(target)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(_SCHEMA)
+                connection.executemany(
+                    "DELETE FROM record WHERE section = ? AND item = ?", gone
+                )
+                connection.executemany(
+                    "INSERT OR REPLACE INTO record (section, item, kind, position, body) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    changed,
+                )
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            connection.execute("COMMIT")
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        raise WritError(f"could not write the state store {target}: {exc}") from exc
+    return rows
 
 
 def fsync_enabled() -> bool:
@@ -206,74 +380,11 @@ def fsync_enabled() -> bool:
     )
 
 
-def _write(target: Path, data: dict[str, Any]) -> None:
-    """Replace the document durably: a commit survives a crash, or never happened.
-
-    `os.replace` alone is atomic against a concurrent *reader* — nobody ever sees
-    half a document — but it says nothing about power loss. Without the flushes
-    below, a committed transaction can be in the page cache and nowhere else, so
-    a machine that dies comes back having lost the most recent state while every
-    run directory on disk says the work happened. Every other guarantee in writ
-    is written down in this file, so this is the floor they all stand on.
-
-    Four steps, in this order, and the order is the whole thing:
-
-    1. write the replacement to a temporary file in the same directory;
-    2. `fsync` it, so its *contents* are on the device before it has a name
-       anyone will read;
-    3. `os.replace`, which is the atomic commit point;
-    4. `fsync` the directory, so the rename itself is on the device.
-    """
-    target.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-    tmp = target.with_name(f"{target.name}.tmp.{os.getpid()}.{threading.get_ident()}")
-    sync = fsync_enabled()
-    try:
-        with tmp.open("w", encoding="utf-8") as handle:
-            handle.write(payload)
-            if sync:
-                handle.flush()
-                os.fsync(handle.fileno())
-        tmp.replace(target)
-    except OSError:
-        # A failure before the replace leaves the previous document intact, which
-        # is the outcome to preserve: better an old state than a truncated one.
-        # The temporary file would otherwise accumulate, and `sweep_temporaries`
-        # only runs at startup.
-        try:
-            tmp.unlink()
-        except OSError:  # pragma: no cover - defensive
-            pass
-        raise
-    if sync:
-        _fsync_dir(target.parent)
-
-
-def _fsync_dir(directory: Path) -> None:
-    """Flush a directory entry, where the platform supports it.
-
-    Not every filesystem allows opening a directory for this, and Windows does
-    not at all. A platform that refuses leaves the rename as durable as it was
-    before — the file's own contents are still flushed — so this is best effort
-    by design rather than by omission.
-    """
-    try:
-        fd = os.open(directory, os.O_RDONLY)
-    except OSError:  # pragma: no cover - platform dependent
-        return
-    try:
-        os.fsync(fd)
-    except OSError:  # pragma: no cover - platform dependent
-        pass
-    finally:
-        os.close(fd)
-
-
 def sweep_temporaries(root: str | os.PathLike[str]) -> list[Path]:
     """Delete temporary state files orphaned by a crash. Returns what it removed.
 
-    A write that dies between step 1 and step 3 above leaves a `state.json.tmp.*`
-    behind. It is harmless — nothing reads it — but it accumulates, and a store
+    The single-file store of schema 1 wrote through a temporary, and a write that
+    died before its rename left a `state.json.tmp.*` behind. It is harmless — nothing reads it — but it accumulates, and a store
     littered with debris from previous crashes is a store nobody trusts.
 
     A temporary whose writing process is still alive is left alone: the pid is in
@@ -305,7 +416,9 @@ def _temporary_pid(path: Path) -> int | None:
 
 
 def save(root: str | os.PathLike[str], data: dict[str, Any]) -> None:
-    _write(state_file(root), data)
+    """Replace the stored document with `data`, writing only what differs."""
+    target = state_file(root)
+    _commit(target, data, _read_rows(target) if target.exists() else {})
 
 
 @contextmanager
@@ -516,8 +629,107 @@ def _release(path: Path, identity: procs.Identity | None = None) -> None:
 
 @contextmanager
 def transaction(root: str | os.PathLike[str]) -> Iterator[dict[str, Any]]:
-    """Load, mutate, save — under a lock, so concurrent writers serialize."""
+    """Load, mutate, save — under a lock, so concurrent writers serialize.
+
+    Only the records the block changed are written. A change to the plan's
+    revision is recorded as a changeset in the same commit, and a change to
+    the plan refreshes its files afterwards, whoever made it.
+    """
     with _lock(root):
-        data = load(root)
+        data, before = _load(root)
         yield data
-        save(root, data)
+        if data.get("plan", {}).get("revision") != _revision(before):
+            _record_revision(data, before)
+        after = _commit(state_file(root), data, before)
+        if any(
+            after.get(key) != before.get(key)
+            for key in set(after) | set(before)
+            if key[0] in VIEW_SECTIONS
+        ):
+            _refresh_views(root, data)
+
+
+#: the sections the plan's files are generated from
+VIEW_SECTIONS = ("tasks", "plan", "requirements", "milestones", "design_docs")
+
+
+def _revision(rows: dict[Key, Row]) -> Any:
+    row = rows.get(("plan", ""))
+    return json.loads(row[2]).get("revision") if row else None
+
+
+def _record_revision(data: dict[str, Any], before: dict[Key, Row]) -> None:
+    """Append what the new revision changed, field by field, to `plan_revisions`."""
+    from . import planfiles  # the plan's shape lives there; it imports this module
+
+    previous = {
+        item: json.loads(body)
+        for (section, item), (_, _, body) in before.items()
+        if section == "tasks" and item
+    }
+    plan = data.get("plan") or {}
+    changes = planfiles.changeset(previous, data.get("tasks", {}))
+    data.setdefault("plan_revisions", []).append(
+        {
+            "revision": plan.get("revision"),
+            "base_revision": _revision(before),
+            "by": plan.pop("revised_by", "") or "",
+            "at": utcnow(),
+            **changes,
+        }
+    )
+
+
+def _refresh_views(root: str | os.PathLike[str], data: dict[str, Any]) -> None:
+    """Regenerate the plan's files. Views: a failure here loses nothing."""
+    from . import planfiles
+
+    try:
+        planfiles.refresh(root, data)
+    except (OSError, WritError):
+        pass
+
+
+# ------------------------------------------------------------------ migration
+
+
+def migrate(root: str | os.PathLike[str], *, prune: bool = False) -> dict[str, Any]:
+    """Convert a schema 1 `state.json` into the record store.
+
+    The old file is left where it was, and ignored from then on, until `prune`
+    removes it: a conversion that turns out wrong is then one `rm store.db`
+    away from undone.
+    """
+    legacy = legacy_file(root)
+    target = state_file(root)
+    report: dict[str, Any] = {"converted": False, "pruned": [], "store": target}
+    with _lock(root):
+        if not target.exists():
+            if not legacy.exists():
+                raise WritError(
+                    f"no Writ project at {Path(root).expanduser()} (run `writ init` first)"
+                )
+            try:
+                data = json.loads(legacy.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise WritError(f"corrupt state file {legacy}: {exc}") from exc
+            version = data.get("schema_version")
+            if version != LEGACY_SCHEMA_VERSION:
+                raise WritError(
+                    f"{legacy} has schema {version!r}; `writ migrate` converts "
+                    f"schema {LEGACY_SCHEMA_VERSION}"
+                )
+            data["schema_version"] = SCHEMA_VERSION
+            _commit(target, _defaults(data), {})
+            report["converted"] = True
+        if prune:
+            for path in [legacy, *sorted(store_dir(root).glob(f"{STATE_FILENAME}.tmp.*"))]:
+                if path.exists():
+                    path.unlink()
+                    report["pruned"].append(path)
+    return report
+
+
+def dump(root: str | os.PathLike[str]) -> str:
+    """The whole project as one JSON document, the way `state.json` held it."""
+    return json.dumps(load(root), indent=2, sort_keys=True, ensure_ascii=False) + "\n"

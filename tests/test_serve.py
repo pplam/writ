@@ -108,6 +108,17 @@ def test_a_detail_route_answers_for_one_id(served):
     assert json.loads(body)["id"] == "M01-001"
 
 
+def test_a_run_id_with_its_slash_encoded_is_one_id(served):
+    base, project = served
+    with state.transaction(project) as data:
+        data["runs"]["M01-001/01-implement"] = {
+            "id": "M01-001/01-implement", "task": "M01-001", "role": "agent",
+            "status": "completed", "dir": str(state.run_dir(project, "M01-001/01-implement")),
+        }
+    _, _, body = get(f"{base}/api/run/M01-001%2F01-implement")
+    assert json.loads(body)["id"] == "M01-001/01-implement"
+
+
 def test_an_unknown_id_is_a_404_with_a_readable_reason(served):
     base, _ = served
     with pytest.raises(urllib.error.HTTPError) as caught:

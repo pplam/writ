@@ -49,7 +49,7 @@ DEFAULT_PORT = 8731
 #: the flag, the help text and the generated config all read it from one place.
 DEFAULT_HOST = "127.0.0.1"
 
-#: How often the watcher stats `state.json`. Agent turns take tens of seconds, so
+#: How often the watcher stats the store. Agent turns take tens of seconds, so
 #: this is far finer than what it observes; it is cheap because a tick is a stat
 #: and the file is only parsed when the mtime moves.
 POLL_SECONDS = 0.4
@@ -174,15 +174,17 @@ class _Handler(BaseHTTPRequestHandler):
             return api.task(data, parts[1])
         if len(parts) == 2 and parts[0] == "milestone":
             return api.milestone(data, parts[1])
+        # A run id is its folder, `FT-002/02-review`, so the client encodes the
+        # slash and it arrives as one segment to unquote.
         if len(parts) == 2 and parts[0] == "run":
-            return api.run(data, self.root, parts[1])
+            return api.run(data, self.root, unquote(parts[1]))
         if len(parts) == 3 and parts[0] == "run":
             # The whole log rather than the tail the detail view carries.
-            return api.log(self.root, data, parts[1], parts[2])
+            return api.log(self.root, data, unquote(parts[1]), parts[2])
         if len(parts) == 3 and parts[:2] == ["phase", "step"]:
             # Polled while a reader is watching a live planning step. Not on the
             # snapshot push: a step's transcript grows continuously while
-            # `state.json` does not move at all, so it is not something a snapshot
+            # the store does not move at all, so it is not something a snapshot
             # watcher would ever notice — and shipping every step's output on every
             # push would send megabytes to a page showing one of them.
             #
@@ -223,11 +225,11 @@ class _Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------- streaming
 
     def _stream(self) -> None:
-        """Push a snapshot whenever `state.json` changes.
+        """Push a snapshot whenever the store changes.
 
         Watching the file rather than hooking the orchestrator is what makes this
         work for every writer: `writ run`, a hand-run `writ dispatch`, a `writ
-        override` in another window, even an editor saving the file. The dashboard
+        override` in another window, even a hand-run `writ migrate`. The dashboard
         needs to know nothing about who is working.
         """
         self.started = True
@@ -364,7 +366,7 @@ def serve(
             flush=True,
         )
     print(f"writ serve on {url}", flush=True)
-    print("read-only; following .writ/state.json  (^C to stop)", flush=True)
+    print("read-only; following .writ/store.db  (^C to stop)", flush=True)
     if open_browser:
         threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
     try:

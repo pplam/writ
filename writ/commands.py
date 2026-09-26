@@ -29,6 +29,7 @@ from . import (
     plans,
     render,
     repair,
+    retention,
     runner,
     server,
     state,
@@ -881,7 +882,7 @@ def _commit_plan(
                 results=pipeline_results,
                 artifacts=pipeline_artifacts,
             )
-        plans.bump(data)
+        plans.bump(data, by="planner")
         plans.set_status(data, "draft")
         # An appended plan joins the graph already on disk; anything else starts
         # a plan directory of its own (the pipeline's, when there was one).
@@ -1292,7 +1293,7 @@ def cmd_adjudicate(args) -> int:
             phase,
             step_for(number),
             resolved=resolved,
-            directory=directory / f"round-{number}",
+            directory=adjudicate.attempt_dir(directory, number),
         )
         if args.json:
             return
@@ -1500,7 +1501,7 @@ def _repair_plan(
             phase,
             step_of[number],
             resolved=resolved,
-            directory=directory / f"round-{number}",
+            directory=adjudicate.attempt_dir(directory, number),
         )
         print(f"  round {number}: {resolved.display}")
         sys.stdout.flush()
@@ -1664,7 +1665,7 @@ def _run_critics(args, *, root, doc, chosen, plan_path, phase=None, verify=False
                     contexts[critic.name] = context
     found = plans.findings(data, open_only=True)
     revision = plans.revision(data)
-    directory = planfiles.reviews_dir(root, data, revision)
+    directory = planfiles.rounds_dir(root, data, revision)
     step_id = _critic_steps(root, phase, chosen, revision=revision, data=data)
     if len(chosen) > 1 and not args.json:
         grouped = critics.waves(chosen)
@@ -1758,7 +1759,7 @@ def _critic_steps(root, phase, chosen, *, revision: int, data):
     The critics can run more than once over one plan. `--repair` patches the plan
     between rounds, `repair.apply_patch` bumps its revision, and `recheck` re-runs
     every critic against the patched plan at that new revision — writing to a new
-    `reviews/r{n}` directory. So a second pass is not the declared step happening
+    `rounds/r{n}` directory. So a second pass is not the declared step happening
     again, it is a different run of the same critic against a different plan, and
     giving it the declared step's id would overwrite the first pass's result with
     the second's and point its transcript link at the wrong directory.
@@ -3470,7 +3471,47 @@ def cmd_cancel(args) -> None:
         print(f"marked {run_id} interrupted")
 
 
+def cmd_gc(args) -> None:
+    """Compact abandoned event logs and remove compacted ones past their age."""
+    report = retention.collect(
+        Path(args.root), keep_days=args.older_than, dry_run=args.dry_run
+    )
+    verb = ("would compact", "would remove") if args.dry_run else ("compacted", "removed")
+    root = Path(args.root)
+    for path in report.compacted:
+        print(f"{verb[0]} {planfiles.rel(root, path)}")
+    for path in report.removed:
+        print(f"{verb[1]} {planfiles.rel(root, path)}")
+    if not report.compacted and not report.removed:
+        print("nothing to collect")
+    elif not args.dry_run:
+        print(f"freed {report.freed / 1e6:.1f} MB")
 
+
+
+
+def cmd_migrate(args) -> None:
+    """Convert a schema 1 `state.json` into the record store."""
+    root = Path(args.root)
+    report = state.migrate(root, prune=args.prune)
+    if report["converted"]:
+        print(f"converted {state.STATE_FILENAME} into {planfiles.rel(root, report['store'])}")
+        # The plan's files are views of the store; bring them up to date with it.
+        planfiles.refresh(root, state.load(root))
+    else:
+        print(f"already converted: {planfiles.rel(root, report['store'])}")
+    for path in report["pruned"]:
+        print(f"removed {planfiles.rel(root, path)}")
+    if report["converted"] and not args.prune:
+        print(
+            f"the old {state.STATE_FILENAME} is kept, and ignored; "
+            "`writ migrate --prune` removes it"
+        )
+
+
+def cmd_state_dump(args) -> None:
+    """Print the project as one JSON document: the store, read the old way."""
+    sys.stdout.write(state.dump(Path(args.root)))
 
 
 # --------------------------------------------------------------------------
