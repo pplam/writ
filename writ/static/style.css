@@ -1,4 +1,4 @@
-/* built from ui/src (ad2b6c0b5487) */
+/* built from ui/src (3d395f021351) */
 /*
  * One stylesheet, no framework.
  *
@@ -740,14 +740,14 @@ code, .mono, pre { font-family: var(--mono); }
 }
 
 /*
- * An activity row is two lines: the event, then the agent's own summary of what
- * it did. Both used to compete for one ellipsised line, which cut the summary
- * to nothing on any realistic width.
+ * An activity row is one line: mark, role, event, the agent's summary, time.
+ * The summary takes whatever width is left and is cut to fit, so every row is
+ * the same height whether or not the run said anything.
  */
 .activity > li {
   display: flex;
-  gap: 10px;
-  align-items: baseline;
+  gap: 9px;
+  align-items: center;
   padding: 8px 6px;
   border-radius: 6px;
   border: 1px solid transparent;
@@ -758,13 +758,12 @@ code, .mono, pre { font-family: var(--mono); }
 .activity > li[data-opens] { cursor: pointer; }
 .activity > li[data-opens]:hover { background: var(--sunken); }
 .activity > li:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
-.event-body { flex: 1 1 auto; min-width: 0; }
-.event-line { display: flex; align-items: center; gap: 9px; min-width: 0; }
-.activity .what { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.activity .when { font-size: 12px; color: var(--faint); white-space: nowrap; }
+.activity .what { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.activity .when { flex: 0 0 auto; font-size: 12px; color: var(--faint); white-space: nowrap; }
 
 .event-summary {
-  margin: 2px 0 0;
+  flex: 1 1 0;
+  min-width: 0;
   font-size: 12.5px;
   color: var(--dim);
   overflow: hidden;

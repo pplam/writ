@@ -1,4 +1,4 @@
-/* built from ui/src (ad2b6c0b5487) */
+/* built from ui/src (3d395f021351) */
 /*
  * writ dashboard — compiled from ui/src by ui/build.mjs.
  * Do not edit: change the TypeScript and rebuild.
@@ -951,16 +951,19 @@ function activityCard(events, handlers) {
         : el('p', { class: 'blank' }, 'Nothing has happened yet.'));
 }
 /**
- * Two lines, not one. The event text and its summary were competing for a
- * single ellipsised row, which cut both; the summary is the agent's own sentence
- * about what it did, so it gets its own line under the event.
+ * One line per event, whatever it carries. The agent's summary used to take a
+ * second line, which made rows with one twice the height of rows without and
+ * the list read as ragged. It now fills the space between the event and its
+ * time, cut to fit; the whole sentence is in the row's tooltip and the run.
  */
 function activityRow(event, handlers) {
-    const row = el('li', { class: classes('event', event.kind, isLive(event.status) && 'live') }, el('span', { class: classes('mark', event.status) }, mark(event.status)), el('div', { class: 'event-body' }, el('div', { class: 'event-line' }, event.role ? el('span', { class: classes('role', event.role) }, roleLabel(event.role)) : null, 
+    const row = el('li', { class: classes('event', event.kind, isLive(event.status) && 'live') }, el('span', { class: classes('mark', event.status) }, mark(event.status)), event.role ? el('span', { class: classes('role', event.role) }, roleLabel(event.role)) : null, 
     // The badge already says what kind of run it was, so a start reads as
     // "review · FT-002 started" rather than repeating the verb.
-    el('span', { class: 'what' }, event.kind === 'run-started' ? `${event.task} started` : event.text), el('span', { class: 'grow' }), el('span', { class: 'when muted', title: event.at }, ago(event.at))), event.summary ? el('p', { class: 'event-summary' }, event.summary) : null));
-    row.setAttribute('title', `${clock(event.at)} · ${event.text}`);
+    el('span', { class: 'what' }, event.kind === 'run-started' ? `${event.task} started` : event.text), event.summary
+        ? el('span', { class: 'event-summary' }, event.summary)
+        : el('span', { class: 'grow' }), el('span', { class: 'when muted', title: event.at }, ago(event.at)));
+    row.setAttribute('title', `${clock(event.at)} · ${event.text}${event.summary ? `\n${event.summary}` : ''}`);
     if (event.run) {
         activate(row, `run:${event.run}`, () => handlers.onRun(event.run));
     }
