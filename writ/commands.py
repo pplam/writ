@@ -1333,8 +1333,13 @@ def cmd_adjudicate(args) -> int:
             for finding in round_.refused[:6]:
                 print(f"    {finding.line()}")
             return
-        if round_.questions:
-            print(f"  raised {len(round_.questions)} question(s) for a human")
+        if round_.questions and not round_.unanswered:
+            print(
+                f"  answered {len(round_.questions)} question(s) with their "
+                "recommendations (autonomous)"
+            )
+        elif round_.questions:
+            print(f"  raised {len(round_.unanswered)} question(s) for a human")
             return
         print(f"  applied: {_applied_line(round_.applied)}")
         print(f"  blocking now: {round_.blocking_after}")
@@ -1376,6 +1381,7 @@ def cmd_adjudicate(args) -> int:
             stream=not args.quiet,
             on_round=report,
             on_start=announce,
+            autonomous=_autonomous(args, root),
         )
     finally:
         phases.finish(root, phase, status="done")
@@ -1412,6 +1418,15 @@ def cmd_adjudicate(args) -> int:
         print(f"stopped: {result.stopped}")
     if result.clean:
         print("next: writ approve")
+    elif any(
+        decisions.asked(data, finding.id)
+        for finding in plans.findings(data, open_only=True)
+        if finding.severity == "error"
+    ):
+        print(
+            'next: writ set D-NNNN active --decision "..."   (then writ adjudicate '
+            "again to repair the plan to follow it)"
+        )
     else:
         print("next: writ check   (then writ approve --force --reason ..., or re-plan)")
     return 0 if result.clean else 1
@@ -1521,8 +1536,13 @@ def _repair_plan(
             for finding in round_.refused[:6]:
                 print(f"    {finding.line()}")
             return
-        if round_.questions:
-            print(f"  raised {len(round_.questions)} question(s) for a human")
+        if round_.questions and not round_.unanswered:
+            print(
+                f"  answered {len(round_.questions)} question(s) with their "
+                "recommendations (autonomous)"
+            )
+        elif round_.questions:
+            print(f"  raised {len(round_.unanswered)} question(s) for a human")
             return
         print(
             f"  applied: {_applied_line(round_.applied)}; "
@@ -1569,6 +1589,7 @@ def _repair_plan(
             stream=not args.quiet,
             on_round=report,
             on_start=announce,
+            autonomous=_autonomous(args, root),
         )
     except WritError as exc:
         print(f"repair did not run: {exc}", file=sys.stderr)
@@ -2027,10 +2048,21 @@ def _list_decisions(data, args):
         items = [item for item in items if item["status"] == args.status]
     if getattr(args, "proposed", False):
         items = [item for item in items if item["status"] == "proposed"]
+    if getattr(args, "autonomous", False):
+        items = [
+            item for item in items if item.get("confirmed_by") == decisions.AUTONOMOUS
+        ]
     rows = [
-        [i["id"], i["status"], i.get("proposed_by") or "", i["title"]] for i in items
+        [
+            i["id"],
+            i["status"],
+            i.get("proposed_by") or "",
+            i.get("confirmed_by") or "-",
+            i["title"],
+        ]
+        for i in items
     ]
-    return ["ID", "STATUS", "BY", "TITLE"], rows, list(items)
+    return ["ID", "STATUS", "BY", "RULED BY", "TITLE"], rows, list(items)
 
 
 def _list_findings(data, args):
@@ -2463,7 +2495,12 @@ def _render_task(data: dict[str, Any], task: dict[str, Any]) -> str:
         head = (
             f"\nrework: attempt {attempt} of "
             f"{record.get('budget', record.get('max'))}, "
-            f"rejected by {record.get('reviewer') or '-'} at {record.get('at')}"
+            + (
+                f"returned unfinished ({record.get('reason')}) at {record.get('at')}"
+                if record.get("kind") == "unfinished"
+                else f"rejected by {record.get('reviewer') or '-'} "
+                f"at {record.get('at')}"
+            )
         )
         if record.get("resolved_at"):
             head += f" — answered, accepted at {record['resolved_at']}"
@@ -2942,12 +2979,32 @@ def _set_decision(args, data) -> None:
         print(f"{record['id']} rejected: {record['title']}")
         print(f"reason: {record['rejected_reason']}")
         return
+    ruling = (getattr(args, "decision", None) or "").strip()
+    record = decisions.get(data, args.id)
+    if decisions.undecided(record) and not ruling:
+        # Confirming the placeholder would make "undecided" binding and leave the
+        # finding it came from standing with nothing to repair it to.
+        raise WritError(
+            f"{args.id} is a question, not a proposal: give your answer with "
+            f'`writ set {args.id} active --decision "..."`'
+        )
+    if ruling:
+        if record["status"] != "proposed":
+            raise WritError(f"{args.id} is {record['status']}; its text is settled")
+        record["decision"] = ruling
     record = decisions.confirm(data, args.id, supersedes=args.supersedes)
     decisions.sync_markdown(args.root, data)
     print(f"{record['id']} active: {record['title']}")
+    if ruling:
+        print(f"decision: {ruling}")
     if record.get("supersedes"):
         print(f"supersedes: {record['supersedes']}")
     print(f"mirror: {state.decisions_file(args.root)}")
+    if record.get("finding"):
+        print(
+            f"next: writ build   (repairs the plan to follow {record['id']}, "
+            f"which answers {record['finding']})"
+        )
 
 
 def cmd_override(args) -> None:
@@ -3448,6 +3505,7 @@ BUILD_FORWARDS: dict[str, tuple[str | None, str | None]] = {
     "quiet": ("quiet", "quiet"),
     "json": (None, "json"),
     "dry_run": ("dry_run", "dry_run"),
+    "autonomous": ("autonomous", "autonomous"),
 }
 
 
@@ -3497,8 +3555,16 @@ def cmd_build(args) -> int:
             return code
         data = state.load(root)
         print()
-    elif not args.json:
-        print(f"the plan is in place ({len(data['tasks'])} tasks); running it")
+    else:
+        if not args.json:
+            print(f"the plan is in place ({len(data['tasks'])} tasks); running it")
+        if (
+            not args.dry_run
+            and not plans.runnable(data)
+            and (_ruled(data) or _build_autonomous(args, root))
+        ):
+            _repair_to_rulings(args, root)
+            data = state.load(root)
 
     if not args.dry_run and not plans.runnable(data):
         print(plans.not_runnable_message(data))
@@ -3507,6 +3573,86 @@ def cmd_build(args) -> int:
     run_args = _step_args(args, "run", [], index=1)
     config.apply(run_args, config.load(root))
     return cmd_run(run_args)
+
+
+def _build_autonomous(args, root: Path) -> bool:
+    """Whether this build decides on its own: its flag, else the config."""
+    if getattr(args, "autonomous", None) is not None:
+        return bool(args.autonomous)
+    return bool((config.load(root).get("decisions") or {}).get("autonomous"))
+
+
+def _autonomous(args, root: Path) -> bool:
+    """Whether this command decides on its own, recorded where verdicts read it.
+
+    Applying a verdict happens several calls from the arguments, and sometimes in
+    a later process (`writ run` resuming what a killed one left), so the mode
+    goes in the state: the last command that resolved it says what holds.
+    """
+    on = bool(getattr(args, "autonomous", False))
+    if decisions.autonomous(state.load(root)) != on:
+        with state.transaction(root) as data:
+            data["autonomous"] = on
+    return on
+
+
+def _ruled(data) -> list[str]:
+    """Blocking findings a person has now ruled on, which a repair can close."""
+    return [
+        finding.id
+        for finding in plans.findings(data, open_only=True)
+        if finding.severity == "error"
+        and finding.category == adjudicate.DECISION_CATEGORY
+        and decisions.ruling(data, finding.id)
+    ]
+
+
+def _repair_to_rulings(args, root: Path) -> None:
+    """Resume a build held for a ruling: repair the plan to it, then approve.
+
+    `writ build` stopped because a critic's question needed a person. Once they
+    have answered with `writ set D-NNNN active --decision`, running build again is
+    the obvious next step, and it used to re-check the plan, find the same finding
+    and stop at the same place — the answer was recorded and never applied.
+    """
+    # parsed only for what the config and build's flags say planning should do
+    designs = list(state.load(root)["design_docs"]) or ["design.md"]
+    plan_args = _step_args(args, "plan", designs, index=0)
+    if plan_args.auto_approve is None:
+        plan_args.auto_approve = not args.no_auto_approve  # as `cmd_build` does
+    config.apply(plan_args, config.load(root))
+    if not getattr(plan_args, "repair", False):
+        return
+    ruled = ", ".join(_ruled(state.load(root)))
+    if ruled:
+        print(f"repairing the plan to follow the ruling on {ruled}")
+    else:
+        print("repairing the plan, deciding its open questions (autonomous)")
+    from .cli import build_parser
+
+    # Not `_step_args`: under `writ adjudicate`, `--agent` is the critic's role,
+    # so build's `--planner` must not land there.
+    step = build_parser().parse_args(["--root", str(root), "adjudicate"])
+    for source, target in (
+        ("critic", "agent"),
+        ("critic_model", "model"),
+        ("critic", "critic_agent"),
+        ("critic_model", "critic_model"),
+        ("max_rounds", "max_rounds"),
+        ("cwd", "cwd"),
+        ("quiet", "quiet"),
+        ("autonomous", "autonomous"),
+    ):
+        if getattr(args, source, None) is not None:
+            setattr(step, target, getattr(args, source))
+    step.agent_args = []
+    config.apply(step, config.load(root))
+    # re-reviewed exactly as the build's own planning would have been
+    step.no_critics = not _critics_requested(plan_args)
+    cmd_adjudicate(step)
+    if plan_args.auto_approve and _auto_approve(root):
+        print("plan approved: nothing blocking stands against it")
+    print()
 
 
 def _step_args(args, command: str, positional: list[str], *, index: int):
@@ -3572,6 +3718,10 @@ def cmd_run(args) -> int:
             "or pass --force if you know it is gone."
         )
 
+    # Before anything reconciles: a verdict a killed session left behind is
+    # applied under the mode this run says holds.
+    if _autonomous(args, root) and not args.json:
+        print("autonomous: writ makes the decisions; each one is logged")
     # Reconcile before deciding there is nothing to do. A previous session that
     # was killed leaves tasks parked mid-flight, and they are exactly the work a
     # resume should pick up first.
@@ -3629,6 +3779,7 @@ def cmd_run(args) -> int:
             cwd=args.cwd,
             max_rework=getattr(args, "max_rework", None),
             max_infra_retries=getattr(args, "max_infra_retries", None),
+            verify=getattr(args, "verify", None),
             on_event=reporter,
             stream=stream,
             lock=output_lock,
@@ -3636,6 +3787,9 @@ def cmd_run(args) -> int:
     finally:
         orchestrator.release_session(root)
     data = state.load(root)
+    unfinished = orchestrator.unfinished(
+        data, session, budgeted=args.max_tasks is not None
+    )
     if args.json:
         render.emit_json(
             {
@@ -3656,9 +3810,10 @@ def cmd_run(args) -> int:
                     for task_id, task in sorted(data["tasks"].items())
                     if task["status"] != "completed"
                 ],
+                "unfinished": unfinished,
             }
         )
-        return 1 if (session.failed or session.errors) else 0
+        return 1 if (session.failed or session.errors or unfinished) else 0
     print("─" * 62)
     for line in orchestrator.summary(data, session):
         print(line)
@@ -3669,7 +3824,9 @@ def cmd_run(args) -> int:
         for message in session.errors:
             print(f"error: {message}", file=sys.stderr)
         return 1
-    return 1 if session.failed else 0
+    for reason in unfinished:
+        print(f"unfinished: {reason}", file=sys.stderr)
+    return 1 if (session.failed or unfinished) else 0
 
 
 def _run_preview(data, args) -> int:

@@ -298,6 +298,10 @@ def idempotency_key(task_id: str, role: str, attempt: int, infra_attempt: int) -
 #: the agent's.
 TIMEOUT_EXIT_CODE = 124
 
+#: the exit code writ assigns a run whose agent command could not be spawned,
+#: by the shell's convention for "command not found"
+AGENT_NOT_FOUND_EXIT_CODE = 127
+
 
 def describe(record: dict[str, Any] | None) -> str:
     """One line for a failure read back out of the store.
@@ -323,9 +327,15 @@ def from_run(run: dict[str, Any]) -> Failure | None:
     and eventually reported the task as having failed on technical merit — when
     no reviewer had read a line of it.
 
-    None for everything else. An agent that ran, spoke and exited non-zero has
-    reported for itself, and second-guessing that would be writ inventing a
-    judgement it has no grounds for.
+    Two more are the machinery's too. A transcript that ends on a provider error
+    (a 429, an overloaded API) is a failed model call, not failed work. And a
+    reviewer or gate that ends without writing a verdict at all has judged
+    nothing: the work it was meant to read is untouched, and another attempt at
+    the reading is the whole remedy — so it is retried from the infrastructure
+    budget rather than failing, or silently parking, the work under review.
+
+    None for everything else, including an unusable verdict: that one was
+    written, and its error is the thing to show.
     """
     if run.get("verdict"):
         return None
@@ -352,5 +362,31 @@ def from_run(run: dict[str, Any]) -> Failure | None:
                 "reached a model (unknown model id, missing provider "
                 "credentials, or exhausted quota)"
             ),
+        )
+    if run.get("exit_code") == AGENT_NOT_FOUND_EXIT_CODE:
+        # The agent command could not be spawned. Nothing ran, so nothing can
+        # have failed on its merits, and retrying cannot find a missing binary.
+        return Failure(
+            category=UNAVAILABLE,
+            reason=f"the agent could not be started ({run.get('note') or 'not found'})",
+        )
+    if run.get("provider_error"):
+        return Failure(
+            category=INFRASTRUCTURE,
+            reason=(
+                f"the model provider failed ({run['provider_error']!r} in the "
+                f"agent's output, exit {run.get('exit_code')})"
+            ),
+            retryable=True,
+        )
+    role = run.get("role", "agent")
+    if role in ("reviewer", "gate") and not run.get("verdict_error"):
+        return Failure(
+            category=INFRASTRUCTURE,
+            reason=(
+                f"the {role} exited {run.get('exit_code')} without writing a "
+                "verdict, so nothing was judged"
+            ),
+            retryable=True,
         )
     return None

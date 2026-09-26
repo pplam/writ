@@ -151,6 +151,19 @@ FIELDS: dict[str, Field] = {
         doc="times a rejected task goes back before it waits for a human"
         " (--max-rework)",
     ),
+    "run.verify": Field(
+        kind="text",
+        doc="the command that builds and tests the project, handed to every"
+        " implementer, reviewer and gate (null: the one planning found, if any)",
+        written=None,
+    ),
+    "decisions.autonomous": Field(
+        kind="flag",
+        doc="make every decision without a person, in planning and in running:"
+        " answer the plan's questions, confirm agents' decisions, rule on what a"
+        " gate asks. Each is still logged, confirmed by `autonomous`. Implies"
+        " plan.repair and plan.auto_approve (--autonomous)",
+    ),
     "serve.port": Field(kind="port", doc="port the web view listens on (--port)"),
 }
 
@@ -162,6 +175,7 @@ SECTION_DOCS: dict[str, str] = {
     " seconds",
     "plan": "what `writ plan` does after it commits a plan",
     "run": "how `writ run` walks the graph",
+    "decisions": "who settles what the design left open: a person, or writ",
     "serve": "the read-only web view",
 }
 
@@ -275,6 +289,7 @@ DEFAULTS: dict[str, dict[str, Default]] = {
             "max_rounds": Default("plan.max_rounds", MAX_REPAIR_ROUNDS),
             "auto_approve": Default("plan.auto_approve", False),
             "critics": Default("plan.critics", False),
+            "autonomous": Default("decisions.autonomous", False),
         },
         "critique": {**_CRITIC},
         "adjudicate": {
@@ -283,6 +298,7 @@ DEFAULTS: dict[str, dict[str, Default]] = {
             "critic_agent": Default("agents.critic.command"),
             "critic_model": Default("agents.critic.model"),
             "no_critics": Default(builtin=True, invert=True),
+            "autonomous": Default("decisions.autonomous", False),
         },
         "check": {"all": Default(builtin=False)},
         "coverage": {"uncovered": Default(builtin=False)},
@@ -327,7 +343,9 @@ DEFAULTS: dict[str, dict[str, Default]] = {
             "parallel": Default("run.parallel", 1),
             "order": Default(),
             "max_rework": Default("run.max_rework"),
+            "verify": Default("run.verify"),
             "no_stream": Default(builtin=True, invert=True),
+            "autonomous": Default("decisions.autonomous", False),
         },
     }.items()
 }
@@ -336,6 +354,12 @@ DEFAULTS: dict[str, dict[str, Default]] = {
 FROM_FLAG = "flag"
 FROM_CONFIG = "config"
 FROM_BUILTIN = "default"
+#: a setting `--autonomous` turned on, because it cannot work without it
+FROM_AUTONOMOUS = "autonomous"
+
+#: what an autonomous run needs on: a repair loop to act on the answers, and an
+#: approval nobody is waiting to give. A flag saying otherwise still wins.
+AUTONOMOUS_IMPLIES = ("repair", "auto_approve")
 
 
 def _written_default(path: str) -> Any:
@@ -617,6 +641,11 @@ def apply(args: Any, loaded: dict[str, Any]) -> dict[str, tuple[str, Any]]:
         if builtin is not None:
             setattr(args, attribute, _for_args(builtin, default.invert))
         decided[attribute] = (FROM_BUILTIN, builtin)
+    if getattr(args, "autonomous", False):
+        for attribute in AUTONOMOUS_IMPLIES:
+            if attribute in decided and decided[attribute][0] != FROM_FLAG:
+                setattr(args, attribute, True)
+                decided[attribute] = (FROM_AUTONOMOUS, True)
     return decided
 
 

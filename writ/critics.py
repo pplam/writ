@@ -200,6 +200,9 @@ Rules:
 5. `where` must name a feature id or a requirement id.
 6. Finding nothing is a legitimate result. Write an empty `findings` list and say
    in `summary` what you checked.
+7. For `needs-decision`, `suggested_action` is the reading you recommend, stated
+   as the decision itself ("FT-004's gate uses deterministic rules; ..."), not
+   a list of options: whoever rules starts from it.
 """
 
 

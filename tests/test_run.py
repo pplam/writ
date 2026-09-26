@@ -745,7 +745,7 @@ def test_a_silent_review_leaves_the_task_awaiting_review(planned, writ, project)
     """
     code, _, _ = writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
                       "--reviewer", "true")
-    assert code == 0
+    assert code == 1  # the review was never had, and the exit says so
     data = state.load(project)
     assert data["tasks"]["M01-001"]["status"] == "awaiting-review"
     assert len([r for r in data["runs"].values() if r["role"] == "reviewer"]) == 1
@@ -1191,9 +1191,12 @@ def test_a_printed_tool_call_is_reported_as_the_model_breaking_not_a_missing_rep
     not the problem — the remedy is a different model.
     """
     code, _, _ = writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
-                      "--reviewer", agent(BABBLER))
-    assert code == 0
+                      "--reviewer", agent(BABBLER), "--max-infra-retries", "0")
+    # a review that judged nothing is retried, not parked; with no retries
+    # allowed the task is left awaiting review and the run says it is unfinished
+    assert code == 1
     data = state.load(project)
+    assert data["tasks"]["M01-001"]["status"] == "awaiting-review"
     run = next(r for r in data["runs"].values() if r["role"] == "reviewer")
     assert run["unparsed_tool_call"] is True
     assert "printed rather than made" in run["no_verdict"]
@@ -1211,7 +1214,7 @@ def test_an_agent_that_merely_forgets_to_report_is_not_blamed_on_tool_calling(
     """
     code, _, _ = writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
                       "--reviewer", "true")
-    assert code == 0
+    assert code == 1  # the review was never had, and the exit says so
     data = state.load(project)
     run = next(r for r in data["runs"].values() if r["role"] == "reviewer")
     assert not run.get("unparsed_tool_call")
@@ -1231,7 +1234,7 @@ def test_a_run_that_judged_nothing_still_records_where_the_task_went(
     """
     code, _, _ = writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
                       "--reviewer", "true")
-    assert code == 0
+    assert code == 1  # the review was never had, and the exit says so
     data = state.load(project)
     run = next(r for r in data["runs"].values() if r["role"] == "reviewer")
     assert run["resulting_status"] == "awaiting-review"
@@ -1369,3 +1372,104 @@ def test_concurrent_agents_never_splice_a_line(planned, writ, project):
         assert role in ("impl", "review")
         if "thinking step" in said:
             assert said.startswith(f"{task} thinking step"), line
+
+
+# --------------------------------------------------------------------------
+# runs that end without a judgement
+
+
+#: a model call that failed at the provider: output, a 529, no verdict
+OVERLOADED = """
+import sys
+sys.stdin.read()
+print("working on it")
+print('API Error: 529 {"type":"error","error":{"type":"overloaded_error"}}',
+      file=sys.stderr)
+sys.exit(1)
+"""
+
+#: an agent that ran, printed, and crashed without reporting
+CRASHER = """
+import sys
+sys.stdin.read()
+print("started")
+sys.exit(2)
+"""
+
+
+def test_a_provider_error_is_retried_not_failed(planned, writ, project):
+    code, _, _ = writ("dispatch", "M01-001", "--agent", agent(OVERLOADED))
+    data = state.load(project)
+    run = next(iter(data["runs"].values()))
+    task = data["tasks"]["M01-001"]
+    assert run["failure"]["category"] == "infrastructure"
+    assert run["failure"]["retryable"] is True
+    assert "529" in run["provider_error"]
+    # nothing judged the work, so none of its budgets were touched
+    assert task["status"] == "planned"
+    assert not task.get("rework")
+
+
+def test_a_crashing_reviewer_does_not_fail_the_work_it_was_reading(
+    planned, writ, project
+):
+    writ("dispatch", "M01-001", "--agent", agent(IMPLEMENTER))
+    writ("review", "M01-001", "--agent", agent(CRASHER))
+    data = state.load(project)
+    task = data["tasks"]["M01-001"]
+    assert task["status"] == "awaiting-review"
+    run = next(r for r in data["runs"].values() if r["role"] == "reviewer")
+    assert run["failure"]["retryable"] is True
+    # the implementer's claims stand; nothing overwrote them
+    assert all(a["status"] == "passed" for a in task["acceptances"])
+
+
+def test_a_crashing_reviewer_is_retried_within_the_session(planned, writ, project):
+    """The retry takes the review to completion instead of parking it."""
+    flag = project / "crashed-once"
+    flaky = f"""
+import json, os, re, sys
+prompt = sys.stdin.read()
+if not os.path.exists({str(flag)!r}):
+    open({str(flag)!r}, "w").close()
+    print("reading the diff")
+    sys.exit(2)
+path = re.search(r'^  (\\S*verdict\\.json)$', prompt, re.M).group(1)
+total = int(re.search(r'has (\\d+) acceptance criteri', prompt).group(1))
+open(path, "w").write(json.dumps({{
+    "decision": "accept", "summary": "ok",
+    "criteria": [{{"number": i, "status": "passed", "evidence": "re-ran"}}
+                 for i in range(1, total + 1)],
+}}))
+"""
+    code, out, _ = writ("run", "--max-tasks", "1", "--agent", agent(IMPLEMENTER),
+                        "--reviewer", agent(flaky))
+    assert code == 0, out
+    assert state.load(project)["tasks"]["M01-001"]["status"] == "completed"
+
+
+def test_the_infrastructure_budget_is_counted_per_role_and_round():
+    task = {
+        "id": "M01-001",
+        "infrastructure": {
+            "attempts": [
+                {"role": "agent", "round": 0},
+                {"role": "agent", "round": 0},
+                {"role": "reviewer", "round": 0},
+                {"role": "agent"},  # recorded before rounds were: round 0
+            ]
+        },
+    }
+    assert runner.infrastructure_attempts(task) == 4
+    assert runner.infrastructure_attempts(task, role="agent") == 3
+    assert runner.infrastructure_attempts(task, role="reviewer") == 1
+    task["rework"] = {"attempt": 1}
+    # a new rework round is a new attempt at the work, with its own allowance
+    assert runner.infrastructure_attempts(task, role="agent") == 0
+
+
+def test_a_run_that_ends_with_work_left_exits_non_zero(planned, writ, project):
+    code, _, err = writ("run", "--agent", agent(IMPLEMENTER),
+                        "--reviewer", agent(REJECTOR), "--max-rework", "0")
+    assert code == 1
+    assert state.load(project)["tasks"]["M01-001"]["status"] == "failed"

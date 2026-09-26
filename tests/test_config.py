@@ -216,9 +216,9 @@ def test_the_starter_config_comments_every_setting():
 
 def test_the_config_holds_only_the_core_settings():
     """The file is for the choices a project makes once, not a mirror of every flag."""
-    assert config.SECTIONS == ("agents", "plan", "run", "serve")
+    assert config.SECTIONS == ("agents", "plan", "run", "decisions", "serve")
     assert "stage" not in config.ROLES
-    assert len(config.FIELDS) == 4 * 3 + 5 + 2 + 1
+    assert len(config.FIELDS) == 4 * 3 + 5 + 3 + 1 + 1
 
 
 def test_init_keeps_an_existing_config(writ, project):
@@ -456,6 +456,27 @@ def test_plan_switches_come_from_the_config_and_a_flag_still_wins(project):
     assert decided["repair"] == (config.FROM_CONFIG, True)
     args, decided = resolve(project, "plan", "d.md", "--critics", "coverage")
     assert args.critics == ["coverage"]
+
+
+def test_autonomous_mode_repairs_and_approves_unless_a_flag_says_not(project):
+    args, decided = resolve(project, "plan", "d.md", "--autonomous")
+    assert (args.autonomous, args.repair, args.auto_approve) == (True, True, True)
+    assert decided["repair"] == (config.FROM_AUTONOMOUS, True)
+    # what `writ build --autonomous --no-auto-approve` hands its planning step
+    args = build_parser().parse_args(
+        ["--root", str(project), "plan", "d.md", "--autonomous"]
+    )
+    args.auto_approve = False
+    config.apply(args, config.load(project))
+    assert (args.repair, args.auto_approve) == (True, False)
+
+
+def test_autonomous_mode_can_be_the_projects_default(project):
+    write_config(project, {"decisions": {"autonomous": True}})
+    for argv in (("plan", "d.md"), ("adjudicate",), ("run",)):
+        assert resolve(project, *argv)[0].autonomous is True, argv
+    assert resolve(project, "run", "--no-autonomous")[0].autonomous is False
+    assert resolve(project, "plan", "d.md")[0].auto_approve is True
 
 
 def test_the_critic_follows_the_critic_role_under_plan(project):

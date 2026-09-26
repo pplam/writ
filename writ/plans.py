@@ -158,6 +158,25 @@ def not_runnable_message(data: dict[str, Any]) -> str:
             "Read it with `writ check` and `writ coverage`, then approve it with "
             "`writ approve`. For automation, plan with `--auto-approve`."
         )
+    from . import decisions
+
+    questions = [
+        (record["id"], finding.id)
+        for finding in findings(data, open_only=True)
+        if finding.severity == "error"
+        and (record := decisions.asked(data, finding.id)) is not None
+    ]
+    if questions:
+        listed = ", ".join(f"{d} (for {f})" for d, f in questions)
+        return (
+            f"this plan is {status}: {counts['error']} blocking "
+            f"finding{'s' if counts['error'] != 1 else ''} stand against it, and "
+            f"{len(questions)} of them need{'s' if len(questions) == 1 else ''} "
+            f"your ruling: {listed}. Read each with `writ show D-NNNN`, answer "
+            'with `writ set D-NNNN active --decision "..."`, and run `writ build` '
+            "again to repair the plan to follow it. Or accept a finding as it "
+            "stands with `writ set F-NNNN accepted --reason ...`."
+        )
     return (
         f"this plan is {status}: {counts['error']} blocking "
         f"finding{'s' if counts['error'] != 1 else ''} stand against it. Read them "

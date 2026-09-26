@@ -60,6 +60,7 @@ def build_prompt(
     root: Path,
     *,
     verdict_path: Path | None = None,
+    verify: str | None = None,
 ) -> str:
     """Compose the agent prompt from the task, its gates, and the design doc."""
     lines: list[str] = []
@@ -93,6 +94,20 @@ def build_prompt(
     if task.get("depends_on") and not feature:
         lines.append(f"Completed prerequisites: {', '.join(task['depends_on'])}")
         lines.append("")
+    upstream = _agreed_decisions(
+        data, _work_under(data, task.get("depends_on", []))
+    )
+    if upstream:
+        # What the work this builds on settled. An implementer used to see none
+        # of it, and learnt the interface it had to meet by reading code — or by
+        # deciding something else and leaving the incompatibility for a gate.
+        lines.append(
+            "Decisions the work you build on already made — build to these, and "
+            f"record a decision of your own if you must depart from one "
+            f"{_decisions_pointer(root)}:"
+        )
+        lines.extend(f"- {item}" for item in upstream)
+        lines.append("")
     if task.get("allowed") and feature:
         lines.append("Fence (the component you own, and where tests go):")
         lines.extend(f"- {item}" for item in task["allowed"])
@@ -123,6 +138,7 @@ def build_prompt(
             actor = entry.get("actor", "operator")
             lines.append(f"- [{actor}] {entry['text']}")
         lines.append("")
+    lines.extend(_verify_section(data, root, who="implementer", verify=verify))
     lines.append(GUARDRAILS)
     lines.append("")
     lines.append(_verdict_instructions(task, verdict_path))
@@ -196,6 +212,8 @@ def _rework_section(task: dict[str, Any]) -> str:
         return ""
     attempt = record.get("attempt", 1)
     budget = record.get("budget", record.get("max", DEFAULT_MAX_REWORK))
+    if record.get("kind") == "unfinished":
+        return _unfinished_section(record, attempt, budget)
     reviewer = record.get("reviewer") or "a reviewer"
     lines = [
         f"THIS TASK WAS ALREADY IMPLEMENTED AND THE REVIEW REJECTED IT. "
@@ -254,6 +272,38 @@ def _rework_section(task: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _unfinished_section(record: dict[str, Any], attempt: int, budget: int) -> str:
+    """The rework section for an attempt that stopped, rather than one rejected.
+
+    No reviewer read this work, so nothing here may read as a review. What the
+    next agent needs is that it is not starting fresh, and whatever the last one
+    said about where it got to.
+    """
+    lines = [
+        f"A PREVIOUS ATTEMPT AT THIS TASK DID NOT FINISH: "
+        f"{record.get('reason', 'it stopped without reporting')}. You are attempt "
+        f"{attempt + 1}, and writ allows {budget} further attempt"
+        f"{'s' if budget != 1 else ''} before the task is left failed for a human.",
+        "",
+        "Whatever it changed is still in the working tree. Read it before writing "
+        "anything: keep what works, finish what does not, and check the whole "
+        "task again rather than only the part it left open.",
+    ]
+    if record.get("summary"):
+        lines += ["", f"It described its own work as: {record['summary']}"]
+    findings = record.get("findings") or []
+    if findings:
+        lines += ["", "Criteria it left unmet:"]
+        for finding in findings:
+            text = f"  {finding.get('number')}. {finding.get('status', 'failed')}"
+            if finding.get("evidence"):
+                text += f" — {finding['evidence']}"
+            lines.append(text)
+    if record.get("notes"):
+        lines += ["", f"Its notes: {record['notes']}"]
+    return "\n".join(lines)
+
+
 def _verdict_instructions(task: dict[str, Any], verdict_path: Path | None) -> str:
     """Tell the agent to report a machine-readable verdict, and how.
 
@@ -299,6 +349,7 @@ def build_review_prompt(
     root: Path,
     *,
     verdict_path: Path | None = None,
+    verify: str | None = None,
 ) -> str:
     """Compose the prompt for an agent reviewing someone else's work.
 
@@ -355,7 +406,7 @@ def build_review_prompt(
         lines.append("---")
         lines.append("")
     prior = task.get("rework")
-    if prior and not prior.get("resolved_at"):
+    if prior and not prior.get("resolved_at") and prior.get("kind") != "unfinished":
         # A re-review that does not know it is one re-derives the same objections
         # from scratch, or misses that its predecessor's were never answered. The
         # findings are given as a checklist, not as a conclusion: this reviewer
@@ -386,6 +437,7 @@ def build_review_prompt(
         "Treat the implementer's claims as claims."
     )
     lines.append("")
+    lines.extend(_verify_section(data, root, who="reviewer", verify=verify))
     lines.append(verdict.REVIEW_RULES)
     lines.append("")
     lines.append(verdict.DECISION_RULES)
@@ -457,6 +509,7 @@ def build_gate_prompt(
     root: Path,
     *,
     verdict_path: Path | None = None,
+    verify: str | None = None,
 ) -> str:
     """Compose the prompt for a gate: judge integrated work against requirements.
 
@@ -537,13 +590,22 @@ def build_gate_prompt(
                     "does not hold, that is a missing-coverage finding"
                 )
         lines.append("")
-    interfaces = _agreed_decisions(data, covered)
+    interfaces = _agreed_decisions(data, _work_under(data, covered))
     if interfaces:
         lines.append(
             "Decisions made during this work. Two tasks that decided "
-            "incompatibly is exactly the defect this gate is for:"
+            "incompatibly is exactly the defect this gate is for "
+            f"{_decisions_pointer(root)}:"
         )
         lines.extend(f"- {item}" for item in interfaces)
+        lines.append("")
+    rulings = _rulings(data, task["id"])
+    if rulings:
+        lines.append(
+            "Rulings on questions this gate raised before — settled; judge the "
+            "work against them and do not ask them again:"
+        )
+        lines.extend(f"- {item}" for item in rulings)
         lines.append("")
     lines.append("Criteria this gate must establish:")
     for index, item in enumerate(task.get("acceptances", []), start=1):
@@ -553,6 +615,7 @@ def build_gate_prompt(
     if previous:
         lines.append(previous)
         lines.append("")
+    lines.extend(_verify_section(data, root, who="gate", verify=verify))
     lines.append(GATE_GUARDRAILS)
     lines.append("")
     lines.append(_gate_verdict_instructions(task, verdict_path))
@@ -572,16 +635,124 @@ def _gate_requirements(
     return [row for row in rows if row["id"] in wanted]
 
 
-def _agreed_decisions(data: dict[str, Any], task_ids: list[str]) -> list[str]:
-    """Decisions recorded by the work under this gate, as one-liners."""
+#: how much of each decision a prompt carries. The title and the opening of the
+#: ruling are what show two tasks deciding incompatibly; the full text is in the
+#: decisions file, which the prompt names for anyone who needs the rest.
+DECISION_LIMIT = 200
+
+
+def _rulings(data: dict[str, Any], gate_id: str) -> list[str]:
+    """Answered questions about this gate, in full: they are what it is held to."""
+    return [
+        f"{record['id']} {record['title']}: {record['decision']}"
+        for record in data.get("decisions", [])
+        if gate_id
+        and gate_id in record.get("tasks", [])
+        and record.get("status") == "active"
+        and not decisions.undecided(record)
+    ]
+
+
+def _work_under(data: dict[str, Any], node_ids: Iterable[str]) -> list[str]:
+    """The tasks beneath these nodes, looking through any gates on the way.
+
+    A final gate depends on milestone gates, not on tasks, and decisions are
+    recorded against tasks — so reading only direct dependencies found no
+    decisions at all for exactly the gate that most needs them.
+    """
+    tasks = data.get("tasks", {})
+    seen: set[str] = set()
+    found: list[str] = []
+    stack = list(node_ids)
+    while stack:
+        node_id = stack.pop()
+        if node_id in seen or node_id not in tasks:
+            continue
+        seen.add(node_id)
+        node = tasks[node_id]
+        if node.get("kind") == "gate":
+            stack.extend(node.get("depends_on", []))
+        else:
+            found.append(node_id)
+    return sorted(found)
+
+
+def _agreed_decisions(data: dict[str, Any], task_ids: Iterable[str]) -> list[str]:
+    """Decisions recorded by this work, as one-liners.
+
+    Rejected and superseded rulings are left out: they are not what the code
+    was built to. Each is cut to `DECISION_LIMIT` — on a real run the final gate's
+    prompt was 61% decisions, pasted whole, when the question it asks of them is
+    only whether two disagree.
+    """
     wanted = set(task_ids)
     found: list[str] = []
     for record in data.get("decisions", []):
+        if record.get("status") in ("rejected", "superseded"):
+            continue
+        if decisions.undecided(record):
+            continue  # a question, not something the work was built to
         if not wanted.intersection(record.get("tasks", [])):
             continue
         origin = ", ".join(record.get("tasks", [])) or "unknown"
-        found.append(f"[{origin}] {record['title']}: {record['decision']}")
+        found.append(
+            f"[{origin}] {record['title']}: "
+            f"{_first_sentence(record['decision'], DECISION_LIMIT)}"
+        )
     return found
+
+
+def verify_commands(
+    data: dict[str, Any], root: Path, verify: str | None = None
+) -> list[str]:
+    """How this project is verified: `--verify`, the config, else planning's.
+
+    Named in every execution prompt. Without it each agent was told to "run the
+    project's full verification" and left to rediscover what that meant — every
+    implementer, reviewer and gate on a real run spent turns finding the same
+    test command, and nothing guaranteed they all found the same one.
+    """
+    from . import config
+
+    if verify and verify.strip():
+        return [verify.strip()]
+    try:
+        configured = (config.load(root).get("run") or {}).get("verify")
+    except WritError:
+        configured = None
+    if configured:
+        return [configured]
+    pipeline = (data.get("plan") or {}).get("pipeline") or {}
+    baseline = pipeline.get("baseline") or {}
+    return [str(item) for item in baseline.get("commands") or [] if str(item).strip()]
+
+
+def _verify_section(
+    data: dict[str, Any], root: Path, *, who: str, verify: str | None = None
+) -> list[str]:
+    commands = verify_commands(data, root, verify)
+    if not commands:
+        return []
+    if who == "implementer":
+        head = (
+            "Verify with (run these before reporting; a criterion is not passed "
+            "until they are green):"
+        )
+    else:
+        head = (
+            "The project's verification commands (run them yourself; do not take "
+            "anyone's word that they pass):"
+        )
+    return [head, *(f"  {command}" for command in commands), ""]
+
+
+def _decisions_pointer(root: Path) -> str:
+    path = state.decisions_file(root)
+    try:
+        shown = path.relative_to(root)
+    except ValueError:  # pragma: no cover - the store lives under the root
+        shown = path
+    return f"(abridged; the full text of each is in {shown})"
 
 
 def _previous_gate_attempts(task: dict[str, Any]) -> str:
@@ -687,6 +858,14 @@ def build_repair_prompt(
                     )
                 if finding.suggested_action:
                     lines.append(f"    required outcome: {finding.suggested_action}")
+            lines.append("")
+        rulings = _rulings(data, request.get("gate") or "")
+        if rulings:
+            lines.append(
+                "Rulings on questions raised about this gate — settled; the "
+                "repair must follow them:"
+            )
+            lines.extend(f"- {item}" for item in rulings)
             lines.append("")
         previous = _previous_repairs(data, request)
         if previous:
@@ -1118,6 +1297,44 @@ def produced_output(directory: Path) -> bool:
 UNPARSED_CALL = re.compile(r"<\s*.{0,4}?invoke\s+name\s*=", re.IGNORECASE)
 
 
+# What a model provider or agent harness prints when the call itself failed.
+# Anchored to words rather than bare status codes, because a transcript full of
+# code is full of numbers, and read only from the end of the output, where a
+# failure that ended the run would be.
+PROVIDER_ERROR = re.compile(
+    r"(?i)\b(?:rate[ _-]?limit(?:ed|_error)?|too many requests|overloaded(?:_error)?"
+    r"|insufficient_quota|quota (?:exceeded|exhausted)|service unavailable"
+    r"|bad gateway|gateway time-?out|ECONNRESET|ETIMEDOUT|EAI_AGAIN"
+    r"|connection (?:reset|refused|error)|api_error"
+    r"|(?:http|status|error|code)[\s:=\"']{0,4}(?:429|500|502|503|504|529))\b"
+)
+
+#: how much of the end of each log `provider_error` reads
+PROVIDER_TAIL = 8192
+
+
+def provider_error(directory: Path) -> str | None:
+    """The provider failure the transcript ends on, if it ends on one.
+
+    Only asked of a run that exited non-zero with no verdict. That shape used to
+    fail the task outright — a 429 or an overloaded provider was recorded as the
+    work having failed — when it is exactly the failure an infrastructure retry
+    exists for.
+    """
+    for name in ("stderr.log", "stdout.log"):
+        path = directory / name
+        if not path.exists():
+            continue
+        with path.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, size - PROVIDER_TAIL))
+            text = handle.read().decode("utf-8", errors="replace")
+        found = PROVIDER_ERROR.search(text)
+        if found:
+            return found.group(0)
+    return None
+
+
 def unparsed_tool_call(directory: Path) -> bool:
     """Whether the transcript shows a tool call the harness failed to make.
 
@@ -1151,6 +1368,7 @@ def prepare(
     force: bool,
     role: str = "agent",
     max_rework: int | None = None,
+    verify: str | None = None,
 ) -> tuple[str, Path, str, agents.ResolvedAgent]:
     """Create the run directory and record the run as `starting`.
 
@@ -1223,14 +1441,16 @@ def prepare(
                 )
         elif role == "gate":
             prompt = build_gate_prompt(
-                data, task, Path(root), verdict_path=verdict_path
+                data, task, Path(root), verdict_path=verdict_path, verify=verify
             )
         elif role == "reviewer":
             prompt = build_review_prompt(
-                data, task, Path(root), verdict_path=verdict_path
+                data, task, Path(root), verdict_path=verdict_path, verify=verify
             )
         else:
-            prompt = build_prompt(data, task, Path(root), verdict_path=verdict_path)
+            prompt = build_prompt(
+                data, task, Path(root), verdict_path=verdict_path, verify=verify
+            )
         (directory / "prompt.txt").write_text(prompt, encoding="utf-8")
         data["runs"][run_id] = {
             "id": run_id,
@@ -1536,6 +1756,20 @@ def _finish_repair(
             )
         return
     if patch.empty and patch.questions:
+        ruled = verdict._rule_for_gate(data, gate, patch.questions, actor=actor)
+        if ruled is not None:
+            # Autonomous: its recommendations are the rulings, and it plans the
+            # repair again with them in its prompt.
+            request["status"] = "open"
+            request["questions"] = list(patch.questions)
+            add_evidence(
+                gate,
+                f"{actor} asked {len(patch.questions)} question(s); decided "
+                f"autonomously ({', '.join(ruled)}), and the repair is planned "
+                "again to follow them",
+                actor="writ",
+            )
+            return
         # The planner could not repair this without a ruling. Same destination as a
         # gate's own `needs-decision`: a human, through the decision log.
         for question in patch.questions:
@@ -1546,7 +1780,12 @@ def _finish_repair(
                     "Undecided: the repair planner could not close the finding "
                     "without a ruling."
                 ),
-                context=str(question.get("context", question.get("question", ""))),
+                context=str(question.get("context", question.get("question", "")))
+                + (
+                    f" Recommended: {question['recommendation']}"
+                    if question.get("recommendation")
+                    else ""
+                ),
                 consequences=f"{gate['id']} stays held until this is settled.",
                 proposed_by=actor,
                 tasks=[gate["id"]],
@@ -1722,7 +1961,18 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
                 "reached a model (unknown model id, missing provider "
                 "credentials, or exhausted quota)"
             )
-        # The opposite shape of the same problem: plenty of output, none of it a
+        # A provider that refused the call (rate limit, overload, a 5xx) reached
+        # the model and was turned away: nothing about the task was judged, so
+        # this is named for `failures.from_run` to retry rather than send back.
+        elif code not in (0, 124) and not note and (
+            marker := provider_error(directory)
+        ):
+            run["provider_error"] = marker
+            reason += (
+                f" — and its output reports a provider error ({marker!r}), so "
+                "the model call failed rather than the work"
+            )
+        # The opposite shape of a silent run: plenty of output, none of it a
         # report, because the agent's last act was a tool call that was printed
         # instead of run. That is the model breaking its own call syntax, so the
         # remedy is the model rather than the prompt — and re-reading a transcript
@@ -1768,12 +2018,32 @@ def _finish(root: Path, run_id: str, code: int, note: str | None = None) -> None
                 # id and runs it again, rather than first having to undo a status
                 # that says the work failed.
                 task["status"] = INTERRUPTED_STATUS.get(task["status"], "planned")
-            elif code != 0:
-                task["status"] = "failed"
+            # Nothing classified it, so it is the agent's own doing — but it is
+            # still not a judgement, and none of these lands at `failed` any
+            # more. A crashed *reviewer* used to fail the implementation it was
+            # reading, and a crashed gate failed the gate and with it everything
+            # behind it, when in both cases the work under review was untouched.
             elif role == "reviewer":
                 task["status"] = "awaiting-review"
-            else:
+            elif role == "gate":
                 task["status"] = "planned"
+            else:
+                # An implementation that stopped without reporting is an attempt
+                # at the work that came to nothing: counted against the rework
+                # budget, so it is retried with the reason in hand, and bounded.
+                task["status"] = verdict.send_back_unfinished(
+                    task,
+                    reason=(
+                        f"the previous attempt exited {code} without a usable "
+                        "verdict"
+                    ),
+                    notes=run.get("verdict_error", ""),
+                    max_rework=(
+                        DEFAULT_MAX_REWORK
+                        if run.get("max_rework") is None
+                        else int(run["max_rework"])
+                    ),
+                )
             task["updated_at"] = utcnow()
         # Recorded on this path too, not only after a verdict is applied. The first
         # question about a run that judged nothing is where the task ended up, and
@@ -2092,7 +2362,7 @@ def reconcile(
         attempt = (
             _note_infrastructure_failure(data, run, failure)
             if failure.retryable and task is not None
-            else _infra_attempts(task)
+            else infrastructure_attempts(task, role=run.get("role", "agent"))
         )
         refresh_milestones(data)
         return Reconciliation(
@@ -2124,38 +2394,73 @@ def _note_infrastructure_failure(
         "infrastructure", {"attempts": [], "exhausted": False}
     )
     attempts = record.setdefault("attempts", [])
-    attempt = len(attempts) + 1
+    role = run.get("role", "agent")
+    round_ = _round(task, role)
+    attempt = _infra_attempts(task, role=role, round_=round_) + 1
+    # A new failure after the budget was spent in an earlier round starts that
+    # round's count afresh, so the flag describes the round it was set in.
+    record["exhausted"] = False
     attempts.append(
         {
             "attempt": attempt,
             "at": utcnow(),
             "run": run["id"],
-            "role": run.get("role", "agent"),
+            "role": role,
+            "round": round_,
             "category": failure.category,
             "reason": failure.reason,
             # The logical attempt this run was, so two runs that are the same
             # attempt retried can be told from two genuine attempts.
-            "key": failures.idempotency_key(
-                run["task"],
-                run.get("role", "agent"),
-                rework_attempts(task),
-                attempt,
-            ),
+            "key": failures.idempotency_key(run["task"], role, round_, attempt),
         }
     )
     return attempt
 
 
-def _infra_attempts(task: dict[str, Any] | None) -> int:
+def _round(task: dict[str, Any], role: str) -> int:
+    """Which attempt at the work an infrastructure failure happened in.
+
+    The same number the scheduler keys its jobs on: rework rounds for a task,
+    repair rounds for a gate.
+    """
+    from . import gates
+
+    return gates.rounds(task) if role == "gate" else rework_attempts(task)
+
+
+def _infra_attempts(
+    task: dict[str, Any] | None,
+    *,
+    role: str | None = None,
+    round_: int | None = None,
+) -> int:
+    """Infrastructure failures recorded on this task, optionally for one job.
+
+    Scoped to a role and round when given. The budget used to be the task's
+    whole lifetime, shared across roles: two provider timeouts during the first
+    implementation left the reviewer, and every later rework round, with no
+    retries at all — so one bad afternoon at the provider could strand a task
+    that went on to do everything right. An attempt recorded before rounds were
+    stored counts against round 0, which is the round it will have been.
+    """
     if task is None:
         return 0
     record = task.get("infrastructure") or {}
-    return len(record.get("attempts") or [])
+    return sum(
+        1
+        for entry in record.get("attempts") or []
+        if (role is None or entry.get("role", "agent") == role)
+        and (round_ is None or int(entry.get("round", 0)) == round_)
+    )
 
 
-def infrastructure_attempts(task: dict[str, Any] | None) -> int:
-    """How many times this task has been retried for infrastructure reasons."""
-    return _infra_attempts(task)
+def infrastructure_attempts(
+    task: dict[str, Any] | None, *, role: str | None = None
+) -> int:
+    """Infrastructure retries spent, for one role's current round when given."""
+    if task is None or role is None:
+        return _infra_attempts(task)
+    return _infra_attempts(task, role=role, round_=_round(task, role))
 
 
 def mark_infrastructure_exhausted(root: Path, task_id: str, reason: str) -> None:
