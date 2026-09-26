@@ -843,6 +843,8 @@ code, .mono, pre { font-family: var(--mono); }
 .node-mark { font-size: 11px; fill: var(--dim); }
 .node-id { font-size: 11px; fill: var(--dim); }
 .node-count { font-size: 11px; fill: var(--dim); font-variant-numeric: tabular-nums; }
+/* A running node's time counts up each second; the running colour says it is live. */
+.node-count.ticking, .node-time.ticking { fill: var(--i-running); font-weight: 600; }
 .node-title { font-size: 12.5px; fill: var(--ink); }
 .node-status { font-size: 10.5px; fill: var(--dim); }
 .node .track { fill: var(--edge); opacity: 0.5; }

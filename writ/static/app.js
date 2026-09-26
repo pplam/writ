@@ -1,4 +1,4 @@
-/* built from ui/src (d11f939a1994) */
+/* built from ui/src (ad2b6c0b5487) */
 /*
  * writ dashboard — compiled from ui/src by ui/build.mjs.
  * Do not edit: change the TypeScript and rebuild.
@@ -734,7 +734,7 @@ function stepNode(step, isSelected, handlers) {
     group.append(svg('rect', { class: 'box', width: STEP_W, height: STEP_H, rx: 8 }));
     group.append(svg('text', { class: 'node-mark', x: 11, y: 19 }, STEP_MARKS[step.status] ?? '·'));
     group.append(svg('text', { class: 'node-id', x: 26, y: 19 }, step.name));
-    group.append(svg('text', { class: 'node-count', x: STEP_W - 11, y: 19, 'text-anchor': 'end' }, duration(step.duration)));
+    group.append(stepTime(step));
     group.append(svg('text', { class: 'node-title', x: 11, y: 38 }, step.summary || KIND_WORDS[step.kind]));
     group.append(svg('text', { class: 'node-status', x: 11, y: 54 }, step.error ? 'failed' : step.note || step.status));
     const select = () => handlers.onStep(step.id);
@@ -747,6 +747,35 @@ function stepNode(step, isSelected, handlers) {
         }
     });
     return group;
+}
+/** When a running step started, or null: the start its clock counts up from. */
+function liveSince(step) {
+    return step.status === 'running' && step.started_at ? step.started_at : null;
+}
+/**
+ * How long the step took, or has been going.
+ *
+ * A running step's figure was the server's, fixed at the last snapshot, so it sat
+ * still between them. It carries `liveClock`'s data attributes instead, and the
+ * app's one-second ticker counts it up in place, as it does a task's.
+ */
+function stepTime(step) {
+    const since = liveSince(step);
+    const text = svg('text', {
+        class: classes('node-count', since !== null && 'ticking'),
+        x: STEP_W - 11,
+        y: 19,
+        'text-anchor': 'end',
+    });
+    if (since) {
+        text.dataset.tickBase = '0';
+        text.dataset.tickSince = since;
+        text.textContent = duration(elapsed(0, since, serverNow())) || '<1s';
+    }
+    else {
+        text.textContent = duration(step.duration);
+    }
+    return text;
 }
 function stepTooltip(step) {
     const lines = [`${step.name}  (${KIND_WORDS[step.kind]})`, step.status];
@@ -781,7 +810,9 @@ function fitStepTitles(host) {
  * command, with the model and event flags this step chose, not the agent's name.
  */
 function renderStepDetail(host, step, output) {
-    replace(host, el('header', { class: 'detail-head' }, el('h2', {}, step.name), el('span', { class: classes('pill', step.status) }, step.status), el('span', { class: 'muted small' }, KIND_WORDS[step.kind])), step.summary ? el('p', { class: 'muted' }, step.summary) : null, el('div', { class: 'meta-row' }, step.duration !== null ? el('span', {}, duration(step.duration)) : null, step.started_at
+    replace(host, el('header', { class: 'detail-head' }, el('h2', {}, step.name), el('span', { class: classes('pill', step.status) }, step.status), el('span', { class: 'muted small' }, KIND_WORDS[step.kind])), step.summary ? el('p', { class: 'muted' }, step.summary) : null, el('div', { class: 'meta-row' }, step.duration !== null || liveSince(step)
+        ? el('span', {}, liveClock(liveSince(step) ? 0 : step.duration, liveSince(step)))
+        : null, step.started_at
         ? el('span', { class: 'muted small', title: step.started_at }, `started ${ago(step.started_at)}`)
         : null, step.exit_code !== null ? el('span', {}, `exit ${step.exit_code}`) : null, step.model ? code(step.model) : null, step.artifact ? code(step.artifact) : null), step.note ? el('p', { class: 'muted small' }, step.note) : null, step.error ? el('p', { class: 'prose error' }, step.error) : null, step.command ? el('pre', { class: 'command' }, step.command) : null, step.directory ? el('pre', { class: 'command' }, step.directory) : null, ...outputPanes(step, output));
 }

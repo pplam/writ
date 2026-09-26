@@ -18,8 +18,8 @@
  * whether repair is armed — rather than boxes appearing from nowhere one at a time.
  */
 
-import { classes, code, el, svg, replace } from '../dom.js';
-import { ago, duration, plural } from '../format.js';
+import { classes, code, el, liveClock, svg, replace } from '../dom.js';
+import { ago, duration, elapsed, plural, serverNow } from '../format.js';
 import type { Phase, PhaseEdge, PhaseStep, StepOutput } from '../types.js';
 
 /** Node geometry. Only the box: every position comes from the server. */
@@ -174,10 +174,7 @@ function stepNode(step: PhaseStep, isSelected: boolean, handlers: PhaseHandlers)
   group.append(svg('rect', { class: 'box', width: STEP_W, height: STEP_H, rx: 8 }));
   group.append(svg('text', { class: 'node-mark', x: 11, y: 19 }, STEP_MARKS[step.status] ?? '·'));
   group.append(svg('text', { class: 'node-id', x: 26, y: 19 }, step.name));
-  group.append(
-    svg('text', { class: 'node-count', x: STEP_W - 11, y: 19, 'text-anchor': 'end' },
-      duration(step.duration)),
-  );
+  group.append(stepTime(step));
   group.append(svg('text', { class: 'node-title', x: 11, y: 38 }, step.summary || KIND_WORDS[step.kind]));
   group.append(
     svg('text', { class: 'node-status', x: 11, y: 54 },
@@ -194,6 +191,36 @@ function stepNode(step: PhaseStep, isSelected: boolean, handlers: PhaseHandlers)
     }
   });
   return group;
+}
+
+/** When a running step started, or null: the start its clock counts up from. */
+function liveSince(step: PhaseStep): string | null {
+  return step.status === 'running' && step.started_at ? step.started_at : null;
+}
+
+/**
+ * How long the step took, or has been going.
+ *
+ * A running step's figure was the server's, fixed at the last snapshot, so it sat
+ * still between them. It carries `liveClock`'s data attributes instead, and the
+ * app's one-second ticker counts it up in place, as it does a task's.
+ */
+function stepTime(step: PhaseStep): SVGElement {
+  const since = liveSince(step);
+  const text = svg('text', {
+    class: classes('node-count', since !== null && 'ticking'),
+    x: STEP_W - 11,
+    y: 19,
+    'text-anchor': 'end',
+  });
+  if (since) {
+    text.dataset.tickBase = '0';
+    text.dataset.tickSince = since;
+    text.textContent = duration(elapsed(0, since, serverNow())) || '<1s';
+  } else {
+    text.textContent = duration(step.duration);
+  }
+  return text;
 }
 
 function stepTooltip(step: PhaseStep): string {
@@ -242,7 +269,9 @@ export function renderStepDetail(
     el(
       'div',
       { class: 'meta-row' },
-      step.duration !== null ? el('span', {}, duration(step.duration)) : null,
+      step.duration !== null || liveSince(step)
+        ? el('span', {}, liveClock(liveSince(step) ? 0 : step.duration, liveSince(step)))
+        : null,
       step.started_at
         ? el('span', { class: 'muted small', title: step.started_at }, `started ${ago(step.started_at)}`)
         : null,
