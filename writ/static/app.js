@@ -1,4 +1,4 @@
-/* built from ui/src (b6d06649a777) */
+/* built from ui/src (d11f939a1994) */
 /*
  * writ dashboard — compiled from ui/src by ui/build.mjs.
  * Do not edit: change the TypeScript and rebuild.
@@ -1153,7 +1153,65 @@ function blockedSection(task) {
 function evidenceSection(task) {
     if (!task.evidence.length)
         return null;
-    return section('History', null, el('ol', { class: 'history' }, ...[...task.evidence].reverse().map((item) => el('li', {}, el('span', { class: 'actor' }, item.actor), el('span', { class: 'history-text' }, item.text), el('span', { class: 'grow' }), el('span', { class: 'muted small tnum', title: item.at }, ago(item.at))))));
+    const items = [...task.evidence].reverse();
+    return section('History', String(items.length), el('ol', { class: 'history' }, ...items.map((item, index) => historyEntry(task.id, item, items.length - index))));
+}
+/** Entries the reader expanded, so a repaint mid-run does not fold them back up. */
+const expandedHistory = new Set();
+/** Past this many characters an entry is clamped to a few lines until asked for. */
+const HISTORY_CLAMP = 280;
+/**
+ * One line of a task's history as a feed entry: who, then what, then the words.
+ *
+ * It was a three-column row, and the actor — `reviewer(pi:ppio/zai-org/…)` in
+ * mono — took a third of the drawer, leaving a narrow column of long prose and a
+ * timestamp wrapped onto two lines beside it. The actor is now split into the
+ * role it played and the model it ran on, both on a header line, and the text
+ * gets the full width under it.
+ */
+function historyEntry(taskId, item, number) {
+    const { role, detail } = splitActor(item.actor);
+    const { label, body } = splitLead(item.text);
+    const key = `${taskId}|${item.at}|${number}`;
+    const long = body.length > HISTORY_CLAMP;
+    const text = el('p', { class: classes('history-text', long && !expandedHistory.has(key) && 'clamped') }, body);
+    let toggle = null;
+    if (long) {
+        const more = el('button', { class: 'link small', type: 'button' }, expandedHistory.has(key) ? 'Show less' : 'Show more');
+        more.addEventListener('click', (event) => {
+            event.stopPropagation();
+            const open = !expandedHistory.has(key);
+            if (open)
+                expandedHistory.add(key);
+            else
+                expandedHistory.delete(key);
+            text.classList.toggle('clamped', !open);
+            more.textContent = open ? 'Show less' : 'Show more';
+        });
+        toggle = more;
+    }
+    return el('li', { class: 'history-entry' }, el('div', { class: 'history-head' }, role in ROLE_ACTORS
+        ? el('span', { class: classes('role', role) }, roleLabel(role))
+        : el('span', { class: 'history-actor' }, role), detail ? el('span', { class: 'muted mono small clip', title: detail }, detail) : null, el('span', { class: 'grow' }), el('span', { class: 'history-when', title: stamp(item.at) }, ago(item.at))), label ? el('div', { class: 'history-label' }, label) : null, body ? text : null, toggle);
+}
+const ROLE_ACTORS = { agent: true, reviewer: true, gate: true, repair: true };
+/** `reviewer(pi:model)` → role `reviewer`, detail `pi:model`; `operator` stays whole. */
+function splitActor(actor) {
+    const match = /^([\w-]+)\((.*)\)$/.exec(actor);
+    return match ? { role: match[1], detail: match[2] } : { role: actor || 'writ', detail: '' };
+}
+/**
+ * The short lead an entry opens with — `notes`, `review accepted (5/5 criteria
+ * passed)` — as a label of its own, so the kind of entry reads before its prose.
+ * Only a short lead on the first line counts: a colon deep inside a sentence is
+ * part of the sentence.
+ */
+function splitLead(text) {
+    const at = text.indexOf(': ');
+    if (at > 0 && at <= 60 && !text.slice(0, at).includes('\n')) {
+        return { label: text.slice(0, at), body: text.slice(at + 2).trim() };
+    }
+    return { label: '', body: text };
 }
 
 // ---- views/runs.js ----

@@ -771,17 +771,49 @@ code, .mono, pre { font-family: var(--mono); }
   white-space: nowrap;
 }
 
-.history li {
-  display: flex;
-  gap: 9px;
-  align-items: baseline;
-  padding: 5px 2px;
-  font-size: 13px;
+/*
+ * A task's history as a feed: a header line saying who and when, then the text at
+ * full width. Long entries are clamped until asked for, so the section reads as a
+ * sequence of events before it reads as a wall of agent prose.
+ */
+.history-entry { padding: 10px 0; }
+.history-entry + .history-entry { border-top: 1px solid var(--line); }
+.history-entry:first-child { padding-top: 2px; }
+
+.history-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.history-head .clip { flex: 0 1 auto; }
+
+.history-actor {
+  flex: 0 0 auto;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 17px;
+  color: var(--dim);
 }
 
-.history li + li { border-top: 1px solid var(--line); }
-.history .actor { font-family: var(--mono); font-size: 11.5px; color: var(--dim); flex: 0 0 auto; }
-.history-text { flex: 1 1 auto; min-width: 0; }
+.history-when { flex: 0 0 auto; font-size: 12px; color: var(--faint); white-space: nowrap; }
+.history-label { margin-top: 6px; font-size: 13px; font-weight: 600; }
+
+.history-text {
+  margin: 3px 0 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--dim);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.history-text.clamped {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.history-entry > .link { display: inline-block; margin-top: 4px; font-size: 12px; }
 
 /* ------------------------------------------------------------- graph */
 
