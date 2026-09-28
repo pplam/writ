@@ -279,8 +279,15 @@ def build_parser() -> argparse.ArgumentParser:
             "approve the plan without a human when no blocking finding stands "
             "against it. For automation: a clean check means writ proved nothing "
             "wrong, not that anyone read it. Blocking findings are never "
-            "overridden this way — that is `writ approve --force --reason ...`"
+            "overridden this way — that is `writ approve --force --reason ...` "
+            "(default: plan.auto_approve, on)"
         ),
+    )
+    p.add_argument(
+        "--no-auto-approve",
+        dest="auto_approve",
+        action="store_false",
+        help="leave the plan for a human to `writ approve`",
     )
     p.add_argument(
         "--critics",
@@ -288,9 +295,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME",
         help=(
             "after committing, have independent critics read the plan and report "
-            "findings. Spends an agent run each, so it is opt-in: "
+            "findings, an agent run each (default: plan.critics, on): "
             + ", ".join(critic.name for critic in critics.CRITICS)
         ),
+    )
+    p.add_argument(
+        "--no-critics", dest="critics", action="store_false", help="skip the critics"
     )
     p.add_argument(
         "--parallel-critics",
@@ -309,10 +319,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "answer the plan's blocking findings with the bounded repair loop "
-            "before it is approved, the same one `writ adjudicate` runs. Spends "
-            "agent runs, so it is opt-in; what --auto-approve refuses to override "
-            "is exactly what this tries to remove"
+            "before it is approved, the same one `writ adjudicate` runs. What "
+            "--auto-approve refuses to override is exactly what this tries to "
+            "remove (default: plan.repair, on)"
         ),
+    )
+    p.add_argument(
+        "--no-repair", dest="repair", action="store_false", help="do not repair"
     )
     p.add_argument(
         "--max-rounds",

@@ -51,7 +51,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from . import agents, prompts, runner, state
+from . import agents, config, prompts, runner, state
 from .plancheck import Finding, Requirement
 from .planner import DesignDocs, doc_list
 from .stream import truncated
@@ -742,7 +742,13 @@ def run_stage(
             )
     if artifact_path.exists():
         artifact_path.unlink()
-    resolved = agents.resolve(agent, list(agent_args or []), model, events=True)
+    resolved = agents.resolve(
+        agent,
+        list(agent_args or []),
+        model,
+        events=True,
+        dirs=config.agent_dirs(root, cwd),
+    )
     where = directory / stage.name
     where.mkdir(parents=True, exist_ok=True)
     prompt = build_prompt(

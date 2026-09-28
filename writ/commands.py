@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 from . import (
     adjudicate,
@@ -388,10 +388,9 @@ def _plan(args, held: dict[str, Any]) -> int:
         print(f"note: no section titled {section!r} in {names}", file=sys.stderr)
     _print_findings(findings)
     if _critics_requested(args):
-        # `--critics` absent is None and runs nothing; `--critics` with no names is
-        # `[]` and means all of them. The distinction matters because the flag is
-        # opt-in — it spends an agent run per critic — so the empty list is a
-        # request, not the absence of one.
+        # `--critics` with no names is `[]` and means all of them, so the empty
+        # list is a request, not the absence of one. Absent, `plan.critics`
+        # decides, and it is on unless a person turned it off.
         _run_critics(
             args,
             root=root,
@@ -408,23 +407,34 @@ def _plan(args, held: dict[str, Any]) -> int:
     # human instead of looping.
     if getattr(args, "repair", False):
         _repair_plan(args, root=root, doc=doc, phase=phase)
+    reviewers = _required_reviewers(args)
     if getattr(args, "auto_approve", False):
         phases.start_step(root, phase, "approval")
-        approved = _auto_approve(root)
+        declined = _auto_approve(root, reviewers=reviewers)
         phases.finish_step(
             root,
             phase,
             "approval",
-            status="ok" if approved else "skipped",
+            status="skipped" if declined else "ok",
             note=(
-                "approved: nothing blocking stood against the plan"
-                if approved
-                else "not approved: a blocking finding stands, which only "
-                "`writ approve --force --reason` may overrule"
+                f"not approved: {declined}"
+                if declined
+                else "approved: nothing blocking stood against the plan"
             ),
         )
     data = state.load(root)
     counts = plancheck.tally(plans.findings(data, open_only=True))
+    unread = _unread(data, reviewers)
+    if unread and not plans.runnable(data):
+        # A critic that could not run found nothing, and nothing is not a pass:
+        # approving on it would execute a plan no critic read.
+        print(
+            f"plan held at {plans.plan_status(data)['status']}: "
+            f"{', '.join(unread)} could not read it, so it is not approved",
+            file=sys.stderr,
+        )
+        print("next: fix the critic agent, then writ critique   (then writ build)")
+        return 1
     if plans.runnable(data):
         record = plans.plan_status(data)
         print(f"plan approved by {record['approved_by']}: {record['approval_note']}")
@@ -920,10 +930,23 @@ def _commit_plan(
     return created, findings
 
 
-def _auto_approve(root: Path) -> bool:
+def _required_reviewers(args) -> list[str]:
+    """The critics this plan was asked to be read by, which approval waits on."""
+    if not _critics_requested(args):
+        return []
+    return [critic.name for critic in _chosen_critics(args)]
+
+
+def _unread(data: dict[str, Any], reviewers: Sequence[str]) -> list[str]:
+    """Which of `reviewers` have not read the plan at its current revision."""
+    stale = set(critics.unreviewed(data))
+    return [name for name in reviewers if name in stale]
+
+
+def _auto_approve(root: Path, *, reviewers: Sequence[str] = ()) -> str | None:
     """Approve the plan without a human, when nothing blocking stands against it.
 
-    Returns whether it did. The caller records the answer: a plan that reached
+    Returns None when it did, else why not. The caller records the answer: a plan that reached
     approval and was declined is the most common end of an unattended run, and the
     reader looking for why should find the approval step saying so rather than
     find nothing where an approval would have been.
@@ -944,6 +967,10 @@ def _auto_approve(root: Path) -> bool:
     Worse while it lasted: between the commit and the last critic the plan really
     was `approved`, so a `writ run` in another terminal would start executing a plan
     no critic had finished reading.
+
+    `reviewers` are the critics that were asked to read the plan. One that failed
+    reported nothing, which is not the same as objecting to nothing, so the plan
+    waits until each has read it at this revision.
     """
     with state.transaction(root) as data:
         blocking = [
@@ -952,15 +979,22 @@ def _auto_approve(root: Path) -> bool:
             if finding.severity == "error"
         ]
         if blocking:
-            return False
-        if plans.plan_status(data)["status"] not in ("draft", "needs-approval"):
-            return False
+            return (
+                "a blocking finding stands, which only "
+                "`writ approve --force --reason` may overrule"
+            )
+        unread = _unread(data, reviewers)
+        if unread:
+            return f"{', '.join(unread)} could not read the plan"
+        status = plans.plan_status(data)["status"]
+        if status not in ("draft", "needs-approval"):
+            return f"the plan is {status}"
         plans.approve(
             data,
             actor="writ --auto-approve",
             reason="no blocking findings stood against the plan",
         )
-        return True
+        return None
 
 
 def _feature_offset(data: dict[str, Any]) -> int:
@@ -1622,9 +1656,9 @@ def _applied_line(applied: dict[str, Any]) -> str:
 def _critics_requested(args) -> bool:
     """Whether the critics should read the plan `writ plan` just committed.
 
-    Absent (None) or `plan.critics: false` runs nothing, since each critic costs
-    an agent run and writ does not spend those unasked; `--critics` with no names,
-    or `plan.critics: true`, runs all of them; and a list runs exactly those.
+    `--no-critics` or `plan.critics: false` runs nothing; `--critics` with no
+    names, or `plan.critics: true` (writ's default), runs all of them; and a list
+    runs exactly those.
     """
     requested = getattr(args, "critics", None)
     if requested is None or requested is False:
@@ -3617,10 +3651,14 @@ def cmd_build(args) -> int:
 
 
 def _build_autonomous(args, root: Path) -> bool:
-    """Whether this build decides on its own: its flag, else the config."""
+    """Whether this build decides on its own: its flag, else the config, else
+    writ's default."""
     if getattr(args, "autonomous", None) is not None:
         return bool(args.autonomous)
-    return bool((config.load(root).get("decisions") or {}).get("autonomous"))
+    configured = (config.load(root).get("decisions") or {}).get("autonomous")
+    if configured is None:
+        return bool(config.DEFAULTS["run"]["autonomous"].builtin)
+    return bool(configured)
 
 
 def _autonomous(args, root: Path) -> bool:
@@ -3655,6 +3693,9 @@ def _repair_to_rulings(args, root: Path) -> None:
     have answered with `writ set D-NNNN active --decision`, running build again is
     the obvious next step, and it used to re-check the plan, find the same finding
     and stop at the same place — the answer was recorded and never applied.
+
+    It is also how a build held because a critic could not run carries on: the
+    critics that have not read the plan read it first.
     """
     # parsed only for what the config and build's flags say planning should do
     designs = list(state.load(root)["design_docs"]) or ["design.md"]
@@ -3690,9 +3731,25 @@ def _repair_to_rulings(args, root: Path) -> None:
     config.apply(step, config.load(root))
     # re-reviewed exactly as the build's own planning would have been
     step.no_critics = not _critics_requested(plan_args)
+    # A critic that failed last time is read again first: approval waits on it,
+    # and its findings are what the repair has to answer.
+    unread = _unread(state.load(root), _required_reviewers(plan_args))
+    if unread:
+        print(f"re-running {', '.join(unread)}, which could not read the plan")
+        _run_critics(
+            step,
+            root=root,
+            doc=None,
+            chosen=critics.by_name(unread),
+            plan_path=None,
+        )
     cmd_adjudicate(step)
-    if plan_args.auto_approve and _auto_approve(root):
-        print("plan approved: nothing blocking stands against it")
+    if plan_args.auto_approve:
+        declined = _auto_approve(root, reviewers=_required_reviewers(plan_args))
+        if declined:
+            print(f"plan not approved: {declined}")
+        else:
+            print("plan approved: nothing blocking stands against it")
     print()
 
 

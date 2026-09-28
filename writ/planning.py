@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import agents, contracts, plancheck, planfiles, prompts, runner, state
+from . import agents, config, contracts, plancheck, planfiles, prompts, runner, state
 from .stream import truncated
 from .plancheck import Finding, Requirement
 from .planner import (
@@ -360,7 +360,9 @@ def generate(
     into that pipeline's directory, beside the analyses it was built from. Without
     them it is the older single-shot planner, which decides everything at once.
     """
-    resolved = agents.resolve(agent, agent_args, model, events=True)
+    resolved = agents.resolve(
+        agent, agent_args, model, events=True, dirs=config.agent_dirs(root, cwd)
+    )
     plan_id = plan_id or new_plan_id(doc)
     # The draft sits beside the analyses it was built from; the synthesizer's
     # transcript gets its own folder, as each analysis stage's does. `plan.json`

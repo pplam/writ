@@ -17,6 +17,7 @@ from __future__ import annotations
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Sequence
 
 from .state import WritError
 
@@ -40,6 +41,13 @@ class AgentProfile:
     event_args: tuple[str, ...] = ()
     #: which adapter in `writ/stream.py` reads those events
     event_shape: str = ""
+    #: flags that let the agent edit files and run commands with nobody there to
+    #: approve each one; without them a headless run is refused every change
+    permission_args: tuple[str, ...] = ()
+    #: any of these already present means the operator chose the permissions
+    permission_optouts: tuple[str, ...] = ()
+    #: flag that grants access to a directory outside the working directory
+    dir_flag: str | None = None
     note: str = ""
 
 
@@ -57,6 +65,17 @@ PROFILES: dict[str, AgentProfile] = {
         interactive_optouts=("-p", "--print"),
         event_args=("--output-format", "stream-json", "--verbose"),
         event_shape="claude",
+        # `-p` alone runs in the default mode, which asks before every edit and
+        # command, and headless there is nobody to ask: each one is refused.
+        # Edits stay fenced to the working directory and any `--add-dir`.
+        permission_args=("--permission-mode", "acceptEdits", "--allowedTools", "Bash"),
+        permission_optouts=(
+            "--permission-mode",
+            "--dangerously-skip-permissions",
+            "--allowedTools",
+            "--allowed-tools",
+        ),
+        dir_flag="--add-dir",
     ),
     "codex": AgentProfile(
         prefix=("exec",),
@@ -113,6 +132,7 @@ def resolve(
     model: str | None = None,
     *,
     events: bool = False,
+    dirs: Sequence[str] = (),
 ) -> ResolvedAgent:
     """Build the argv for a headless agent run.
 
@@ -125,6 +145,10 @@ def resolve(
     guarantee: an agent Writ has no adapter for, or one whose output mode the
     operator already set by hand, runs exactly as it did before and reports no
     shape — better plain prose than events parsed under the wrong shape.
+
+    `dirs` are directories outside the working directory the agent may read and
+    write (`access.dirs`). An agent writ knows no flag for runs without them and
+    says so, rather than failing a run that may not need them.
     """
     tokens = shlex.split(agent)
     if not tokens:
@@ -150,6 +174,12 @@ def resolve(
                 f"{name} is not a known agent, so writ cannot confirm it runs "
                 "without a terminal; if the run hangs, add its non-interactive "
                 "flag to --agent"
+                + (
+                    f"; nor can it give it access to {', '.join(dirs)} "
+                    "(access.dirs)"
+                    if dirs
+                    else ""
+                )
             ),
         )
 
@@ -184,12 +214,48 @@ def resolve(
         event_args = list(profile.event_args)
         event_shape = profile.event_shape
 
+    permission_args: list[str] = []
+    if profile.permission_args and not _supplies(supplied, profile.permission_optouts):
+        permission_args = list(profile.permission_args)
+
+    warning = None
+    dir_args: list[str] = []
+    if dirs and profile.dir_flag:
+        for directory in dirs:
+            dir_args += [profile.dir_flag, directory]
+    elif dirs:
+        warning = (
+            f"writ knows no flag to give {name} access to {', '.join(dirs)} "
+            "(access.dirs); it runs without them"
+        )
+
     suffix = [token for token in profile.suffix if token not in supplied]
     command = [
-        executable, *prefix, *rest, *extra, *model_args, *event_args, *suffix
+        executable,
+        *prefix,
+        *rest,
+        *extra,
+        *permission_args,
+        *dir_args,
+        *model_args,
+        *event_args,
+        *suffix,
     ]
     return ResolvedAgent(
-        command=command, profile=profile, name=name, event_shape=event_shape
+        command=command,
+        profile=profile,
+        name=name,
+        warning=warning,
+        event_shape=event_shape,
+    )
+
+
+def _supplies(supplied: set[str], flags: tuple[str, ...]) -> bool:
+    """Whether any of `flags` was given, as `--flag value` or `--flag=value`."""
+    return any(
+        token == flag or token.startswith(f"{flag}=")
+        for token in supplied
+        for flag in flags
     )
 
 

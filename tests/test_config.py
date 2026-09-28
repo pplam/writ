@@ -216,9 +216,9 @@ def test_the_starter_config_comments_every_setting():
 
 def test_the_config_holds_only_the_core_settings():
     """The file is for the choices a project makes once, not a mirror of every flag."""
-    assert config.SECTIONS == ("agents", "plan", "run", "decisions", "serve")
+    assert config.SECTIONS == ("agents", "plan", "run", "decisions", "access", "serve")
     assert "stage" not in config.ROLES
-    assert len(config.FIELDS) == 4 * 3 + 5 + 3 + 1 + 1
+    assert len(config.FIELDS) == 4 * 3 + 5 + 3 + 1 + 1 + 1
 
 
 def test_init_keeps_an_existing_config(writ, project):
@@ -503,7 +503,8 @@ def test_every_field_is_used_by_some_command():
         for default in command.values()
         if default.path
     }
-    assert referenced == set(config.FIELDS)
+    # read where every agent is launched, by `config.agent_dirs`, not by a flag
+    assert referenced | {"access.dirs"} == set(config.FIELDS)
 
 
 def test_every_config_path_a_command_reads_is_a_field():
@@ -520,3 +521,41 @@ def test_agents_reports_the_configured_roles(writ, project):
     assert "reviewer" in out and "codex" in out
     assert "stage" not in out.split("ROLE", 1)[1]
     assert "config.yaml" in out
+
+
+def test_access_dirs_are_resolved_against_the_project(tmp_path):
+    root = tmp_path / "project"
+    (root / ".writ").mkdir(parents=True)
+    (root / ".writ" / "config.yaml").write_text(
+        "access:\n  dirs:\n    - ../writ\n    - /abs/lib\n", encoding="utf-8"
+    )
+    assert config.agent_dirs(root) == [
+        str((tmp_path / "writ").resolve()),
+        str(Path("/abs/lib").resolve()),
+    ]
+
+
+def test_an_agent_working_elsewhere_is_given_the_project(tmp_path):
+    (tmp_path / "work").mkdir()
+    assert config.agent_dirs(tmp_path, tmp_path / "work") == [str(tmp_path.resolve())]
+    assert config.agent_dirs(tmp_path, tmp_path) == []
+
+
+def test_access_dirs_must_be_paths():
+    with pytest.raises(WritError, match="access.dirs"):
+        config.validate({"access": {"dirs": 3}})
+
+
+def test_writ_runs_unattended_out_of_the_box(monkeypatch, project):
+    """Critics, repair, auto-approval and autonomy are on unless a person turns
+    them off: in the builtins and in the config `writ init` writes."""
+    monkeypatch.undo()  # the suite's `attended` fixture turns them off
+    for path in ("plan.critics", "plan.repair", "plan.auto_approve",
+                 "decisions.autonomous"):
+        assert config.DEFAULT_VALUES[path] is True, path
+    args, _ = resolve(project, "plan", "design.md")
+    assert args.critics and args.repair and args.auto_approve and args.autonomous
+    args, _ = resolve(project, "run")
+    assert args.autonomous
+    args, _ = resolve(project, "plan", "design.md", "--no-autonomous", "--no-repair")
+    assert not args.autonomous and not args.repair

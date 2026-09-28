@@ -16,6 +16,7 @@ from typing import Any, IO, Iterable
 
 from . import (
     agents,
+    config,
     contracts,
     decisions,
     failures,
@@ -1417,7 +1418,9 @@ def prepare(
     run and nothing else. Recording it also makes the run say which budget it was
     judged under, which a run read weeks later otherwise cannot tell you.
     """
-    resolved = agents.resolve(agent, agent_args, model)
+    resolved = agents.resolve(
+        agent, agent_args, model, dirs=config.agent_dirs(root, cwd)
+    )
     with state.transaction(root) as data:
         task = get_task(data, task_id)
         # Refuse to put a second agent on a task that already has a live one.

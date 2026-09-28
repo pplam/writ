@@ -1038,8 +1038,13 @@ def test_edits_and_a_question_both_land(objected, project, monkeypatch):
     assert "question" in out
 
 
-def test_a_finding_that_survives_its_repair_is_escalated(objected, project):
-    """The worse bound: the same objection coming back after a repair closed it."""
+def test_a_reopened_finding_does_not_stop_the_plan_loop(objected, project):
+    """Only the budget bounds plan repair: a finding that came back gets a round.
+
+    A critic re-reads every patched plan, so a blocker it reports again is most
+    often a repair that went part of the way. Stopping on the first reopen cut
+    runs off after one round with the rest of `--max-rounds` unspent.
+    """
     with state.transaction(project) as data:
         record = [
             item
@@ -1055,70 +1060,9 @@ def test_a_finding_that_survives_its_repair_is_escalated(objected, project):
             summary="still open",
             actor="adjudicator",
         )["status"] = "applied"
-    assert repair.plan_repeat_findings(state.load(project))
-    assert "survived" in repair.plan_exhausted(state.load(project), max_rounds=9)
-
-
-def test_repeated_advisories_do_not_escalate_the_plan(objected, project):
-    """The bound is about findings that were repaired, so advisories are not it.
-
-    A critic re-reports every note it still believes each time it re-reads, so a
-    plan with seventy notes crosses any seen-count limit the first time the critics
-    run twice — on a plan whose blocking findings were being fixed exactly as
-    intended.
-    """
-    with state.transaction(project) as data:
-        plans.record_findings(
-            data,
-            [
-                plancheck.Finding(
-                    severity=severity,
-                    category="unjustified-task",
-                    message="nothing in the design asks for it",
-                    where="M01-001",
-                    suggested_action="name the requirement it serves",
-                    source="critic:feasibility",
-                )
-                for severity in ("note", "warning")
-            ],
-            scope="critic:feasibility",
-        )
-        for record in plans.finding_records(data):
-            if record["severity"] in ("note", "warning"):
-                record["seen_count"] = repair.REPEAT_FINDING_LIMIT + 2
-                record["reopened_at"] = "2026-01-01T00:00:00Z"
-        repair.open_request(
-            data,
-            gate_id=None,
-            finding_ids=[],
-            summary="one round landed",
-            actor="adjudicator",
-        )["status"] = "applied"
     data = state.load(project)
-    assert repair.plan_repeat_findings(data) == []
     assert repair.plan_exhausted(data, max_rounds=9) == ""
-
-
-def test_a_blocking_finding_reopened_once_escalates(objected, project):
-    """`reopened_at` alone is the signal: a re-check disagreed with a repair."""
-    with state.transaction(project) as data:
-        record = [
-            item
-            for item in plans.finding_records(data)
-            if item["source"] == "critic:fidelity"
-        ][0]
-        record["seen_count"] = 1
-        record["reopened_at"] = "2026-01-01T00:00:00Z"
-        repair.open_request(
-            data,
-            gate_id=None,
-            finding_ids=[record["id"]],
-            summary="still open",
-            actor="adjudicator",
-        )["status"] = "applied"
-    data = state.load(project)
-    assert repair.plan_repeat_findings(data) == [record["id"]]
-    assert "survived" in repair.plan_exhausted(data, max_rounds=9)
+    assert "budget of 1" in repair.plan_exhausted(data, max_rounds=1)
 
 
 def test_the_plan_bound_counts_only_applied_repairs(objected, project):
@@ -1226,6 +1170,34 @@ def test_a_finding_a_critic_still_reports_does_not_close(
     assert code == 1
 
 
+def test_a_finding_the_critic_reopens_gets_another_round(
+    objected, project, monkeypatch
+):
+    """The re-check disagreeing with a repair is a reason to repair again, until
+    the budget says otherwise."""
+    patched(
+        monkeypatch,
+        [
+            ADDS_THE_TASK,
+            {"analysis": "sharpen it", "revise": {"M01-003": {
+                "title": "Show queue depth to the operator"}}},
+        ],
+    )
+    code, out, _ = objected(
+        "adjudicate",
+        "--agent",
+        agent(ADJUDICATOR),
+        "--critic-agent",
+        agent(STUBBORN_CRITIC),
+        "--max-rounds",
+        "2",
+    )
+    data = state.load(project)
+    applied = [r for r in repair.requests(data) if r.get("status") == "applied"]
+    assert len(applied) == 2, out
+    assert code == 1
+
+
 # --------------------------------------------------------------------------
 # what it refuses to do at all
 
@@ -1313,6 +1285,27 @@ def test_plan_repair_answers_what_the_critics_found_before_approval(
     record = plans.plan_status(data)
     assert record["status"] == "approved"
     assert record["approved_by"] == "writ --auto-approve"
+
+
+def test_a_critic_that_could_not_run_holds_the_plan(writ, project, design, tmp_path):
+    """A failed critic reported nothing, and nothing is not a pass.
+
+    Auto-approval used to count only open findings, so a critic that died on an
+    API error left none and the plan was approved and executed unread.
+    """
+    artifact = tmp_path / "plan.json"
+    artifact.write_text(json.dumps(PLAN), encoding="utf-8")
+    writ("init")
+    code, _, err = writ(
+        "plan", str(design), "--from-plan", str(artifact),
+        "--critics", "fidelity", "--critic-agent", agent(MUTE),
+        "--auto-approve", "--quiet",
+    )
+    assert code == 1
+    assert "fidelity could not read it" in err
+    record = plans.plan_status(state.load(project))
+    assert record["status"] != "approved"
+    assert not plans.runnable(state.load(project))
 
 
 def test_check_stops_listing_what_the_repair_answered(

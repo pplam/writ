@@ -1,10 +1,12 @@
 import io
 import sys
 from contextlib import redirect_stdout, redirect_stderr
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from writ import config
 from writ.cli import main
 
 DESIGN = """\
@@ -36,6 +38,33 @@ Inline projection.
 
 No explicit gate here, so generic criteria apply.
 """
+
+
+#: writ's unattended defaults, turned back off for the suite.
+#:
+#: Out of the box `writ plan` runs the critics, repairs, auto-approves and decides
+#: on its own, and `writ init` writes that into the config. Tests name each of
+#: those they exercise, and with them on by default every other `writ plan` would
+#: call the default agent, which on a developer's machine may be a real one.
+#: tests/test_config.py checks the real defaults.
+UNATTENDED = {
+    ("plan", "critics"),
+    ("plan", "repair"),
+    ("plan", "auto_approve"),
+    ("plan", "autonomous"),
+    ("adjudicate", "autonomous"),
+    ("run", "autonomous"),
+}
+
+
+@pytest.fixture(autouse=True)
+def attended(monkeypatch):
+    for command, attribute in UNATTENDED:
+        default = config.DEFAULTS[command][attribute]
+        monkeypatch.setitem(
+            config.DEFAULTS[command], attribute, replace(default, builtin=False)
+        )
+        monkeypatch.setitem(config.DEFAULT_VALUES, default.path, False)
 
 
 @pytest.fixture

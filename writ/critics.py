@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from . import agents, planning, plans, prompts, runner, state
+from . import agents, config, planning, plans, prompts, runner, state
 from .plancheck import Finding
 from .planner import DesignDocs
 from .state import WritError, utcnow
@@ -713,7 +713,9 @@ def review(
     order the critics were given, whatever order they finished in, so a review
     reads the same whichever agent happened to finish first.
     """
-    resolved = agents.resolve(agent, [], model, events=True)
+    resolved = agents.resolve(
+        agent, [], model, events=True, dirs=config.agent_dirs(root, cwd)
+    )
     directory.mkdir(parents=True, exist_ok=True)
     chosen = list(chosen)
     known = write_known(directory / KNOWN_FINDINGS_FILENAME, found)

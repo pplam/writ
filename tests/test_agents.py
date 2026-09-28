@@ -15,8 +15,12 @@ def test_pi_gets_the_print_flag_so_it_does_not_open_a_tui():
     assert agents.resolve("pi").command == ["pi", "-p"]
 
 
+#: what claude needs to edit and run commands with nobody there to approve them
+CLAUDE_PERMISSIONS = ["--permission-mode", "acceptEdits", "--allowedTools", "Bash"]
+
+
 def test_claude_gets_the_print_flag():
-    assert agents.resolve("claude").command == ["claude", "-p"]
+    assert agents.resolve("claude").command == ["claude", "-p", *CLAUDE_PERMISSIONS]
 
 
 def test_codex_reads_the_prompt_from_stdin_via_exec():
@@ -43,7 +47,11 @@ def test_an_absolute_path_is_still_recognised():
 
 def test_an_explicit_print_flag_is_not_duplicated():
     assert agents.resolve("pi -p").command == ["pi", "-p"]
-    assert agents.resolve("claude --print").command == ["claude", "--print"]
+    assert agents.resolve("claude --print").command == [
+        "claude",
+        "--print",
+        *CLAUDE_PERMISSIONS,
+    ]
 
 
 def test_an_explicit_mode_flag_suppresses_the_default():
@@ -204,7 +212,14 @@ def test_pi_asks_for_json_events_and_reports_its_shape():
 
 def test_claude_asks_for_its_own_stream_format():
     resolved = agents.resolve("claude", events=True)
-    assert resolved.command == ["claude", "-p", "--output-format", "stream-json", "--verbose"]
+    assert resolved.command == [
+        "claude",
+        "-p",
+        *CLAUDE_PERMISSIONS,
+        "--output-format",
+        "stream-json",
+        "--verbose",
+    ]
     assert resolved.event_shape == "claude"
 
 
@@ -235,3 +250,40 @@ def test_the_event_flag_lands_before_a_stdin_suffix():
         ]
     finally:
         del agents.PROFILES["fake-agent"]
+
+
+# --------------------------------------------------------------------------
+# permissions and directories
+
+
+def test_permissions_the_operator_chose_are_kept():
+    for chosen in (
+        "claude --dangerously-skip-permissions",
+        "claude --permission-mode plan",
+        "claude --permission-mode=bypassPermissions",
+        "claude --allowedTools Read",
+    ):
+        command = agents.resolve(chosen).command
+        assert "acceptEdits" not in command, chosen
+        assert command.count("--allowedTools") <= 1, chosen
+
+
+def test_directories_outside_the_project_are_added():
+    resolved = agents.resolve("claude", dirs=["/src/writ", "/src/other"])
+    assert resolved.command == [
+        "claude",
+        "-p",
+        *CLAUDE_PERMISSIONS,
+        "--add-dir",
+        "/src/writ",
+        "--add-dir",
+        "/src/other",
+    ]
+    assert resolved.warning is None
+
+
+def test_an_agent_with_no_directory_flag_says_it_runs_without_them():
+    resolved = agents.resolve("codex", dirs=["/src/writ"])
+    assert resolved.command == ["codex", "exec", "-"]
+    assert "/src/writ" in resolved.warning
+    assert "/src/writ" in agents.resolve("my-agent", dirs=["/src/writ"]).warning

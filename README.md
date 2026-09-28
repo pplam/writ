@@ -110,18 +110,23 @@ A committed plan is a **draft**, not an accepted one.
   whether it can be built here.
 - **Repair** (`writ adjudicate`, or `plan --repair`) gives an agent a working copy
   of the plan to fix its blocking findings. Writ accepts the edit only if
-  coverage does not regress and the graph stays sound. The number of rounds is
-  bounded.
+  coverage does not regress and the graph stays sound. The critics re-read every
+  patched plan, and a finding they report again gets another round, up to
+  `plan.max_rounds`.
 - **Approval** always has an actor behind it. A clean check is not approval:
 
 ```bash
 writ approve --by ada --reason "read it through"
 writ set F-0007 accepted --reason "known gap"          # or answer one finding
-writ plan design.md --critics --repair --auto-approve  # unattended
+writ plan design.md --no-auto-approve                  # stop for a human
 ```
 
-`--auto-approve` approves only when nothing blocking stands against the plan. It
-never overrides a finding.
+Out of the box writ runs unattended: `writ plan` runs the critics, repairs, and
+auto-approves, and `decisions.autonomous` settles open questions itself, logging
+each one. `--no-critics`, `--no-repair`, `--no-auto-approve` and
+`--no-autonomous` (or the same keys set to `false` in the config) switch each
+off. Auto-approval approves only when nothing blocking stands against the plan.
+It never overrides a finding.
 
 ### 3. Execution
 
@@ -190,11 +195,13 @@ plan:
   critics: true
   repair: true
   max_rounds: 2
-  auto_approve: false
+  auto_approve: false     # a person signs every plan off
   instructions: null      # standing guidance for the planner
 run:
   parallel: 3
   max_rework: 2
+access:
+  dirs: [../shared-lib]   # folders outside the project agents may read and write
 serve:
   port: 8731
 ```
@@ -205,12 +212,20 @@ effect. Pick a different reviewer from the implementer: a review is only as
 independent as the model doing it.
 
 Writ adds each agent's headless flag and translates `--model` for `pi`, `claude`,
-`codex`, `cursor-agent`, `opencode`, `amp` and `gemini`. Anything after `--` is
-passed through to the agent:
+`codex`, `cursor-agent`, `opencode`, `amp` and `gemini`. `claude -p` would refuse
+every edit and command with nobody there to approve them, so writ runs it with
+`--permission-mode acceptEdits --allowedTools Bash`: edits stay inside the
+project and `access.dirs`, which become `--add-dir`. Anything after `--` is
+passed through to the agent, and a permission flag of your own replaces writ's:
 
 ```bash
 writ dispatch M01-001 --agent claude -- --dangerously-skip-permissions
 ```
+
+A planning step that fails stops the plan. A critic that could not run found
+nothing, which is not a pass, so auto-approval waits until every critic asked for
+has read the plan. Rerun the failed critics with `writ critique`, or, under
+`decisions.autonomous` (on by default), just run `writ build` again.
 
 ## Commands
 

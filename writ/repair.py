@@ -340,11 +340,12 @@ def plan_exhausted(
 ) -> str:
     """Why the plan should stop being adjudicated, or "" while it may continue.
 
-    The pre-execution twin of `exhausted`, and bounded for the same two reasons. A
-    plan that has been patched twice and still draws blocking findings is not one
-    round away from being right; and a finding that survives its own repair will
-    survive the next one, because what is wrong is the question rather than the
-    answer.
+    The pre-execution twin of `exhausted`, bounded only by the round budget. A
+    finding a re-check reopens after a repair does not end the loop early, as it
+    does for a gate: the critics re-read every patched plan, so a finding that
+    comes back is usually a repair that went part of the way, and the next round
+    sees what the critic still objects to. `max_rounds` is what stops a repair
+    that is going nowhere.
 
     Deliberately not a finding. Writ cannot prove the plan is wrong — that is why
     it asked agents — so this stops the loop and hands over what it has, rather
@@ -358,26 +359,7 @@ def plan_exhausted(
             "What is still open needs a decision rather than another patch "
             "(writ check, then writ approve --force --reason ...)."
         )
-    repeated = plan_repeat_findings(data)
-    if repeated:
-        listed = ", ".join(repeated)
-        return (
-            f"{listed} survived {REPEAT_FINDING_LIMIT} repair(s). The repairs are "
-            "not addressing the finding, so the next one will not either."
-        )
     return ""
-
-
-def plan_repeat_findings(data: dict[str, Any]) -> list[str]:
-    """Pre-execution findings that came back after a repair claimed to close them.
-
-    Scoped to everything that is not a gate: writ's own checks (`plan`) and each
-    critic (`critic:<name>`). A finding reopened by a re-check after a patch landed
-    is the signal — the patch said it closed it and the check disagreed.
-    """
-    return _repeat_findings(
-        data, lambda scope: scope == "plan" or scope.startswith("critic:")
-    )
 
 
 def _repeat_findings(data: dict[str, Any], in_scope) -> list[str]:

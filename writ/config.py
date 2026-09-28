@@ -164,6 +164,13 @@ FIELDS: dict[str, Field] = {
         " gate asks. Each is still logged, confirmed by `autonomous`. Implies"
         " plan.repair and plan.auto_approve (--autonomous)",
     ),
+    "access.dirs": Field(
+        kind="paths",
+        doc="directories outside the project every agent may read and write, e.g."
+        " a codebase the design copies from. Relative to the project; ~ is"
+        " expanded",
+        written=[],
+    ),
     "serve.port": Field(kind="port", doc="port the web view listens on (--port)"),
 }
 
@@ -176,6 +183,7 @@ SECTION_DOCS: dict[str, str] = {
     "plan": "what `writ plan` does after it commits a plan",
     "run": "how `writ run` walks the graph",
     "decisions": "who settles what the design left open: a person, or writ",
+    "access": "what the agents may touch beyond the project",
     "serve": "the read-only web view",
 }
 
@@ -285,11 +293,11 @@ DEFAULTS: dict[str, dict[str, Default]] = {
             "gates": Default(builtin=True),
             "stages": Default(builtin=True),
             "refresh": Default(builtin=False),
-            "repair": Default("plan.repair", False),
+            "repair": Default("plan.repair", True),
             "max_rounds": Default("plan.max_rounds", MAX_REPAIR_ROUNDS),
-            "auto_approve": Default("plan.auto_approve", False),
-            "critics": Default("plan.critics", False),
-            "autonomous": Default("decisions.autonomous", False),
+            "auto_approve": Default("plan.auto_approve", True),
+            "critics": Default("plan.critics", True),
+            "autonomous": Default("decisions.autonomous", True),
         },
         "critique": {**_CRITIC},
         "adjudicate": {
@@ -298,7 +306,7 @@ DEFAULTS: dict[str, dict[str, Default]] = {
             "critic_agent": Default("agents.critic.command"),
             "critic_model": Default("agents.critic.model"),
             "no_critics": Default(builtin=True, invert=True),
-            "autonomous": Default("decisions.autonomous", False),
+            "autonomous": Default("decisions.autonomous", True),
         },
         "check": {"all": Default(builtin=False)},
         "coverage": {"uncovered": Default(builtin=False)},
@@ -345,7 +353,7 @@ DEFAULTS: dict[str, dict[str, Default]] = {
             "max_rework": Default("run.max_rework"),
             "verify": Default("run.verify"),
             "no_stream": Default(builtin=True, invert=True),
-            "autonomous": Default("decisions.autonomous", False),
+            "autonomous": Default("decisions.autonomous", True),
         },
     }.items()
 }
@@ -477,6 +485,14 @@ def _text(value: Any, where: str) -> str:
     return value.strip()
 
 
+def _paths(value: Any, where: str) -> list[str]:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        raise WritError(f"{where}: expected a list of paths (got {value!r})")
+    return [_text(item, f"{where}[{index}]") for index, item in enumerate(value)]
+
+
 def _count(value: Any, where: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise WritError(f"{where}: expected a whole number above 0 (got {value!r})")
@@ -504,6 +520,7 @@ def _flag(value: Any, where: str) -> bool:
 _CHECKS = {
     "command": _command,
     "text": _text,
+    "paths": _paths,
     "count": _count,
     "tally": _tally,
     "port": _port,
@@ -597,6 +614,21 @@ def _legacy_values(path: Path) -> dict[str, Any]:
         if node is not None and node != "":
             out[field_path] = _CHECKS[entry.kind](node, f"{path}: {field_path}")
     return out
+
+
+def agent_dirs(root: str | Path, cwd: str | Path | None = None) -> list[str]:
+    """The directories an agent is given beyond its working directory.
+
+    `access.dirs`, absolute, plus the project itself when the agent works
+    elsewhere (`--cwd`): its prompt, verdict and reports are written under
+    `.writ/`, and an agent that cannot write there cannot report.
+    """
+    base = Path(root).expanduser().resolve()
+    listed = (load(root).get("access") or {}).get("dirs") or []
+    out = [str((base / Path(path).expanduser()).resolve()) for path in listed]
+    if cwd is not None and Path(cwd).expanduser().resolve() != base:
+        out.append(str(base))
+    return list(dict.fromkeys(out))
 
 
 def ensure(root: str | Path) -> tuple[Path, str]:

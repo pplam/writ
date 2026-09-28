@@ -53,7 +53,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from . import agents, contracts, gates, planfiles, plans, prompts, repair, runner, state
+from . import (
+    agents,
+    config,
+    contracts,
+    gates,
+    planfiles,
+    plans,
+    prompts,
+    repair,
+    runner,
+    state,
+)
 from .model import add_task, check_dag, refresh_milestones
 from .plancheck import Finding, sort_findings
 from .planner import DesignDocs
@@ -404,7 +415,9 @@ def loop(
     with a recommendation is answered with it. Both still land in the decision
     log, confirmed by `autonomous`, so what was decided on whose word is kept.
     """
-    resolved = agents.resolve(agent, [], model, events=True)
+    resolved = agents.resolve(
+        agent, [], model, events=True, dirs=config.agent_dirs(root, cwd)
+    )
     directory.mkdir(parents=True, exist_ok=True)
     result = Result()
     budget = repair.DEFAULT_MAX_REPAIR_ROUNDS if max_rounds is None else max_rounds
