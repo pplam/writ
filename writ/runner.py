@@ -134,6 +134,10 @@ def build_prompt(
         lines.append(excerpt)
         lines.append("---")
         lines.append("")
+    triaged = _triage_section(task)
+    if triaged:
+        lines.append(triaged)
+        lines.append("")
     rework = _rework_section(task)
     if rework:
         lines.append(rework)
@@ -197,6 +201,37 @@ def _feature_section(data: dict[str, Any], task: dict[str, Any]) -> list[str]:
         "from its contract, say so in your verdict rather than building around it."
     )
     return lines
+
+
+def _triage_section(task: dict[str, Any]) -> str:
+    """What the triage that unstuck this task decided, for the attempt after it.
+
+    Stated before any rejection, because it supersedes it: the brief may have
+    changed since the review was written, and a criterion the review failed may
+    no longer be this task's to meet.
+    """
+    from .triage import pending_guidance
+
+    record = pending_guidance(task)
+    if not record:
+        return ""
+    lines = [
+        "THIS TASK WAS STUCK, AND WRIT'S TRIAGE HAS CHANGED WHAT COMES NEXT. The "
+        "previous attempts' code is still in the working tree: continue from it, "
+        "and re-verify every criterion below against the brief as it now stands.",
+    ]
+    if record.get("analysis"):
+        lines.append(f"  Why it was stuck: {record['analysis']}")
+    moved = record.get("moved") or []
+    if moved:
+        lines.append("  Criteria moved off this task — do not try to meet them here:")
+        lines.extend(
+            f"    - {entry.get('criterion', '')} -> {entry.get('to', '')}"
+            for entry in moved
+        )
+    if record.get("guidance"):
+        lines.append(f"  What to do: {record['guidance']}")
+    return "\n".join(lines)
 
 
 def _rework_section(task: dict[str, Any]) -> str:

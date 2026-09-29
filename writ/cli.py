@@ -36,6 +36,7 @@ from .model import DEFAULT_MAX_REWORK, JUDGED_STATUSES, SETTABLE_STATUSES
 from .orchestrator import DEFAULT_ORDER, ORDERS
 from .plans import SETTABLE_DISPOSITIONS
 from .state import WritError
+from .triage import MAX_TRIAGES
 
 DESCRIPTION = """\
 Writ turns a design document into an executable task DAG, dispatches tasks to
@@ -1047,6 +1048,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--timeout", type=int, default=None, help="seconds before killing an agent"
     )
+    p.add_argument(
+        "--critic",
+        dest="critic_agent",
+        metavar="CMD",
+        help=(
+            "agent that triages a stuck task under --autonomous (default: "
+            "agents.critic, else --agent)"
+        ),
+    )
+    p.add_argument("--critic-model", metavar="NAME", help="model for the triage")
+    p.set_defaults(critic_timeout=None)
     p.add_argument("--cwd", help="working directory for the agents (default: --root)")
     p.add_argument(
         "--force",
@@ -1087,6 +1099,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="print the intended walk and stop",
     )
     p.set_defaults(func=commands.cmd_run)
+
+    p = sub.add_parser(
+        "unstick",
+        help="have the plan's agent look at a blocked or failed task",
+        description=(
+            "A task that is blocked, or failed with its rework spent, holds up "
+            "everything that depends on it. This hands it to the plan's repair "
+            "agent (agents.critic) with the verdicts, reviews and the state of its "
+            "neighbours. The agent may revise the plan — moving a criterion to the "
+            "task or gate that can actually meet it, adding a task — or send the "
+            "task back with guidance, or ask a question. Writ checks any edit the "
+            "way it checks a plan repair: a criterion may move, never vanish. "
+            f"At most {MAX_TRIAGES} triages per task; `writ run` does this itself "
+            "under decisions.autonomous."
+        ),
+    )
+    p.add_argument("id", help="the stuck task")
+    p.add_argument("--note", help="a steer for the agent, put in its prompt")
+    p.add_argument("--agent", help="agent command (default: agents.critic, else pi)")
+    p.add_argument("--model", help="model for the agent")
+    p.add_argument("--timeout", type=int, default=None, help="seconds before killing it")
+    p.add_argument("--cwd", help="working directory for the agent (default: --root)")
+    _autonomy(p)
+    p.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        default=None,
+        help="do not mirror the agent's output",
+    )
+    p.set_defaults(func=commands.cmd_unstick)
 
     p = sub.add_parser("dispatch", help="hand one task to a coding agent")
     p.add_argument("id")

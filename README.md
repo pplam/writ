@@ -152,6 +152,15 @@ planned ─► ready ─► running ─► awaiting-review ─► reviewing ─�
 - **Gates:** each milestone, and the plan as a whole, ends in a gate task. It
   writes no code; it judges whether the pieces fit together. A failing gate adds
   repair tasks in front of itself rather than failing the graph.
+- **Triage:** a task that blocks, or fails with its rework spent, holds up
+  everything behind it. `writ unstick <id>` hands it to the plan's agent
+  (`agents.critic`) with the verdicts, reviews and the state of its neighbours.
+  The agent can revise the plan, for example by moving a criterion to the
+  dependent task or gate that can actually meet it. It can also send the task
+  back with guidance, or ask a question. Writ checks any edit the way it checks a
+  plan repair: a criterion may move but never vanish. Under
+  `decisions.autonomous`, `writ run` triages stuck tasks itself. Each task gets
+  at most two triages, and after that it needs a person.
 - **Decisions:** agents report choices the design left open. They arrive as
   `proposed`, and only you can make them binding (`writ set D-0001 active`).
 
@@ -185,7 +194,7 @@ agents:
     model: opus
     timeout: 1800
   critic:
-    command: codex        # critics and plan repair
+    command: codex        # critics, plan repair and triage
   implementer:
     command: claude       # tasks and gates
     model: sonnet
@@ -243,6 +252,7 @@ has read the plan. Rerun the failed critics with `writ critique`, or, under
 | `writ run` | work the whole graph |
 | `writ dispatch <id>` | one task to an implementer (`--detach` to background it) |
 | `writ review [id]` | review one task, or everything awaiting review |
+| `writ unstick <id>` | have the plan's agent triage a blocked or failed task |
 | `writ cancel [run-id]` | stop a run, or reconcile dead ones |
 | `writ agents` | how each agent is invoked |
 | **Look** | |

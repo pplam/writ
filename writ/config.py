@@ -354,6 +354,15 @@ DEFAULTS: dict[str, dict[str, Default]] = {
             "verify": Default("run.verify"),
             "no_stream": Default(builtin=True, invert=True),
             "autonomous": Default("decisions.autonomous", True),
+            # who triages a stuck task: the plan's repair agent, and unset, the
+            # implementer (see `triage.py`)
+            "critic_agent": Default("agents.critic.command"),
+            "critic_model": Default("agents.critic.model"),
+            "critic_timeout": Default("agents.critic.timeout", AGENT_TIMEOUT),
+        },
+        "unstick": {
+            **_CRITIC,
+            "autonomous": Default("decisions.autonomous", True),
         },
     }.items()
 }

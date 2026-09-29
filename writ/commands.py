@@ -33,6 +33,7 @@ from . import (
     runner,
     server,
     state,
+    triage,
     verdict,
 )
 from .model import (
@@ -3559,8 +3560,8 @@ def cmd_state_dump(args) -> None:
 BUILD_FORWARDS: dict[str, tuple[str | None, str | None]] = {
     "planner": ("agent", None),
     "planner_model": ("model", None),
-    "critic": ("critic_agent", None),
-    "critic_model": ("critic_model", None),
+    "critic": ("critic_agent", "critic_agent"),
+    "critic_model": ("critic_model", "critic_model"),
     "instructions": ("instructions", None),
     "critics": ("critics", None),
     "repair": ("repair", None),
@@ -3771,6 +3772,71 @@ def _step_args(args, command: str, positional: list[str], *, index: int):
     return step
 
 
+def cmd_unstick(args) -> int:
+    """Have the plan's agent look at one stuck task, and apply what it decides.
+
+    What `writ run` does itself under `decisions.autonomous`, for the attended
+    case: the person asks for it, reads what came of it, and the decision it
+    proposes waits for them (`writ list decisions --proposed`).
+    """
+    root = Path(args.root)
+    autonomous = _autonomous(args, root)
+    stream = not args.quiet and not args.json
+    result = triage.run(
+        root,
+        args.id,
+        agent=args.agent,
+        model=args.model,
+        timeout=args.timeout,
+        cwd=args.cwd,
+        stream=stream,
+        autonomous=autonomous,
+        note=getattr(args, "note", None) or "",
+    )
+    if args.json:
+        render.emit_json(
+            {
+                "task": result.task_id,
+                "triage": result.number,
+                "action": result.action,
+                "status": result.status,
+                "unstuck": result.unstuck,
+                "moved": result.moved,
+                "applied": result.applied,
+                "refused": [finding.to_dict() for finding in result.refused],
+                "waiting": result.waiting,
+                "error": result.error,
+                "analysis": result.analysis,
+                "guidance": result.guidance,
+                "directory": str(result.directory) if result.directory else None,
+            }
+        )
+        return 0 if result.unstuck else 1
+    mark = render.mark("planned" if result.unstuck else result.status or "blocked")
+    print(
+        f"{mark} {result.task_id}  "
+        + ("unstuck" if result.unstuck else f"still {result.status or 'stuck'}")
+        + (f"  ({result.action})" if result.action else "")
+    )
+    print(f"  {result.summary}")
+    if result.analysis and result.analysis not in result.summary:
+        print(f"  why: {_first_line(result.analysis)}")
+    if result.directory:
+        print(f"  files: {result.directory}")
+    if result.unstuck:
+        print("  next: writ run")
+    elif result.waiting:
+        print("  next: writ list decisions --proposed, then writ unstick again")
+    elif triage.triages_left(state.load(root)["tasks"][result.task_id]):
+        print(f"  next: writ unstick {result.task_id} --note \"...\" to steer it")
+    else:
+        print(
+            f"  no triages left: writ show {result.task_id}, then writ override "
+            "or writ set"
+        )
+    return 0 if result.unstuck else 1
+
+
 def cmd_run(args) -> int:
     """Walk the DAG: dispatch what is ready, review what is reported, repeat.
 
@@ -3881,6 +3947,9 @@ def cmd_run(args) -> int:
             on_event=reporter,
             stream=stream,
             lock=output_lock,
+            triager=getattr(args, "critic_agent", None),
+            triager_model=getattr(args, "critic_model", None),
+            triager_timeout=getattr(args, "critic_timeout", None),
         )
     finally:
         orchestrator.release_session(root)
@@ -3977,11 +4046,18 @@ def _nothing_to_run(data) -> str:
         )
     stalled = orchestrator._stalled(data)
     if stalled:
-        return (
+        message = (
             "nothing can start: "
             + ", ".join(stalled)
             + " wait on failed work (see `writ list --status failed`)"
         )
+        stuck = triage.stuck(data)
+        if stuck:
+            message += (
+                f"\n{', '.join(stuck)} can be triaged: `writ unstick <id>` has "
+                "the plan's agent look at it"
+            )
+        return message
     return "nothing is ready to dispatch or awaiting review"
 
 
@@ -4027,6 +4103,8 @@ class _RunReporter:
                 return None
             if payload["role"] == "reviewer":
                 verb = "review  "
+            elif payload["role"] == "triage":
+                verb = "triage  "
             elif payload.get("attempt"):
                 verb = "rework  "
             else:
@@ -4062,6 +4140,20 @@ class _RunReporter:
         The agent already wrote a one-line account; use it.
         """
         status = payload["status"] or "unknown"
+        if payload.get("role") == "triage":
+            # The status is the task's, and the news is whether triage moved it:
+            # `planned` means it goes round again, anything else that it did not.
+            line = (
+                f"{render.mark('planned' if payload.get('unstuck') else status)} "
+                f"{payload['task']}  "
+                + ("unstuck" if payload.get("unstuck") else f"still {status}")
+            )
+            if payload["error"]:
+                line += f"  ({payload['error']})"
+            out = [f"         {line}"]
+            if payload.get("summary"):
+                out.append(f"           {_first_line(payload['summary'])}")
+            return "\n".join(out)
         rework = payload.get("rework")
         if rework:
             # `planned` is the truthful status and a useless thing to print: the

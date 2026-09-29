@@ -1065,6 +1065,8 @@ def validate(
     finding_ids: Iterable[str],
     base_revision: int,
     root: Path | None = None,
+    stuck: str = "",
+    moved: list[dict[str, str]] | None = None,
 ) -> tuple[list[Finding], dict[str, dict[str, Any]], dict[str, list[str]]]:
     """Everything writ enforces about a working copy, as findings rather than a raise.
 
@@ -1072,6 +1074,11 @@ def validate(
     findings, the features the copy proposes, and the diff against the committed
     plan (`revised`, `added`, `removed`). With `root`, the committed index the
     adjudicator was told to leave alone is checked too.
+
+    `stuck` is the task a triage is about (see `triage.py`). It is the one started
+    task the copy may edit, and the one that may end with fewer criteria — but only
+    by the criteria listed in `moved`, each of which must land on a planned task or
+    gate. The bar still does not drop; part of it moves to where it can be met.
     """
     work = directory / WORKING_DIRNAME
     tasks = data.get("tasks", {})
@@ -1120,7 +1127,7 @@ def validate(
                     _refuse("gate-edited", f"gate {task_id} was deleted", where,
                             "restore the file; gates are writ's")
                 )
-            elif task.get("status") != "planned":
+            elif task.get("status") != "planned" or task_id == stuck:
                 found.append(
                     _refuse(
                         "started-task-edited",
@@ -1158,7 +1165,7 @@ def validate(
             continue
         if after == before:
             continue
-        if task.get("status") != "planned":
+        if task.get("status") != "planned" and task_id != stuck:
             found.append(
                 _refuse(
                     "started-task-edited",
@@ -1168,7 +1175,9 @@ def validate(
                 )
             )
             continue
-        if len(after["acceptances"]) < len(before["acceptances"]):
+        if task_id == stuck:
+            found.extend(_validate_moves(tasks, proposed, before, after, stuck, moved))
+        elif len(after["acceptances"]) < len(before["acceptances"]):
             found.append(
                 _refuse(
                     "weakened-criteria",
@@ -1239,8 +1248,93 @@ def validate(
         )
 
     found.extend(_validate_graph(tasks, proposed))
-    found.extend(_validate_answers(response, finding_ids, diff))
+    if not stuck:
+        found.extend(_validate_answers(response, finding_ids, diff))
     return sort_findings(found), proposed, diff
+
+
+def _validate_moves(
+    tasks: dict[str, dict[str, Any]],
+    proposed: dict[str, dict[str, Any]],
+    before: dict[str, Any],
+    after: dict[str, Any],
+    stuck: str,
+    moved: list[dict[str, str]] | None,
+) -> list[Finding]:
+    """A stuck task's dropped criteria all went somewhere that can still meet them.
+
+    A criterion is dropped when its wording is gone from the task. Each one must be
+    named in `moved` with a target: a planned task, whose file in the copy must now
+    carry it (as `as`, when it was reworded to fit there), or an unstarted gate,
+    which writ appends it to. A target that has started would be asked to meet a
+    bar after it was judged, which is the same trap the stuck task is in.
+    """
+    found: list[Finding] = []
+    where = f"{WORKING_DIRNAME}/{stuck}.json"
+    dropped = [text for text in before["acceptances"] if text not in after["acceptances"]]
+    placed = {str(entry.get("criterion", "")).strip(): entry for entry in moved or []}
+    for text in dropped:
+        entry = placed.get(text)
+        if entry is None:
+            found.append(
+                _refuse(
+                    "weakened-criteria",
+                    f"{stuck} dropped the criterion {text!r} without moving it",
+                    where,
+                    "keep it, reword it in place, or list it in `moved` with the "
+                    "task or gate that will meet it",
+                )
+            )
+            continue
+        target = str(entry.get("to", "")).strip()
+        landed = str(entry.get("as") or text).strip()
+        if target == stuck or not target:
+            found.append(
+                _refuse("bad-move", f"{text!r} is moved to {target or 'nowhere'}",
+                        RESPONSE_FILENAME, "name another task or a gate")
+            )
+        elif target in tasks and tasks[target].get("kind") == "gate":
+            if tasks[target].get("status") != "planned":
+                found.append(
+                    _refuse(
+                        "bad-move",
+                        f"{text!r} is moved to {target}, which is "
+                        f"{tasks[target].get('status')}",
+                        RESPONSE_FILENAME,
+                        "move it to a gate that has not run yet",
+                    )
+                )
+        elif target not in proposed:
+            found.append(
+                _refuse("bad-move", f"{text!r} is moved to {target}, which is not "
+                        "in the working copy", RESPONSE_FILENAME)
+            )
+        elif target in tasks and tasks[target].get("status") != "planned":
+            found.append(
+                _refuse(
+                    "bad-move",
+                    f"{text!r} is moved to {target}, which is "
+                    f"{tasks[target].get('status')}",
+                    RESPONSE_FILENAME,
+                    "move it to a task that has not started, or to a gate",
+                )
+            )
+        elif landed not in normal(proposed[target])["acceptances"]:
+            found.append(
+                _refuse(
+                    "bad-move",
+                    f"{text!r} is moved to {target}, but {target}'s file does not "
+                    "carry it",
+                    f"{WORKING_DIRNAME}/{target}.json",
+                    "add it to that feature's acceptances (as `as`, if reworded)",
+                )
+            )
+    if not after["acceptances"]:
+        found.append(
+            _refuse("weakened-criteria", f"{stuck} is left with no criteria", where,
+                    "a task with nothing left to meet should be removed by a person")
+        )
+    return found
 
 
 def _gate_edges(nodes: dict[str, dict[str, Any]]) -> dict[str, list[str]]:
@@ -1793,9 +1887,16 @@ def _recompute_gates(data: dict[str, Any]) -> None:
         gate["requirement_ids"] = requirement_ids
         if milestone in data.get("milestones", {}):
             held = {item["text"]: item for item in gate.get("acceptances", [])}
+            derived = gates.milestone_criteria(data, milestone, requirement_ids)
             gate["acceptances"] = [
                 dict(held[text]) if text in held else {"text": text, "status": "pending"}
-                for text in gates.milestone_criteria(data, milestone, requirement_ids)
+                for text in derived
+            ] + [
+                # carried here by a triage from a task that could not meet it;
+                # not derivable from the milestone, so kept through a recompute
+                dict(item)
+                for item in held.values()
+                if item.get("from") and item["text"] not in derived
             ]
 
 

@@ -33,7 +33,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from . import agents, failures, gates, plans, procs, repair, runner, state
+from . import agents, decisions, failures, gates, plans, procs, repair, runner, state
+from . import triage as triaging
 from .model import acceptance_summary, effective_status, rework_attempts
 from .state import WritError, utcnow
 
@@ -56,6 +57,7 @@ ROLE_TAGS = {
     "reviewer": "review",
     "gate": "gate  ",
     "repair": "repair",
+    "triage": "triage",
 }
 
 
@@ -64,7 +66,7 @@ class Job:
     """One agent invocation the scheduler decided to make."""
 
     task_id: str
-    role: str  # "agent" | "reviewer" | "gate" | "repair"
+    role: str  # "agent" | "reviewer" | "gate" | "repair" | "triage"
     #: how many times this task had been sent back for rework when the job was
     #: chosen. Part of the ledger key, not decoration: see `key`.
     attempt: int = 0
@@ -72,6 +74,10 @@ class Job:
     #: the same reason `attempt` is: a second request on the same gate is a
     #: different job, a retry of the same one is not.
     request: str = ""
+    #: for a task's implementation and review, the triages it has had. Part of
+    #: the key because a triage that unstuck a task changed something without
+    #: sending it back for rework: the attempt after it is a new job.
+    triaged: int = 0
 
     @property
     def verb(self) -> str:
@@ -79,8 +85,8 @@ class Job:
             return "review"
         if self.role == "gate":
             return "gate"
-        if self.role == "repair":
-            return "repair"
+        if self.role in ("repair", "triage"):
+            return self.role
         # A re-dispatch after a rejection is the same invocation with a different
         # prompt, but calling it "dispatch" in the preview and the log reads as
         # work that had not started yet.
@@ -108,7 +114,13 @@ class Job:
             # bound lives in `repair.patches_left`.
             suffix = f"#{self.attempt}" if self.attempt else ""
             return f"{self.task_id}~{self.request or 'repair'}{suffix}"
-        return self.task_id if not self.attempt else f"{self.task_id}#{self.attempt}"
+        if self.role == "triage":
+            # The attempt is the number of triages the task has had, which the
+            # store keeps — so a refused triage is a new job, and the bound is
+            # `triage.MAX_TRIAGES`, not the session.
+            return f"{self.task_id}~triage#{self.attempt}"
+        key = self.task_id if not self.attempt else f"{self.task_id}#{self.attempt}"
+        return f"{key}@{self.triaged}" if self.triaged else key
 
 
 @dataclass
@@ -140,6 +152,8 @@ class Outcome:
     repaired: list[str] = field(default_factory=list)
     #: for a repair job: why writ refused the patch
     refused: str = ""
+    #: for a triage job: whether it put the task back in the queue
+    unstuck: bool = False
     #: gate findings recorded by this run
     findings: list[str] = field(default_factory=list)
     #: what kind of failure this was, if it was one — see `failures`. An empty
@@ -202,6 +216,8 @@ class Session:
     #: repair budget. The run is not finished when one of these is outstanding —
     #: it is waiting, which is a different thing and has to read differently.
     held: list[str] = field(default_factory=list)
+    #: stuck tasks a triage put back in the queue
+    triaged: list[str] = field(default_factory=list)
     #: tasks retried because the machinery around them failed. Kept apart from
     #: `failed` and from `reworked`: nobody read this work, so it is neither a
     #: rejection nor a judgement, and counting it as either is what made a broken
@@ -504,6 +520,7 @@ def next_job(
     started: Iterable[str],
     reviewed: Iterable[str] = (),
     order: str = DEFAULT_ORDER,
+    triage: bool = False,
 ) -> Job | None:
     """Choose the next agent invocation, or None when there is nothing to do.
 
@@ -520,6 +537,10 @@ def next_job(
     is dispatched again within this same session rather than waiting for the next
     one.
 
+    With `triage`, a stuck task — blocked, or failed with its rework spent — is
+    handed to the plan's agent before new work starts, for the same reason repair
+    is: it is holding up everything that depends on it (see `triage.py`).
+
     `order` breaks ties among ready tasks. It cannot affect *which* tasks are
     eligible, only which eligible one goes first, so no order can produce a run
     the dependency rules would not allow.
@@ -532,7 +553,10 @@ def next_job(
         if gates.is_gate(task):
             continue
         job = Job(
-            task_id=task["id"], role="reviewer", attempt=rework_attempts(task)
+            task_id=task["id"],
+            role="reviewer",
+            attempt=rework_attempts(task),
+            triaged=len(triaging.attempts(task)),
         )
         if task["id"] in busy or job.key in reviewed:
             continue
@@ -566,6 +590,17 @@ def next_job(
         if request["gate"] in busy or job.key in started:
             continue
         return job
+
+    if triage:
+        for task_id in triaging.stuck(data):
+            job = Job(
+                task_id=task_id,
+                role="triage",
+                attempt=len(triaging.attempts(data["tasks"][task_id])),
+            )
+            if task_id in busy or job.key in started:
+                continue
+            return job
 
     ready = [
         task
@@ -610,12 +645,17 @@ def _job_for(task: dict[str, Any]) -> Job:
     """
     if gates.is_gate(task):
         return Job(task_id=task["id"], role="gate", attempt=gates.rounds(task))
-    return Job(task_id=task["id"], role="agent", attempt=rework_attempts(task))
+    return Job(
+        task_id=task["id"],
+        role="agent",
+        attempt=rework_attempts(task),
+        triaged=len(triaging.attempts(task)),
+    )
 
 
 def _base(key: str) -> str:
     """The task id inside a ledger key, whichever attempt it names."""
-    return key.split("#", 1)[0].split("~", 1)[0]
+    return key.split("#", 1)[0].split("~", 1)[0].split("@", 1)[0]
 
 
 def _first(data: dict[str, Any], ready: list[dict[str, Any]], order: str) -> str:
@@ -706,13 +746,24 @@ def preview(
     while guard < limit:
         guard += 1
         job = next_job(
-            shadow, busy=[], budget=budget, started=started, order=order
+            shadow,
+            busy=[],
+            budget=budget,
+            started=started,
+            order=order,
+            triage=decisions.autonomous(data),
         )
         if job is None:
             break
         jobs.append(job)
         task = simulated[job.task_id]
-        if job.role == "agent":
+        if job.role == "triage":
+            # Assumed to work, like everything else here: the task goes round again.
+            started.append(job.key)
+            task["status"] = "planned"
+            task["rework"] = dict(task.get("rework") or {}, exhausted=False)
+            task["triage"] = triaging.attempts(task) + [{"simulated": True}]
+        elif job.role == "agent":
             started.append(job.key)
             task["status"] = "awaiting-review"
         else:
@@ -744,6 +795,9 @@ def run(
     on_event: Callable[[str, dict[str, Any]], None] | None = None,
     stream: bool = False,
     lock: threading.Lock | None = None,
+    triager: str | None = None,
+    triager_model: str | None = None,
+    triager_timeout: int | None = None,
 ) -> Session:
     """Walk the DAG until it runs out of work, an error stops it, or you do.
 
@@ -752,6 +806,10 @@ def run(
     log from `on_event` is interleaved with it and remains the thing that says what
     happened; the mirror is there so a long run is visibly working rather than
     silent for ten minutes. Transcripts are written either way.
+
+    Under `decisions.autonomous` a stuck task is triaged by `triager` — the plan's
+    repair agent, falling back to the implementer — instead of ending the walk for
+    everything behind it.
     """
     session = Session()
     emit = on_event or (lambda name, payload: None)
@@ -801,6 +859,35 @@ def run(
         back in the status `prepare` claims from. Nothing about the *work* is
         different, which is the reason this is not its own code path.
         """
+        if job.role == "triage":
+            # Not a run of the task: no run record, nothing claimed. The triage
+            # keeps its own directory under the plan, and its own bound.
+            started.append(job.key)
+            emit(
+                "started",
+                {
+                    "task": job.task_id,
+                    "role": job.role,
+                    "run": None,
+                    "command": triager or agent,
+                    "attempt": job.attempt,
+                    "retry": retry,
+                    "in_flight": len(in_flight) + 1,
+                },
+            )
+            future = pool.submit(
+                _triage,
+                root,
+                job,
+                agent=triager or agent,
+                model=triager_model if triager else model,
+                timeout=triager_timeout,
+                cwd=cwd,
+                stream=stream,
+                lock=mirror_lock,
+            )
+            in_flight[future] = job
+            return
         try:
             run_id, resolved = _prepare(
                 root,
@@ -893,6 +980,7 @@ def run(
                     started=started,
                     reviewed=session.review_attempts,
                     order=order,
+                    triage=decisions.autonomous(data),
                 )
                 if job is None:
                     break
@@ -1086,6 +1174,46 @@ def _execute(
     )
 
 
+def _triage(
+    root: Path,
+    job: Job,
+    *,
+    agent: str,
+    model: str | None,
+    timeout: int | None,
+    cwd: str | None,
+    stream: bool,
+    lock: threading.Lock | None,
+) -> Outcome:
+    """Triage one stuck task. Like `_execute`, errors come back as data."""
+    try:
+        result = triaging.run(
+            root,
+            job.task_id,
+            agent=agent,
+            model=model,
+            timeout=timeout,
+            cwd=cwd,
+            stream=stream,
+            prefix=_label(job) if stream else "",
+            autonomous=True,
+            lock=lock,
+        )
+    except Exception as exc:
+        return Outcome(job=job, error=f"triage failed: {exc}")
+    task = state.load(root)["tasks"].get(job.task_id, {})
+    return Outcome(
+        job=job,
+        exit_code=result.exit_code,
+        status=task.get("status"),
+        summary=result.summary,
+        criteria=acceptance_summary(task) if task else None,
+        repaired=list(result.applied.get("tasks", [])),
+        refused="; ".join(finding.message for finding in result.refused),
+        unstuck=result.unstuck,
+    )
+
+
 def _stranded(
     root: Path, job: Job, run_id: str, failure: failures.Failure
 ) -> Outcome:
@@ -1172,6 +1300,15 @@ def _record(session: Session, outcome: Outcome) -> None:
         if outcome.repaired:
             session.repaired.append(outcome.job.task_id)
         return
+    if outcome.job.role == "triage":
+        if outcome.unstuck:
+            # Back in the queue: whatever this session said about it failing is
+            # no longer the last word, and its next attempt will say what is.
+            session.triaged.append(outcome.job.task_id)
+            session.failed[:] = [
+                task_id for task_id in session.failed if task_id != outcome.job.task_id
+            ]
+        return
     if not outcome.on_merit:
         # An infrastructure failure is not a verdict. The task may well sit at
         # `planned` or `awaiting-review` — the status `reconcile` returned it to —
@@ -1206,6 +1343,7 @@ def _finished_payload(outcome: Outcome) -> dict[str, Any]:
         "request": outcome.request,
         "repaired": outcome.repaired,
         "refused": outcome.refused,
+        "unstuck": outcome.unstuck,
         "findings": outcome.findings,
         "category": outcome.category,
         "retryable": outcome.retryable,
@@ -1347,6 +1485,25 @@ def summary(data: dict[str, Any], session: Session) -> list[str]:
             f"blocked by failed work: {', '.join(blocked)}"
             + (f"   (failed: {', '.join(roots)})" if roots else "")
         )
+    if session.triaged:
+        lines.append(
+            f"unstuck by triage: {', '.join(sorted(set(session.triaged)))}"
+            "   (writ show <id> says what changed)"
+        )
+    stuck = triaging.stuck(data, budgeted=False)
+    if stuck:
+        fresh = [task_id for task_id in stuck if task_id in triaging.stuck(data)]
+        spent = [task_id for task_id in stuck if task_id not in fresh]
+        if fresh:
+            lines.append(
+                f"stuck: {', '.join(fresh)}   (writ unstick <id> has the plan's "
+                "agent look; under decisions.autonomous, writ run does it itself)"
+            )
+        if spent:
+            lines.append(
+                f"stuck after {triaging.MAX_TRIAGES} triages: {', '.join(spent)}"
+                "   (needs a person: writ show <id>, then writ override or writ set)"
+            )
     lines.extend(_gate_lines(data, session))
     # Proposals are inert until a human rules on them, so a run that produced
     # some has left work that no later `writ run` will pick up. Say so, or the
